@@ -75,6 +75,11 @@ func main() {
 	if base == "" {
 		base = "http://localhost:8080"
 	}
+	// Production refuses an http base URL: session cookies set Secure and
+	// OAuth redirects must be https (mirrors the outbox refusal in mailer).
+	if os.Getenv("ENV") == "production" && !strings.HasPrefix(base, "https://") {
+		log.Fatalf("GP_PUBLIC_BASE_URL must be https in production, got %q", base)
+	}
 	srv := server.New(server.Config{
 		Addr:               firstNonEmpty(os.Getenv("GP_HTTP_ADDR"), ":8080"),
 		BaseURL:            base,
@@ -118,9 +123,8 @@ func splitCIDRs(s string) []string {
 	return out
 }
 
-// atoiEnv returns 0 when unset/garbage; the server falls back to its design
-// defaults for 0 (and logs nothing — an invalid value must fail loudly here
-// so operators notice).
+// atoiEnv returns 0 when the key is unset; the server falls back to its
+// design defaults for 0. Garbage values fail loudly at boot.
 func atoiEnv(key string) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {

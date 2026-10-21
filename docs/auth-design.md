@@ -5,7 +5,7 @@ Status: proposed (PART 1). No code written yet. Scope: backend only — accounts
 ## 1. Stack
 
 - **Go 1.22** (already on the box), stdlib `net/http` with the 1.22+ `ServeMux` (method+path patterns). No web framework.
-- **Postgres 16** in Docker (dev). Driver: `pgx/v5` (`pgxpool`) — the standard Postgres driver for Go, native JSONB support.
+- **Postgres** from `DATABASE_URL` (used by the API pool) and `DATABASE_URL_DIRECT` (used by migrations when present). Neon-compatible: with Neon's pooler the pooled URL sits behind transactions and the direct URL hits a real session connection — plain local URLs work with either env set or both pointing at the same database. Driver: `pgx/v5` (`pgxpool`) — the standard Postgres driver for Go, native JSONB support.
 - **Migrations:** plain `.sql` files under `migrations/`, applied lexicographically at startup by a ~40-line runner with a `schema_migrations` table and a Postgres advisory lock against double-apply.
 - **argon2id** from `golang.org/x/crypto/argon2`. **OAuth** from `golang.org/x/oauth2` (credentials only; endpoints configurable so tests can point it at a fake provider).
 - No JWT, no Redis, no ORM. Rate limit state lives in Postgres like everything else.
@@ -20,7 +20,7 @@ All IDs are **UUIDv4 (random, opaque)**. The user ID is a random *public* identi
 |---|---|---|
 | `users` | One row per account | `id uuid PK`, `email text NOT NULL` (unique on `lower(email)`), `email_verified bool DEFAULT false`, `password_hash text NULL` (NULL for OAuth-only accounts), `welcome_sent_at timestamptz NULL`, `created_at`, `updated_at` |
 | `auth_identities` | OAuth identities linked to users | `user_id FK→users`, `provider` (`google`/`github`), `provider_account_id`, `provider_email`, `provider_email_verified bool`, `created_at`; `UNIQUE(provider, provider_account_id)` |
-| `sessions` | Server-side sessions | `token_hash text PK` (SHA‑256 of the cookie value), `user_id FK→users`, `created_at`, `expires_at` (30 d). Plaintext token never stored |
+| `sessions` | Server-side sessions | `token_hash text PK` (SHA‑256 of the cookie value), `user_id FK→users`, `id uuid` (safe list/revoke identifier), `created_at`, `expires_at` (7 d sliding, 30 d absolute from `created_at`). Plaintext token never stored |
 | `api_keys` | Bearer tokens for API access | `id uuid PK`, `user_id FK→users`, `name text`, `key_hash text UNIQUE` (SHA‑256), `prefix text` (~first 12 chars, for the list view), `created_at`, `last_used_at NULL`, `revoked_at NULL`. Plaintext never stored |
 | `user_data` | Per-user JSONB blob | `user_id uuid PK FK→users`, `data jsonb NOT NULL`, `updated_at`. One document per user, typed `jsonb`, keyed by `user_id` only |
 | `email_tokens` | Verify/reset link tokens | `token_hash text UNIQUE`, `user_id FK→users`, `purpose` (`verify`/`reset`), `expires_at` (verify 24 h / **reset 30 min**), `used_at NULL`. One-time use |
@@ -45,7 +45,7 @@ All auth POSTs return uniform responses and never confirm whether an email exist
 - **POST /auth/password-reset-request** `{email}` → uniform 202 regardless of existence; token to outbox (reset tokens expire after **30 minutes**).
 - **POST /auth/password-reset** `{token, new_password}` → updates `password_hash`, consumes token, and **revokes all sessions** of the user. Uniform 200.
 
-**Session cookie:** name `gp_session`; value = 256-bit random (base64url). Cookie flags `HttpOnly; SameSite=Lax; Path=/; Max-Age=30d` + `Secure` whenever `GP_PUBLIC_BASE_URL` is https (dev http: Secure must be off or curl/phone can't use it — this is the one dev-only relaxation, gated to a single env value and listed in the threat table). Server stores only `SHA-256(value)` — a leaked DB does not yield usable session tokens. Every login creates a *fresh* session (no reuse); logout deletes the row; expired rows are deleted opportunistically.
+**Session cookie:** name `gp_session`; value = 256-bit random (base64url). Cookie flags `HttpOnly; SameSite=Lax; Path=/; Max-Age=30d` + `Secure` whenever `GP_PUBLIC_BASE_URL` is https (dev http: Secure must be off or curl/phone can't use it — this is the one dev-only relaxation, gated to a single env value and listed in the threat table). Server stores only `SHA-256(value)` — a leaked DB does not yield usable session tokens. Expiry **slides to now + 7 days on every authenticated use, capped at 30 days absolute from creation** — a session dies after 7 days idle or 30 days after creation, whichever comes first; lapsed windows are never resurrected. Every login creates a *fresh* session (no reuse — rotating the identifier on each login); a password change ends every *other* session and rotates the current session's token in place; logout deletes the row; expired rows are deleted opportunistically.
 
 ## 5. OAuth — Google & GitHub
 
@@ -137,6 +137,10 @@ POST /auth/login                       {email, password}
 POST /auth/logout                      (session)
 POST /auth/password-reset-request      {email}
 POST /auth/password-reset              {token, new_password}
+POST /auth/password-change             {current_password, new_password}  (session; ends other sessions)
+GET  /auth/sessions                                      (session; id/created/expires/current, never the token)
+POST /auth/sessions/{id}/revoke                          (session)
+POST /auth/logout-everywhere                             (session; ends all sessions)
 GET  /auth/oauth/{provider}/start
 GET  /auth/oauth/{provider}/callback
 POST /auth/api-keys                    {name}            (session)
@@ -149,8 +153,15 @@ PUT  /api/user-data                        {json doc}    (session or API key, �
 
 ## 12. Configuration (env / untracked `.env`)
 
-`DATABASE_URL` · `GP_HTTP_ADDR` (default `:8080`) · `GP_PUBLIC_BASE_URL` (cookie Secure + OAuth redirects derive from it) · `GP_MAIL_DRIVER=outbox|smtp` · `GP_SMTP_HOST/PORT/USER/PASS/FROM` (off unless smtp) · `GP_TRUSTED_PROXIES` (default none) · `GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET` · `GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET`.
+`DATABASE_URL` (API pool; Neon pooler-compatible) · `DATABASE_URL_DIRECT` (direct connection, used by migrations; optional — falls back to `DATABASE_URL`) · `GP_HTTP_ADDR` (default `:8080`) · `GP_PUBLIC_BASE_URL` (cookie Secure + OAuth redirects derive from it; with `ENV=production` an http base URL is refused at boot) · `ENV` (only value checked: `production` — also refuses the outbox mail driver) · `GP_MAIL_DRIVER=outbox|smtp` · `GP_SMTP_HOST/PORT/USER/PASS/FROM` (off unless smtp) · `GP_TRUSTED_PROXIES` (default none) · `GP_AUTH_CAP` (auth POSTs per IP per 15 min, default 100) · `GP_LOCKOUT_AFTER` (failed logins locking an IP+email pair, default 5) · `GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET` · `GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET`.
 
 ## 13. Out of scope, deliberately (v1 backend)
 
-2FA, admin UI, audit log, transactional email beyond verify/reset/welcome, key expiry/rotation policies, refresh tokens, signup “magic links”, tests for anything but this domain. Each is a checklist item for a later version, not withheld-by-oversight.
+Admin UI, audit log, transactional email beyond verify/reset/welcome, key expiry/rotation policies, refresh tokens, signup “magic links”, tests for anything but this domain. Each is a checklist item for a later version, not withheld-by-oversight.
+
+## 14. Planned (next version)
+
+- **Account deletion** — self-service, password- or email-confirmed; cascades sessions, API keys, OAuth identities and user data.
+- **Data export** — downloadable JSON of account metadata + all user data rows.
+- **Email change** — mails a confirmation token to the *new* address before swapping it (sessions survive; the address is the login key, so it must be verified first).
+- **2FA** — TOTP with recovery codes, enforced at login and on sensitive endpoints.
