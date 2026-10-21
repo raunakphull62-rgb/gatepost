@@ -1,0 +1,8 @@
+# secrets & local state
+.env
+.env.*
+!*.example
+outbox/
+*.local
+# binaries
+/gatepost
