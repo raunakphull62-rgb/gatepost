@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -71,8 +72,25 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return s.mux }
-func (s *Server) Addr() string          { return s.cfg.Addr }
+func (s *Server) Handler() http.Handler {
+	// CSRF defense (§9): browsers auto-attach our cookie to cross-site
+	// POST/PUT/DELETEs; SameSite=Lax blunts that, this closes the remaining
+	// gap — when an Origin header is present it must name this very
+	// Host. Non-browser clients send no Origin and pass untouched.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || u.Host == "" || u.Host != r.Host {
+					fail(w, http.StatusForbidden, "cross-origin request refused")
+					return
+				}
+			}
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+func (s *Server) Addr() string { return s.cfg.Addr }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("POST /auth/signup", s.signup)

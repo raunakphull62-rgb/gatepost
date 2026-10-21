@@ -19,6 +19,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -752,6 +753,119 @@ func TestLogoutEverywhere(t *testing.T) {
 	}
 	if n := countRows(t, pool, "sessions", ""); n != 0 {
 		t.Fatalf("want 0 sessions, got %d", n)
+	}
+}
+
+// TestAuthCapDefaults proves the shipped defaults that cap tests pace
+// around on purpose: 100 auth POSTs / IP / 15 min, lockout after 5.
+func TestAuthCapDefaults(t *testing.T) {
+	s := New(Config{BaseURL: "http://placeholder"}, nil, nil)
+	if s.cfg.AuthCap != 100 || s.cfg.LockoutAfter != 5 {
+		t.Fatalf("defaults: want 100/5, got %d/%d", s.cfg.AuthCap, s.cfg.LockoutAfter)
+	}
+}
+
+// TestLoginConstantTime — login failures for an unknown account run a dummy
+// argon2 verify, so timing does not reveal which accounts exist. Medians of
+// both failure paths must be far apart neither (3x error band) and both must
+// actually do the argon2 work (well above a fast-path microsecond 401).
+func TestLoginConstantTime(t *testing.T) {
+	pool := testPool(t)
+	email := "ct-" + randHex(t, 4) + "@x.test"
+	c, _ := newTestServer(t, pool, func(cfg *Config) { // headroom for the many failed logins below
+		cfg.AuthCap, cfg.LockoutAfter = 40, 30
+	})
+	c.must("POST", "/auth/signup", `{"email":"`+email+`","password":"secretpw123"}`, http.StatusOK)
+	c.must("POST", "/auth/verify", `{"token":"`+lastEmailToken(t, pool, "verify")+`"}`, http.StatusOK)
+
+	median := func(unknown bool) time.Duration {
+		var all []time.Duration
+		for i := 0; i < 7; i++ {
+			who := email
+			if unknown {
+				who = "ghost-" + randHex(t, 4) + "@x.test"
+			}
+			start := time.Now()
+			if code, _ := c.do("POST", "/auth/login",
+				`{"email":"`+who+`","password":"wrongwrongw"}`); code != http.StatusUnauthorized {
+				t.Fatalf("login %s: want 401", who)
+			}
+			all = append(all, time.Since(start))
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+		return all[len(all)/2]
+	}
+	unk, known := median(true), median(false)
+	const floor = 5 * time.Millisecond
+	if unk < floor || known < floor {
+		t.Fatalf("argon2 missed on a failure path: unknown %v, known %v", unk, known)
+	}
+	if unk > 3*known || known > 3*unk {
+		t.Fatalf("login timing distinguishes accounts: unknown %v vs known %v", unk, known)
+	}
+}
+
+// TestCSRFOriginGuard — cookie-authenticated state changes refuse a
+// mismatching Origin header (browsers auto-attach cookies cross-site);
+// same-origin and Origin-less (API) clients pass.
+func TestCSRFOriginGuard(t *testing.T) {
+	pool := testPool(t)
+	c := signupVerify(t, pool, "csrf-"+randHex(t, 4)+"@x.test", "secretpw123")
+	u, err := url.Parse(c.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := func(method, path, body, origin string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(method, c.base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", c.ip)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		for _, ck := range c.hc.Jar.Cookies(u) {
+			req.AddCookie(ck)
+		}
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	// no Origin header (API/testing client) → allowed
+	if code, _ := attempt("PUT", "/api/user-data", `{"a":1}`, ""); code != http.StatusOK {
+		t.Fatalf("origin-less PUT: want 200, got %d", code)
+	}
+	// cross-site PUT: refused, and the data is untouched
+	if code, _ := attempt("PUT", "/api/user-data", `{"a":2}`, "https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("evil-origin PUT: want 403, got %d", code)
+	}
+	if code, b := attempt("GET", "/api/user-data", "", ""); code != http.StatusOK || !wantJSON(t, b, `{"a":1}`) {
+		t.Fatalf("data mutated by refused PUT: %d %s", code, b)
+	}
+	// cross-site POST (logout-by-CSRF): refused, session lives
+	if code, _ := attempt("POST", "/auth/logout", "", "https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("evil-origin POST: want 403, got %d", code)
+	}
+	if code, _ := attempt("GET", "/api/me", "", ""); code != http.StatusOK {
+		t.Fatalf("session killed by refused CSRF: %d", code)
+	}
+	// same-origin and garbage-free case passes
+	if code, _ := attempt("PUT", "/api/user-data", `{"a":3}`, c.base); code != http.StatusOK {
+		t.Fatalf("same-origin PUT: want 200, got %d", code)
+	}
+	if _, b := attempt("GET", "/api/user-data", "", ""); !wantJSON(t, b, `{"a":3}`) {
+		t.Fatalf("same-origin PUT not applied: %s", b)
+	}
+	// malformed Origin can never pass
+	if code, _ := attempt("PUT", "/api/user-data", `{"a":4}`, "::::"); code != http.StatusForbidden {
+		t.Fatalf("malformed origin: want 403, got %d", code)
 	}
 }
 

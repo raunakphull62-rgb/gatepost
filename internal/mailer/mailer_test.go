@@ -149,13 +149,15 @@ func (f *fakeSMTP) dialogue(conn net.Conn, greet bool) {
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 64<<10), 64<<10)
 	var buf bytes.Buffer
-	defer func() {
+	flush := func() {
 		f.mu.Lock()
 		if buf.Len() > 0 {
 			f.bodies = append(f.bodies, buf.String())
+			buf.Reset()
 		}
 		f.mu.Unlock()
-	}()
+	}
+	defer flush() // no-op once DATA flushed below — closes the test-assert race
 	write := func(s string) { fmt.Fprint(conn, s) }
 	if greet {
 		write("220 fake ready\r\n")
@@ -199,6 +201,7 @@ func (f *fakeSMTP) dialogue(conn net.Conn, greet bool) {
 				f.cmds = append(f.cmds, "#body:"+b)
 				f.mu.Unlock()
 				if b == "." {
+					flush() // record before the 250 so writers can assert right after Send returns
 					write("250 queued\r\n")
 					break
 				}

@@ -149,6 +149,16 @@ check $((s++)) "device 1 session dead" "$(pcode -b "$JAR" "$BASE/api/me")" 401
 check $((s++)) "login still possible afterwards" \
   "$(code -X POST "$BASE/auth/login" -c /dev/null -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW3\"}")" 200
 
+# storage + cookie hygiene, shown: cookie flags from a live Set-Cookie header
+# and the argon2id PHC string in the database (never a plaintext password)
+CD=$(curl -sS -D - -o /dev/null -X POST "$BASE/auth/login" -c /dev/null \
+  -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW3\"}" | tr -d '\r' | grep -i '^set-cookie:')
+check $((s++)) "session cookie flags shown (HttpOnly, Path=/, SameSite=Lax)" \
+  "$(printf '%s' "$CD" | grep -oc 'HttpOnly')/$(printf '%s' "$CD" | grep -oc 'SameSite=Lax')/$(printf '%s' "$CD" | grep -oc 'Path=/')" "1/1/1"
+DBURL="$(sed -n 's/^DATABASE_URL=//p' .env)"
+check $((s++)) "argon2id PHC hash stored (db shows hash, never plaintext)" \
+  "$(psql "$DBURL" -tAc "SELECT count(*) FROM users WHERE email = '$U' AND password_hash LIKE '\$argon2id\$%'")" 1
+
 echo
 echo "=== demo: $PASS pass, $FAIL fail ==="
 [ "$FAIL" -eq 0 ]
