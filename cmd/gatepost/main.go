@@ -46,9 +46,10 @@ func main() {
 		Production: envfile.Production(),
 		SMTPHost:   os.Getenv("GP_SMTP_HOST"),
 		SMTPPort:   os.Getenv("GP_SMTP_PORT"),
-		SMTPUser:   os.Getenv("GP_SMTP_USER"),
-		SMTPPass:   os.Getenv("GP_SMTP_PASSWORD"),
-		SMTPSecure: true,
+		SMTPUser:  os.Getenv("GP_SMTP_USER"),
+		SMTPPass:  os.Getenv("GP_SMTP_PASSWORD"),
+		SMTPTLS:     os.Getenv("GP_SMTP_TLS"),
+		InsecureTLS: os.Getenv("GP_SMTP_INSECURE") == "true",
 	}
 	sender, err := mailer.New(pool, mailCfg)
 	if err != nil {

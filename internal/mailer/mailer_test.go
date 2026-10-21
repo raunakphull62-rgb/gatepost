@@ -8,8 +8,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -95,13 +101,29 @@ type fakeSMTP struct {
 	t      *testing.T
 	mu     sync.Mutex
 	bodies []string
+	cmds   []string // every command line the relay saw
+	mode   string   // "" | "start" (offers STARTTLS) | "implicit" (TLS from accept)
+	srvTLS *tls.Config
 }
 
 func (f *fakeSMTP) listen(t *testing.T) (addr string, done func()) {
 	t.Helper()
+	return f.listenMode(t, "")
+}
+
+// listenMode also supports "start" (EHLO offers STARTTLS, upgrades on
+// command) and "implicit" (accepts a TLS connection directly) — both with a
+// self-signed certificate.
+func (f *fakeSMTP) listenMode(t *testing.T, mode string) (addr string, done func()) {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	f.mode = mode
+	if mode == "start" || mode == "implicit" {
+		cert := selfSigned(t)
+		f.srvTLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
 	serveDone := make(chan struct{})
 	go func() {
@@ -111,38 +133,71 @@ func (f *fakeSMTP) listen(t *testing.T) (addr string, done func()) {
 			if err != nil {
 				return
 			}
-			go f.handle(conn)
+			if mode == "implicit" {
+				conn = tls.Server(conn, f.srvTLS)
+			}
+			go f.dialogue(conn, true)
 		}
 	}()
 	return l.Addr().String(), func() { l.Close(); <-serveDone }
 }
 
-// handle speaks just enough SMTP: EHLO (no STARTTLS, no AUTH advertised),
-// MAIL/RCPT ok, DATA collected. Bodies needed no TLS because no auth is
-// configured (nil auth skip).
-func (f *fakeSMTP) handle(conn net.Conn) {
+// dialogue speaks just enough SMTP: EHLO (caps depend on the configured
+// mode), optional STARTTLS upgrade, AUTH ok, MAIL/RCPT ok, DATA collected.
+func (f *fakeSMTP) dialogue(conn net.Conn, greet bool) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 64<<10), 64<<10)
 	var buf bytes.Buffer
 	defer func() {
 		f.mu.Lock()
-		f.bodies = append(f.bodies, buf.String())
+		if buf.Len() > 0 {
+			f.bodies = append(f.bodies, buf.String())
+		}
 		f.mu.Unlock()
 	}()
 	write := func(s string) { fmt.Fprint(conn, s) }
-	write("220 fake ready\r\n")
+	if greet {
+		write("220 fake ready\r\n")
+	}
 	for sc.Scan() {
 		line := strings.ToUpper(strings.TrimSpace(sc.Text()))
+		f.mu.Lock()
+		f.cmds = append(f.cmds, line)
+		f.mu.Unlock()
 		switch {
 		case strings.HasPrefix(line, "EHLO"):
-			write("250-fake.local\r\n250 8BITMIME\r\n") // no STARTTLS, no AUTH
+			// one 250 space-line only: it must be the LAST of the reply
+			caps := "250 8BITMIME\r\n"
+			if f.mode == "start" && f.srvTLS != nil {
+				caps = "250-STARTTLS\r\n250-AUTH PLAIN\r\n250 8BITMIME\r\n"
+			} else if f.srvTLS != nil {
+				caps = "250-AUTH PLAIN\r\n250 8BITMIME\r\n"
+			}
+			write("250-fake.local\r\n" + caps)
+		case line == "STARTTLS":
+			if f.srvTLS == nil || f.mode != "start" {
+				write("502 not supported\r\n")
+				continue
+			}
+			write("220 go ahead\r\n")
+			tc := tls.Server(conn, f.srvTLS)
+			if err := tc.Handshake(); err != nil {
+				return
+			}
+			f.dialogue(tc, false) // continue the protocol inside TLS
+			return
+		case strings.HasPrefix(line, "AUTH"):
+			write("235 ok\r\n")
 		case strings.HasPrefix(line, "MAIL FROM"), strings.HasPrefix(line, "RCPT TO"), line == "RSET":
 			write("250 ok\r\n")
 		case line == "DATA":
 			write("354 go ahead\r\n")
 			for sc.Scan() {
 				b := sc.Text()
+				f.mu.Lock()
+				f.cmds = append(f.cmds, "#body:"+b)
+				f.mu.Unlock()
 				if b == "." {
 					write("250 queued\r\n")
 					break
@@ -159,6 +214,30 @@ func (f *fakeSMTP) handle(conn net.Conn) {
 			write("250 ok\r\n")
 		}
 	}
+}
+
+// selfSigned generates a throwaway relay certificate for the TLS tests.
+func selfSigned(t *testing.T) tls.Certificate {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "gatepost-smtp.test"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
 }
 
 func TestSMTPStoresNoMessageBodies(t *testing.T) {
@@ -201,6 +280,94 @@ func TestSMTPStoresNoMessageBodies(t *testing.T) {
 
 func hostOnly(addr string) string { host, _, _ := net.SplitHostPort(addr); return host }
 func portOf(addr string) string   { _, p, _ := net.SplitHostPort(addr); return p }
+
+// sendSMTPMsg is the shared helper: a complete send, with or without creds.
+func sendSMTPMsg(t *testing.T, addr, tlsMode string, insecure, withCreds bool) error {
+	t.Helper()
+	s := NewSMTP(Config{Driver: "smtp",
+		SMTPHost:    hostOnly(addr),
+		SMTPPort:    portOf(addr),
+		SMTPTLS:     tlsMode,
+		InsecureTLS: insecure,
+		From:        "gatepost@localhost"})
+	if withCreds {
+		s.cfg.SMTPUser, s.cfg.SMTPPass = "relay-user", "relay-pass-supersecret"
+	}
+	return s.Send(context.Background(), Message{To: "user@x.test", Subject: "Verify your Gatepost account",
+		TextBody: "token tok123", Kind: "verify"})
+}
+
+func sawCommand(t *testing.T, f *fakeSMTP, prefix string) bool {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.cmds {
+		if strings.HasPrefix(c, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSMTPCredentialsOnlyOverTLS — a relay with a self-signed certificate
+// accepts credentials both on implicit TLS (465 convention) and after a
+// required STARTTLS upgrade (587 convention). A relay that cannot upgrade
+// gets NO credentials: the client refuses before AUTH and before MAIL.
+func TestSMTPCredentialsOnlyOverTLS(t *testing.T) {
+	cases := []struct {
+		name        string
+		relay, dial string // fake relay mode / client TLS knob
+	}{
+		{"implicit-tls", "implicit", "implicit"},
+		{"starttls", "start", "starttls"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeSMTP{t: t}
+			addr, done := f.listenMode(t, c.relay)
+			defer done()
+			if err := sendSMTPMsg(t, addr, c.dial, true, true); err != nil {
+				t.Fatalf("send over %s: %v", c.relay, err)
+			}
+			if !sawCommand(t, f, "AUTH PLAIN") {
+				t.Fatal("credentials were not sent over TLS")
+			}
+			f.mu.Lock()
+			bodies := append([]string(nil), f.bodies...)
+			f.mu.Unlock()
+			if len(bodies) != 1 || !strings.Contains(bodies[0], "token tok123") {
+				t.Fatalf("relay got %q", bodies)
+			}
+		})
+	}
+
+	// TLS unavailable (plain relay, no STARTTLS) → credentials refused in
+	// place: no AUTH, no MAIL, no message leaves the client.
+	f := &fakeSMTP{t: t}
+	addr, done := f.listenMode(t, "")
+	defer done()
+	err := sendSMTPMsg(t, addr, "", false, true)
+	if err == nil || !strings.Contains(err.Error(), "refusing to send credentials over an unencrypted connection") {
+		t.Fatalf("plain relay with creds: want refusal error, got %v", err)
+	}
+	if sawCommand(t, f, "AUTH") {
+		t.Fatal("credentials leaked to an unencrypted relay")
+	}
+	if sawCommand(t, f, "MAIL FROM") {
+		t.Fatal("message sent despite refused credentials")
+	}
+}
+
+// TestSMTPNoCredsPlainsStillOK: a credential-less relay (local mail suck
+// servers) may stay unencrypted — nothing to protect.
+func TestSMTPNoCredsPlainStillOK(t *testing.T) {
+	f := &fakeSMTP{t: t}
+	addr, done := f.listenMode(t, "")
+	defer done()
+	if err := sendSMTPMsg(t, addr, "", false, false); err != nil {
+		t.Fatalf("no-creds plain send: %v", err)
+	}
+}
 
 func TestOutboxPruneDeletesOlderThan7Days(t *testing.T) {
 	pool := testPool(t)
