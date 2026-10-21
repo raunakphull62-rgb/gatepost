@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	sessionCookie = "gp_session"
-	sessionMaxAge = 30 * 24 * time.Hour
+	sessionCookie    = "gp_session"
+	sessionMaxAge    = 30 * 24 * time.Hour
+	sessionSlideDays = 7  // expiry slides to now()+7d on every use
+	sessionAbsDays   = 30 // never past created_at+30d, no matter how active
 )
 
 type Config struct {
@@ -79,6 +81,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /auth/logout", s.logout)
 	s.mux.HandleFunc("POST /auth/password-reset-request", s.resetRequest)
 	s.mux.HandleFunc("POST /auth/password-reset", s.resetComplete)
+	s.mux.HandleFunc("POST /auth/password-change", s.changePassword)
 	s.mux.HandleFunc("POST /auth/api-keys", s.requireSession(s.createAPIKey))
 	s.mux.HandleFunc("GET /auth/api-keys", s.requireSession(s.listAPIKeys))
 	s.mux.HandleFunc("POST /auth/api-keys/{id}/revoke", s.requireSession(s.revokeAPIKey))
@@ -190,6 +193,10 @@ func (s *Server) principal(r *http.Request) (*Principal, string, error) {
 	return &p, "", nil
 }
 
+// sessionPrincipal resolves the cookie and, in the same query, SLIDES the
+// session's expiry to now() + 7 days — capped at 30 days absolute from
+// creation. Expired or absolute-lapsed sessions fail the WHERE here, so the
+// row is never resurrected.
 func (s *Server) sessionPrincipal(r *http.Request) (*Principal, string, error) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
@@ -197,9 +204,13 @@ func (s *Server) sessionPrincipal(r *http.Request) (*Principal, string, error) {
 	}
 	hash := token.SHA256Hex(c.Value)
 	row := s.pool.QueryRow(r.Context(), `
-		SELECT u.id::text, u.email, s.token_hash
-		FROM sessions s JOIN users u ON u.id = s.user_id
-		WHERE s.token_hash = $1 AND s.expires_at > now()`, hash)
+		UPDATE sessions s
+		SET expires_at = least(now() + interval '7 days', s.created_at + interval '30 days')
+		FROM users u
+		WHERE s.token_hash = $1 AND s.expires_at > now()
+		  AND s.created_at + interval '30 days' > now()
+		  AND u.id = s.user_id
+		RETURNING u.id::text, u.email, s.token_hash`, hash)
 	var p Principal
 	var th string
 	if err := row.Scan(&p.UserID, &p.Email, &th); err != nil {
@@ -234,22 +245,41 @@ func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request, *P
 	}
 }
 
-// newSession stores only the token hash and sets the cookie.
+// newSession stores only the token hash and sets the cookie. The row starts
+// with a 7-day sliding expiry (30-day absolute cap, enforced at slide time).
 func (s *Server) newSession(w http.ResponseWriter, r *http.Request, userID string) error {
 	tok := token.New()
 	_, err := s.pool.Exec(r.Context(), `INSERT INTO sessions (token_hash, user_id, expires_at)
-		VALUES ($1, $2, now() + interval '30 days')`, token.SHA256Hex(tok), userID)
+		VALUES ($1, $2, now() + interval '7 days')`, token.SHA256Hex(tok), userID)
 	if err != nil {
 		return err
 	}
+	setSessionCookie(w, s.secureCookie, tok)
 	// opportunistic cleanup of expired sessions
 	_, _ = s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE expires_at < now()`)
 
+	return nil
+}
+
+// setSessionCookie writes the session cookie; rotation reuses it.
+func setSessionCookie(w http.ResponseWriter, secure bool, tok string) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/",
-		HttpOnly: true, Secure: s.secureCookie,
+		HttpOnly: true, Secure: secure,
 		SameSite: http.SameSiteLaxMode, MaxAge: int(sessionMaxAge.Seconds()),
 	})
+}
+
+// rotateSession swaps the current session's token (same row, same window), so
+// a stolen token dies the moment the password changes. The new cookie is
+// written for the still-authenticated caller.
+func (s *Server) rotateSession(r *http.Request, w http.ResponseWriter, oldHash string) error {
+	tok := token.New()
+	if _, err := s.pool.Exec(r.Context(), `UPDATE sessions SET token_hash = $2
+		WHERE token_hash = $1`, oldHash, token.SHA256Hex(tok)); err != nil {
+		return err
+	}
+	setSessionCookie(w, s.secureCookie, tok)
 	return nil
 }
 

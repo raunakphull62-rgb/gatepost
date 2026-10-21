@@ -221,6 +221,80 @@ func (s *Server) resetRequest(w http.ResponseWriter, r *http.Request) {
 		"message": "if the address exists, a reset link was sent"})
 }
 
+// POST /auth/password-change {current_password, new_password} — session
+// only. Verifies the current password, sets the new hash, ends every OTHER
+// session of the user and rotates the caller's session id. A wrong current
+// password counts against the (IP, email) lockout like a failed login.
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	p, th, err := s.principal(r)
+	if err != nil || th == "" {
+		fail(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	if !validPassword(body.NewPassword) {
+		fail(w, http.StatusBadRequest, "invalid password")
+		return
+	}
+	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), s.cfg.AuthCap); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	} else if !ok {
+		tooMany(w)
+		return
+	}
+	var hash *string
+	err = s.pool.QueryRow(r.Context(), `SELECT password_hash FROM users WHERE id = $1`,
+		p.UserID).Scan(&hash)
+	if err != nil || hash == nil {
+		fail(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	if valid, verr := password.Verify(*hash, body.CurrentPassword); verr != nil || !valid {
+		lockKey := "lock|" + s.clientIP(r) + "|" + strings.ToLower(p.Email)
+		_, _ = s.bumpRate(r.Context(), lockKey, s.cfg.LockoutAfter)
+		fail(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	newHash, err := password.Hash(body.NewPassword)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `UPDATE users SET password_hash = $1,
+		updated_at = now() WHERE id = $2`, newHash, p.UserID); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// end every other session, then rotate this one in place
+	if _, err := tx.Exec(r.Context(), `DELETE FROM sessions
+		WHERE user_id = $1 AND token_hash <> $2`, p.UserID, th); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.rotateSession(r, w, th); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	done(w, http.StatusOK)
+}
+
 // POST /auth/password-reset {token, new_password} — sets the hash, kills all
 // sessions of the user.
 func (s *Server) resetComplete(w http.ResponseWriter, r *http.Request) {

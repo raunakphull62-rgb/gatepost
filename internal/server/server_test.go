@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -483,6 +484,158 @@ func TestAuthCapConfigurable(t *testing.T) {
 }
 
 // --- API keys -------------------------------------------------------------------
+
+// execSQL runs admin-style SQL in tests (session window backdating etc.).
+func execSQL(t *testing.T, pool *pgxpool.Pool, q string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), q); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sessionTimes reads one session row's window edges.
+func sessionTimes(t *testing.T, pool *pgxpool.Pool, email string) (created, expires time.Time) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(),
+		`SELECT s.created_at, s.expires_at FROM sessions s
+		 JOIN users u ON u.id = s.user_id WHERE u.email = $1
+		 ORDER BY s.created_at DESC LIMIT 1`, email).Scan(&created, &expires)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return
+}
+
+func columnStrings(t *testing.T, pool *pgxpool.Pool, q string) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// TestSessionExpirySlides: sessions slide to now+7d on use, never past
+// created_at+30d absolute; once the absolute window lapses the session is
+// dead for good.
+func TestSessionExpirySlides(t *testing.T) {
+	pool := testPool(t)
+	email := "slide-" + randHex(t, 4) + "@x.test"
+	c := signupVerify(t, pool, email, "secretpw123")
+
+	// fresh session starts at ~7d (not 30d)
+	_, exp := sessionTimes(t, pool, email)
+	if d := time.Until(exp); d < 167*time.Hour || d > 7*24*time.Hour+time.Minute {
+		t.Fatalf("fresh expiry: want ~7d, got %v", d)
+	}
+
+	// stale row + use → slides back out to ~7d from now
+	execSQL(t, pool, `UPDATE sessions SET expires_at = now() + interval '1 hour'`)
+	c.must("GET", "/api/me", "", http.StatusOK)
+	_, exp = sessionTimes(t, pool, email)
+	if d := time.Until(exp); d < 167*time.Hour {
+		t.Fatalf("slid expiry: want ~7d, got %v", d)
+	}
+
+	// 29-day-old session: slide capped at created_at+30d (≈ now+1d)
+	execSQL(t, pool, `UPDATE sessions SET created_at = now() - interval '29 days',
+		expires_at = now() + interval '1 hour'`)
+	c.must("GET", "/api/me", "", http.StatusOK)
+	_, exp = sessionTimes(t, pool, email)
+	if d := time.Until(exp); d < 23*time.Hour || d > 25*time.Hour {
+		t.Fatalf("absolute cap: want ~1d, got %v", d)
+	}
+
+	// 31-day-old session: absolute window passed → dead, not resurrected
+	execSQL(t, pool, `UPDATE sessions SET created_at = now() - interval '31 days',
+		expires_at = now() + interval '5 minutes'`)
+	if code, _ := c.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("lapsed absolute: want 401")
+	}
+}
+
+// TestSessionRotation: login always issues a fresh session; password change
+// ends every other session and rotates the caller's token in place.
+func TestSessionRotation(t *testing.T) {
+	pool := testPool(t)
+	email := "rot-" + randHex(t, 4) + "@x.test"
+	c := signupVerify(t, pool, email, "oldepw12345")
+	if n := countRows(t, pool, "sessions", ""); n != 1 {
+		t.Fatalf("after verify: want 1 session, got %d", n)
+	}
+
+	// login rotates by creating a fresh session (old row stays until cleaned)
+	c.must("POST", "/auth/login", `{"email":"`+email+`","password":"oldepw12345"}`, http.StatusOK)
+	if n := countRows(t, pool, "sessions", ""); n != 2 {
+		t.Fatalf("after re-login: want 2 sessions, got %d", n)
+	}
+
+	// and a second device gets its own session
+	c2 := unfollow(c)
+	c2.must("POST", "/auth/login", `{"email":"`+email+`","password":"oldepw12345"}`, http.StatusOK)
+	c2.must("GET", "/api/me", "", http.StatusOK)
+	before := columnStrings(t, pool, `SELECT token_hash FROM sessions`)
+	if len(before) != 3 {
+		t.Fatalf("want 3 sessions, got %d", len(before))
+	}
+
+	// password-change is session-only: bearer is refused
+	key := c.must("POST", "/auth/api-keys", `{"name":"t"}`, http.StatusCreated)
+	kid := struct{ Key string }{}
+	json.Unmarshal([]byte(key), &kid) //nolint:errcheck — shape covered by TestAPIKeys
+	bearer := tc{t: t, base: c.base, ip: c.ip, hc: &http.Client{Transport: bearerRT(kid.Key)}}
+	if code, _ := bearer.do("POST", "/auth/password-change",
+		`{"current_password":"oldepw12345","new_password":"newpw123456"}`); code != http.StatusUnauthorized {
+		t.Fatalf("bearer password-change: want 401, got %d", code)
+	}
+
+	// wrong current password → 401, nothing changes
+	if code, _ := c.do("POST", "/auth/password-change",
+		`{"current_password":"wrongwrong","new_password":"newpw123456"}`); code != http.StatusUnauthorized {
+		t.Fatalf("wrong current pw: want 401, got %d", code)
+	}
+	if n := countRows(t, pool, "sessions", ""); n != 3 {
+		t.Fatalf("failed change must not touch sessions, got %d", n)
+	}
+
+	// weak new password → 400
+	if code, _ := c.do("POST", "/auth/password-change",
+		`{"current_password":"oldepw12345","new_password":"short"}`); code != http.StatusBadRequest {
+		t.Fatalf("weak new pw: want 400, got %d", code)
+	}
+
+	// correct change: current session rotated (hash not in old set), others die
+	c.must("POST", "/auth/password-change",
+		`{"current_password":"oldepw12345","new_password":"newpw123456"}`, http.StatusOK)
+	after := columnStrings(t, pool, `SELECT token_hash FROM sessions`)
+	if len(after) != 1 {
+		t.Fatalf("after change: want 1 session, got %d", len(after))
+	}
+	for _, h := range before {
+		if h == after[0] {
+			t.Fatal("session hash was not rotated")
+		}
+	}
+	if code, _ := c2.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("other session survived password change: %d", code)
+	}
+	c.must("GET", "/api/me", "", http.StatusOK) // rotated cookie still valid
+
+	// old password dead, new password works
+	if code, _ := c.do("POST", "/auth/login", `{"email":"`+email+`","password":"oldepw12345"}`); code != http.StatusUnauthorized {
+		t.Fatalf("old password still accepted: %d", code)
+	}
+	c.must("POST", "/auth/login", `{"email":"`+email+`","password":"newpw123456"}`, http.StatusOK)
+}
 
 func TestAPIKeys(t *testing.T) {
 	pool := testPool(t)
