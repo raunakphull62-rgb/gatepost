@@ -31,7 +31,12 @@ type Config struct {
 	GoogleClientSecret string
 	GitHubClientID     string
 	GitHubClientSecret string
-	TrustedProxes      []string // CIDR list of trusted reverse proxies; default: trust nothing
+	// Rate limiting (env in main): max auth POSTs per IP / 15 min, and how
+	// many failed logins trigger the per-(IP,email) lockout. Zeros fall back
+	// to the design defaults (100 / 5) so tests can leave them unset.
+	AuthCap       int
+	LockoutAfter  int
+	TrustedProxes []string // CIDR list of trusted reverse proxies; default: trust nothing
 }
 
 type Principal struct {
@@ -52,6 +57,12 @@ type Server struct {
 func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	s := &Server{cfg: cfg, pool: pool, mail: mail, mux: http.NewServeMux(),
 		secureCookie: strings.HasPrefix(cfg.BaseURL, "https://")}
+	if s.cfg.AuthCap <= 0 {
+		s.cfg.AuthCap = 100 // design default: 100 auth POSTs / IP / 15 min
+	}
+	if s.cfg.LockoutAfter <= 0 {
+		s.cfg.LockoutAfter = 5 // design default: 5 failed logins lock the pair
+	}
 	s.dummy, _ = password.Hash("gatepost-dummy-credentials")
 	s.providers = defaultProviders(cfg)
 	s.routes()

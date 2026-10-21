@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,8 @@ func main() {
 		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+		AuthCap:            atoiEnv("GP_AUTH_CAP"),
+		LockoutAfter:       atoiEnv("GP_LOCKOUT_AFTER"),
 		TrustedProxes:      splitCIDRs(os.Getenv("GP_TRUSTED_PROXIES")),
 	}, pool, sender)
 
@@ -113,4 +116,19 @@ func splitCIDRs(s string) []string {
 		}
 	}
 	return out
+}
+
+// atoiEnv returns 0 when unset/garbage; the server falls back to its design
+// defaults for 0 (and logs nothing — an invalid value must fail loudly here
+// so operators notice).
+func atoiEnv(key string) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("%s must be an integer, got %q", key, v)
+	}
+	return n
 }

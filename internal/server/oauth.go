@@ -75,7 +75,7 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "unknown provider")
 		return
 	}
-	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), authCapPerIP); err != nil {
+	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), s.cfg.AuthCap); err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	} else if !ok {

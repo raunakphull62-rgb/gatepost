@@ -45,7 +45,7 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "invalid email or password")
 		return
 	}
-	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), authCapPerIP); err != nil {
+	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), s.cfg.AuthCap); err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	} else if !ok {
@@ -130,7 +130,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	ok, err := s.bumpRate(r.Context(), "auth|"+ip, authCapPerIP)
+	ok, err := s.bumpRate(r.Context(), "auth|"+ip, s.cfg.AuthCap)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
@@ -160,7 +160,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	valid, verr := password.Verify(stored, c.Password)
 	if err != nil || !valid || verr != nil {
-		_, _ = s.bumpRate(r.Context(), lockKey, lockoutAfter)
+		_, _ = s.bumpRate(r.Context(), lockKey, s.cfg.LockoutAfter)
 		fail(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -200,7 +200,7 @@ func (s *Server) resetRequest(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "invalid email")
 		return
 	}
-	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), authCapPerIP); err != nil {
+	if ok, err := s.bumpRate(r.Context(), "auth|"+s.clientIP(r), s.cfg.AuthCap); err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	} else if !ok {

@@ -1,6 +1,8 @@
 // Package server — rate limiting (design §7): Postgres-backed counters keyed
 // by real client IP (+ email for login lockout). Windows are 15 minutes; the
-// counter resets atomically once a window lapses.
+// counter resets atomically once a window lapses. The per-IP auth cap and the
+// failure-lockout threshold come from the Server config (env in main):
+// GP_AUTH_CAP default 100, GP_LOCKOUT_AFTER default 5.
 package server
 
 import (
@@ -9,11 +11,7 @@ import (
 	"time"
 )
 
-const (
-	rateWindow   = 15 * time.Minute
-	authCapPerIP = 20 // POSTs to auth endpoints per IP per window
-	lockoutAfter = 5  // failed logins per (IP, email) pair per window
-)
+const rateWindow = 15 * time.Minute
 
 // bumpRate increments key's counter (resetting when the window lapses) and
 // reports whether count is within limit.
@@ -34,7 +32,7 @@ func (s *Server) bumpRate(ctx context.Context, key string, limit int) (bool, err
 }
 
 // lockedRate reports whether the (IP, email) pair is currently locked out —
-// i.e. lockoutAfter failures within an unexpired window.
+// i.e. LockoutAfter failures within an unexpired window.
 func (s *Server) lockedRate(ctx context.Context, key string) (bool, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `SELECT count FROM rate_limits
@@ -42,7 +40,7 @@ func (s *Server) lockedRate(ctx context.Context, key string) (bool, error) {
 	if err != nil { // incl. no row: not locked
 		return false, nil
 	}
-	return n >= lockoutAfter, nil
+	return n >= s.cfg.LockoutAfter, nil
 }
 
 func tooMany(w http.ResponseWriter) { fail(w, http.StatusTooManyRequests, "too many requests") }

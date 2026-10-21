@@ -121,15 +121,23 @@ func (c tc) must(method, path, body string, want int) string {
 
 // newTestServer wires Server + Outbox on the pool; BaseURL points at the
 // httptest server. Proxies trust 127.0.0.1 so tests can spoof IPs via XFF.
-func newTestServer(t *testing.T, pool *pgxpool.Pool) (tc, *Server) {
+// Caps are pinned to small values (20/5) so cap tests finish quickly —
+// except where a test overrides them via opts.
+func newTestServer(t *testing.T, pool *pgxpool.Pool, opts ...func(*Config)) (tc, *Server) {
 	t.Helper()
-	s := New(Config{
+	cfg := Config{
 		Addr:          "127.0.0.1:0",
 		BaseURL:       "http://placeholder",
 		OutboxDir:     t.TempDir(),
 		Mail:          mailer.Config{Driver: "outbox"},
+		AuthCap:       20,
+		LockoutAfter:  5,
 		TrustedProxes: []string{"127.0.0.1/32"},
-	}, pool, mailer.NewOutbox(pool, t.TempDir()))
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	s := New(cfg, pool, mailer.NewOutbox(pool, t.TempDir()))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	s.cfg.BaseURL = ts.URL
@@ -424,6 +432,8 @@ func TestLoginLockout(t *testing.T) {
 	c.must("POST", "/auth/login", `{"email":"`+email+`","password":"rightpw123"}`, http.StatusOK)
 }
 
+// TestAuthCapPerIP participates the DEFAULT cap only via config override; the
+// configured cap (100/15min default, lockout 5) shares this exact code path.
 func TestAuthCapPerIP(t *testing.T) {
 	pool := testPool(t)
 	c, _ := newTestServer(t, pool)
@@ -440,6 +450,35 @@ func TestAuthCapPerIP(t *testing.T) {
 	c2 := tc{t: t, base: c.base, ip: testIP(t), hc: c.hc}
 	if code, _ := c2.do("POST", "/auth/signup", `{"email":"other-ip@x.test","password":"secretpw123"}`); code != http.StatusOK {
 		t.Fatalf("other ip: want 200, got %d", code)
+	}
+}
+
+// TestAuthCapConfigurable proves the env-driven knobs: a server configured
+// with AuthCap 2 caps the third auth POST, and LockoutAfter 1 locks the pair
+// after a single failure — even for correct credentials. (The two probes
+// use different spoofed IPs so the shared 15-min window doesn't mix them.)
+func TestAuthCapConfigurable(t *testing.T) {
+	pool := testPool(t)
+	loosen := func(c *Config) { c.AuthCap = 2; c.LockoutAfter = 1 }
+	c, _ := newTestServer(t, pool, loosen)
+
+	check := func(email, pw string, want int) {
+		t.Helper()
+		if code, _ := c.do("POST", "/auth/signup", `{"email":"`+email+`","password":"`+pw+`"}`); code != want {
+			t.Fatalf("signup %s: want %d, got %d", email, want, code)
+		}
+	}
+	check("cfg-1@x.test", "secretpw123", http.StatusOK)
+	check("cfg-2@x.test", "secretpw123", http.StatusOK)
+	check("cfg-3@x.test", "secretpw123", http.StatusTooManyRequests) // cap: 2
+
+	// lockout knob on a fresh IP: one failure locks this pair
+	c2 := tc{t: t, base: c.base, ip: testIP(t), hc: c.hc}
+	if code, _ := c2.do("POST", "/auth/login", `{"email":"cfg-2@x.test","password":"wrongwrong"}`); code != http.StatusUnauthorized {
+		t.Fatalf("failed login: want 401, got %d", code)
+	}
+	if code, _ := c2.do("POST", "/auth/login", `{"email":"cfg-2@x.test","password":"secretpw123"}`); code != http.StatusTooManyRequests {
+		t.Fatalf("correct login while locked: want 429, got %d", code)
 	}
 }
 
