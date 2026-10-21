@@ -27,3 +27,10 @@ func Load(path string) {
 		}
 	}
 }
+
+// Production reports whether the process runs in production: any ENV value
+// other than exactly "development" counts (unset, prod, Production …) — a
+// fail-safe default so a typo or forgotten variable cannot ship dev settings.
+func Production() bool {
+	return os.Getenv("ENV") != "development"
+}

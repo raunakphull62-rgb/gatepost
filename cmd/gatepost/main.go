@@ -43,7 +43,7 @@ func main() {
 		Driver:     os.Getenv("GP_MAIL_DRIVER"),
 		OutboxDir:  "outbox",
 		From:       os.Getenv("GP_MAIL_FROM"),
-		Production: os.Getenv("ENV") == "production",
+		Production: envfile.Production(),
 		SMTPHost:   os.Getenv("GP_SMTP_HOST"),
 		SMTPPort:   os.Getenv("GP_SMTP_PORT"),
 		SMTPUser:   os.Getenv("GP_SMTP_USER"),
@@ -77,7 +77,7 @@ func main() {
 	}
 	// Production refuses an http base URL: session cookies set Secure and
 	// OAuth redirects must be https (mirrors the outbox refusal in mailer).
-	if os.Getenv("ENV") == "production" && !strings.HasPrefix(base, "https://") {
+	if envfile.Production() && !strings.HasPrefix(base, "https://") {
 		log.Fatalf("GP_PUBLIC_BASE_URL must be https in production, got %q", base)
 	}
 	srv := server.New(server.Config{

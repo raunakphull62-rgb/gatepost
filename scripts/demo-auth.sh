@@ -41,7 +41,7 @@ mail_token() {
 
 mkdir -p "$OUTDIR"
 go build -o gatepost ./cmd/gatepost || exit 2
-GP_TRUSTED_PROXIES=127.0.0.1/32 ./gatepost >/tmp/gatepost-demo-server.log 2>&1 &
+ENV=development GP_TRUSTED_PROXIES=127.0.0.1/32 ./gatepost >/tmp/gatepost-demo-server.log 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 30); do pcode "$BASE/api/me" >/dev/null 2>&1 && break; sleep 0.5; done
 pcode "$BASE/api/me" >/dev/null 2>&1 || { echo "server did not come up (see /tmp/gatepost-demo-server.log)"; exit 2; }
