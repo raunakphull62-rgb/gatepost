@@ -12,7 +12,7 @@ Toolchain on this server:
 - Docker 29.1.3
 - git 2.43.0
 
-## PART 1 — Design note (docs/auth-design.md) — PENDING · awaiting "continue"
+## PART 1 — Design note (docs/auth-design.md) — DONE, committed 4a219d7 · awaiting review
 Scope to cover: stack (Go API, Postgres in Docker), schema (users, auth_identities,
 sessions, api_keys, user_data JSONB), argon2id, OAuth (Google + GitHub, state/PKCE,
 redirect allowlist, verified-email linking), session cookies (hash-only), API keys
