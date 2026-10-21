@@ -306,6 +306,61 @@ func TestLogout(t *testing.T) {
 	}
 }
 
+// TestExpiredEmailTokens pins the per-purpose TTLs (progress follow-up):
+// verification 24 h, password reset 30 min — and proves an expired token is
+// rejected while a fresh one still works.
+func TestExpiredEmailTokens(t *testing.T) {
+	pool := testPool(t)
+
+	// verify token: stored TTL is ~24 h, and backdating kills it
+	c, _ := newTestServer(t, pool)
+	c.must("POST", "/auth/signup", `{"email":"exp-verify@x.test","password":"secretpw123"}`, http.StatusOK)
+	vt := lastEmailToken(t, pool, "verify")
+	var ttlCheck bool
+	if err := pool.QueryRow(context.Background(),
+		`SELECT expires_at < now() + interval '24 hours 1 minute'
+		   AND expires_at > now() + interval '23 hours'
+		 FROM email_tokens WHERE token_hash = $1`, token.SHA256Hex(vt)).
+		Scan(&ttlCheck); err != nil || !ttlCheck {
+		t.Fatalf("verify token TTL not ~24h (%v, %v)", ttlCheck, err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE email_tokens SET expires_at = now() - interval '1 minute'
+		 WHERE token_hash = $1`, token.SHA256Hex(vt)); err != nil {
+		t.Fatal(err)
+	}
+	c.must("POST", "/auth/verify", `{"token":"`+vt+`"}`, http.StatusBadRequest)
+	if n := countRows(t, pool, "users", "email_verified"); n != 0 {
+		t.Fatalf("expired token still verified: %d users", n)
+	}
+
+	// reset token: stored TTL is ~30 min, and backdating kills it
+	c.must("POST", "/auth/signup", `{"email":"exp-reset@x.test","password":"oldpassword1"}`, http.StatusOK)
+	c.must("POST", "/auth/verify", `{"token":"`+lastEmailToken(t, pool, "verify")+`"}`, http.StatusOK)
+	c.must("POST", "/auth/password-reset-request", `{"email":"exp-reset@x.test"}`, http.StatusAccepted)
+	rt := lastEmailToken(t, pool, "reset")
+	if err := pool.QueryRow(context.Background(),
+		`SELECT expires_at < now() + interval '31 minutes'
+		   AND expires_at > now() + interval '29 minutes'
+		 FROM email_tokens WHERE token_hash = $1`, token.SHA256Hex(rt)).
+		Scan(&ttlCheck); err != nil || !ttlCheck {
+		t.Fatalf("reset token TTL not ~30min (%v, %v)", ttlCheck, err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE email_tokens SET expires_at = now() - interval '1 minute'
+		 WHERE token_hash = $1`, token.SHA256Hex(rt)); err != nil {
+		t.Fatal(err)
+	}
+	c.must("POST", "/auth/password-reset", `{"token":"`+rt+`","new_password":"brandnewpw1"}`, http.StatusBadRequest)
+	c.must("POST", "/auth/login", `{"email":"exp-reset@x.test","password":"oldpassword1"}`, http.StatusOK)
+	// a fresh reset token still works (the expiry filter is per-token)
+	c.must("POST", "/auth/password-reset-request", `{"email":"exp-reset@x.test"}`, http.StatusAccepted)
+	rt2 := lastEmailToken(t, pool, "reset")
+	c.must("POST", "/auth/password-reset", `{"token":"`+rt2+`","new_password":"brandnewpw1"}`, http.StatusOK)
+	c.must("POST", "/auth/login", `{"email":"exp-reset@x.test","password":"oldpassword1"}`, http.StatusUnauthorized)
+	c.must("POST", "/auth/login", `{"email":"exp-reset@x.test","password":"brandnewpw1"}`, http.StatusOK)
+}
+
 func TestPasswordReset(t *testing.T) {
 	pool := testPool(t)
 	email, pw := "reset@x.test", "oldpassword1"

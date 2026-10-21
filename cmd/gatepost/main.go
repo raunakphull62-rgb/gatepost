@@ -42,11 +42,32 @@ func main() {
 		Driver:     os.Getenv("GP_MAIL_DRIVER"),
 		OutboxDir:  "outbox",
 		From:       os.Getenv("GP_MAIL_FROM"),
+		Production: os.Getenv("ENV") == "production",
 		SMTPHost:   os.Getenv("GP_SMTP_HOST"),
 		SMTPPort:   os.Getenv("GP_SMTP_PORT"),
 		SMTPUser:   os.Getenv("GP_SMTP_USER"),
 		SMTPPass:   os.Getenv("GP_SMTP_PASSWORD"),
 		SMTPSecure: true,
+	}
+	sender, err := mailer.New(pool, mailCfg)
+	if err != nil {
+		log.Fatalf("mailer: %v", err)
+	}
+	if !mailCfg.Production && mailCfg.Driver != "smtp" {
+		// Outbox hygiene: files and rows older than 7 days are removed at
+		// boot and hourly. Unneeded in production (outbox is refused there).
+		go func() {
+			for {
+				if err := mailer.Prune(context.Background(), pool, mailCfg.OutboxDir, 7*24*time.Hour); err != nil {
+					log.Printf("outbox prune: %v", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Hour):
+				}
+			}
+		}()
 	}
 
 	base := os.Getenv("GP_PUBLIC_BASE_URL")
@@ -62,7 +83,7 @@ func main() {
 		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 		TrustedProxes:      splitCIDRs(os.Getenv("GP_TRUSTED_PROXIES")),
-	}, pool, mailer.New(pool, mailCfg))
+	}, pool, sender)
 
 	httpSrv := &http.Server{
 		Addr:              srv.Addr(),

@@ -23,7 +23,7 @@ All IDs are **UUIDv4 (random, opaque)**. The user ID is a random *public* identi
 | `sessions` | Server-side sessions | `token_hash text PK` (SHA‑256 of the cookie value), `user_id FK→users`, `created_at`, `expires_at` (30 d). Plaintext token never stored |
 | `api_keys` | Bearer tokens for API access | `id uuid PK`, `user_id FK→users`, `name text`, `key_hash text UNIQUE` (SHA‑256), `prefix text` (~first 12 chars, for the list view), `created_at`, `last_used_at NULL`, `revoked_at NULL`. Plaintext never stored |
 | `user_data` | Per-user JSONB blob | `user_id uuid PK FK→users`, `data jsonb NOT NULL`, `updated_at`. One document per user, typed `jsonb`, keyed by `user_id` only |
-| `email_tokens` | Verify/reset link tokens | `token_hash text UNIQUE`, `user_id FK→users`, `purpose` (`verify`/`reset`), `expires_at` (24 h), `used_at NULL`. One-time use |
+| `email_tokens` | Verify/reset link tokens | `token_hash text UNIQUE`, `user_id FK→users`, `purpose` (`verify`/`reset`), `expires_at` (verify 24 h / **reset 30 min**), `used_at NULL`. One-time use |
 | `oauth_states` | Anti-CSRF state per OAuth attempt | `state text PK`, `provider`, `code_verifier`, `redirect_uri` (must match allowlist), `created_at`, `expires_at` (10 min), `used_at NULL`. One-time |
 | `rate_limits` | Counters & lockouts | `key text PK`, `count int`, `window_start timestamptz`. Atomic upsert; key encodes scope (§7) |
 | `outbox_messages` | Dev mail log | `id bigserial`, `sent_at`, `to_addr`, `subject`, `body text`, `kind`. Written by the outbox mail driver |
@@ -42,7 +42,7 @@ All auth POSTs return uniform responses and never confirm whether an email exist
 - **POST /auth/verify** `{token}` → looks up `email_tokens(purpose='verify')`, one-time + 24 h expiry; sets `email_verified=true`, consumes token, creates a session cookie. **Welcome message fires here** (§8) — exactly once.
 - **POST /auth/login** `{email, password}` → verify argon2id → new session row → cookie. 401 uniform on wrong creds. Failure counters per §7.
 - **POST /auth/logout** (requires session) → deletes session row, clears cookie.
-- **POST /auth/password-reset-request** `{email}` → uniform 202 regardless of existence; token to outbox.
+- **POST /auth/password-reset-request** `{email}` → uniform 202 regardless of existence; token to outbox (reset tokens expire after **30 minutes**).
 - **POST /auth/password-reset** `{token, new_password}` → updates `password_hash`, consumes token, and **revokes all sessions** of the user. Uniform 200.
 
 **Session cookie:** name `gp_session`; value = 256-bit random (base64url). Cookie flags `HttpOnly; SameSite=Lax; Path=/; Max-Age=30d` + `Secure` whenever `GP_PUBLIC_BASE_URL` is https (dev http: Secure must be off or curl/phone can't use it — this is the one dev-only relaxation, gated to a single env value and listed in the threat table). Server stores only `SHA-256(value)` — a leaked DB does not yield usable session tokens. Every login creates a *fresh* session (no reuse); logout deletes the row; expired rows are deleted opportunistically.
@@ -92,7 +92,7 @@ type Message struct { To, Subject, TextBody string; Kind string } // kind: verif
 type Sender interface { Send(ctx context.Context, msg Message) error }
 ```
 
-- **Outbox driver (default, `GP_MAIL_DRIVER=outbox`):** inserts into `outbox_messages` **and** writes `./outbox/<unix-time>-<to>.txt` (address sanitized; file mirrors the row). This is how dev/tests/demo read tokens — no dev backdoor endpoints.
+- **Outbox driver (default, `GP_MAIL_DRIVER=outbox`):** inserts into `outbox_messages` **and** writes `./outbox/<unix-time>-<to>.txt` (address sanitized; file mirrors the row). This is how dev/tests/demo read tokens — no dev backdoor endpoints. Rows and files older than 7 days are deleted by a cleanup (at boot and hourly). **Refuses to start under `ENV=production`** — bodies must never land on a production system; production uses the SMTP driver, which stores no message bodies anywhere.
 - **SMTP driver (`smtp`):** plain startTLS via stdlib; **exists but off** (no creds descended).
 - **Welcome message** sent exactly once after `email_verified` is first set (password path) or the first verified-provider login: plain text — the user's email, the timestamp, and the line `This is a test message from Gatepost.` **Never a token, never a link.** Exactly-once is enforced by `UPDATE users SET welcome_sent_at = now() WHERE id = $1 AND welcome_sent_at IS NULL RETURNING …` — send only if a row comes back (atomic under concurrency).
 
@@ -122,7 +122,7 @@ type Sender interface { Send(ctx context.Context, msg Message) error }
 | 11 | Duplicate identities / user confusion | Same person, two accounts | unique(provider, provider_account_id); verified-email linking merges identities onto one user |
 | 12 | Email enumeration | Signup/reset probing | uniform responses + uniform timing; reset always 202 |
 | 13 | API key leakage from DB | Postgres compromise | only hash + inert prefix stored; full key shown once |
-| 14 | Verification-token replay / theft | Reused link | one-time `used_at`, 24 h expiry, hashed storage |
+| 14 | Verification-token replay / theft | Reused link | one-time `used_at`, expiry (verify 24 h / reset 30 min), hashed storage |
 | 15 | Cross-user access to user_data | Guessed/known user IDs | users are UUIDv4 (unguessable in practice *and* unknowable via IDs alone: no sequential IDs); endpoints address only the authenticated principal — no user id parameter exists to guess |
 | 16 | IDOR on revoked/expired credentials | Old token reuse | checks `revoked_at`, `expires_at`, `used_at` on every use |
 | 17 | Secrets in logs/artifacts | Debug output | log redaction, outbox only writes mail bodies (dev), `.gitignore` for `.env`/`outbox/` |

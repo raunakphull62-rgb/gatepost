@@ -287,10 +287,16 @@ func (s *Server) welcomeOnce(r *http.Request, userID string) {
 
 // --- sessions & tokens -------------------------------------------------------
 
-func (s *Server) newEmailToken(r *http.Request, userID, purpose string) (raw string, err error) {
-	raw = token.New()
-	_, err = s.pool.Exec(r.Context(), `INSERT INTO email_tokens (token_hash, user_id, purpose, expires_at)
-		VALUES ($1, $2, $3, now() + interval '24 hours')`, token.SHA256Hex(raw), userID, purpose)
+// newEmailToken stores the token's SHA-256 with a purpose-scoped TTL:
+// verification 24 h, password reset 30 min.
+func (s *Server) newEmailToken(r *http.Request, userID, purpose string) (string, error) {
+	ttl := "24 hours"
+	if purpose == "reset" {
+		ttl = "30 minutes"
+	}
+	raw := token.New()
+	_, err := s.pool.Exec(r.Context(), `INSERT INTO email_tokens (token_hash, user_id, purpose, expires_at)
+		VALUES ($1, $2, $3, now() + interval '`+ttl+`')`, token.SHA256Hex(raw), userID, purpose)
 	return raw, err
 }
 
