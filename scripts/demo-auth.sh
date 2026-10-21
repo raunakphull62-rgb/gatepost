@@ -4,6 +4,9 @@
 # signup → verify → login → logout → reset → API keys → user-data.
 # Every step prints PASS/FAIL; the script exits nonzero if any step fails.
 # Secrets stay in .env, which is never printed.
+# Rate-limit hygiene: the server runs with 127.0.0.1 trusted and every demo
+# request spoofs its own unique X-Forwarded-For, so repeated runs don't trip
+# the 20-auth/15-min IP cap (mirrors how the go tests isolate their IPs).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -25,7 +28,10 @@ check() { # check <step> <desc> <actual> <want>
     echo "FAIL $1: $2 (want $4, got $3)"; FAIL=$((FAIL+1))
   fi
 }
-code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+CIP="10.$((RANDOM%200+20)).$((RANDOM%200+20)).$((RANDOM%200+20))"
+code()  { curl -s -o /dev/null -w '%{http_code}' -H "X-Forwarded-For: $CIP" "$@"; }
+pcode() { curl -s -o /dev/null -w '%{http_code}' -H "X-Forwarded-For: $CIP" "$@"; }
+raw()   { curl -s -H "X-Forwarded-For: $CIP" "$@"; }
 newest_mail() { # newest outbox file matching a pattern
   grep -l "$1" $(ls -t "$OUTDIR"/*.txt 2>/dev/null) 2>/dev/null | head -1
 }
@@ -35,10 +41,10 @@ mail_token() {
 
 mkdir -p "$OUTDIR"
 go build -o gatepost ./cmd/gatepost || exit 2
-./gatepost >/tmp/gatepost-demo-server.log 2>&1 &
+GP_TRUSTED_PROXIES=127.0.0.1/32 ./gatepost >/tmp/gatepost-demo-server.log 2>&1 &
 SRV_PID=$!
-for _ in $(seq 1 30); do curl -s -o /dev/null "$BASE/api/me" && break; sleep 0.5; done
-curl -s -o /dev/null "$BASE/api/me" || { echo "server did not come up (see /tmp/gatepost-demo-server.log)"; exit 2; }
+for _ in $(seq 1 30); do pcode "$BASE/api/me" >/dev/null 2>&1 && break; sleep 0.5; done
+pcode "$BASE/api/me" >/dev/null 2>&1 || { echo "server did not come up (see /tmp/gatepost-demo-server.log)"; exit 2; }
 
 TS=$(date +%s)-$RANDOM
 U="demo-$TS@x.test";   PW="demo-password-1"
@@ -54,14 +60,14 @@ VT=$(mail_token 'Your verification token')
 check $((s++)) "verify token arrived in outbox file" "$([ -n "$VT" ] && echo yes)" yes
 check $((s++)) "verify (also starts a session)" \
   "$(code -X POST "$BASE/auth/verify" -c "$JAR" -H 'Content-Type: application/json' -d "{\"token\":\"$VT\"}")" 200
-check $((s++)) "session works (/api/me)" "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/api/me")" 200
+check $((s++)) "session works (/api/me)" "$(pcode -b "$JAR" "$BASE/api/me")" 200
 
 check $((s++)) "login with wrong password → 401" \
   "$(code -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"wrong-wrong\"}")" 401
 check $((s++)) "login" \
   "$(code -X POST "$BASE/auth/login" -c "$JAR" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW\"}")" 200
 check $((s++)) "logout" "$(code -X POST "$BASE/auth/logout" -c "$JAR" -b "$JAR")" 200
-check $((s++)) "session dead after logout" "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/api/me")" 401
+check $((s++)) "session dead after logout" "$(pcode -b "$JAR" "$BASE/api/me")" 401
 check $((s++)) "login again" \
   "$(code -X POST "$BASE/auth/login" -c "$JAR" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW\"}")" 200
 
@@ -73,22 +79,22 @@ check $((s++)) "password reset request (uniform 202)" \
 RT=$(mail_token 'Your password reset token')
 check $((s++)) "password reset" \
   "$(code -X POST "$BASE/auth/password-reset" -H 'Content-Type: application/json' -d "{\"token\":\"$RT\",\"new_password\":\"demo-password-2\"}")" 200
-check $((s++)) "old session dead after reset" "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/api/me")" 401
+check $((s++)) "old session dead after reset" "$(pcode -b "$JAR" "$BASE/api/me")" 401
 check $((s++)) "login with new password" \
   "$(code -X POST "$BASE/auth/login" -c "$JAR" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"demo-password-2\"}")" 200
 check $((s++)) "old password rejected" \
   "$(code -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW\"}")" 401
 
-KEY_JSON=$(curl -s -X POST "$BASE/auth/api-keys" -b "$JAR" -H 'Content-Type: application/json' -d '{"name":"demo"}')
+KEY_JSON=$(raw -X POST "$BASE/auth/api-keys" -b "$JAR" -H 'Content-Type: application/json' -d '{"name":"demo"}')
 KEY=$(printf '%s' "$KEY_JSON" | jq -r .key); KID=$(printf '%s' "$KEY_JSON" | jq -r .id)
 check $((s++)) "api key created (gp_pat_…, shown once)" "$(printf '%s' "$KEY" | grep -c '^gp_pat_')" 1
 check $((s++)) "Bearer key authenticates /api/me" "$(code "$BASE/api/me" -H "Authorization: Bearer $KEY")" 200
 check $((s++)) "user-data put via Bearer" \
   "$(code -X PUT "$BASE/api/user-data" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEY" -d '{"demo":true,"items":[1,2,3]}')" 200
 check $((s++)) "user-data get returns own doc" \
-  "$(curl -s "$BASE/api/user-data" -H "Authorization: Bearer $KEY" | jq -r '.demo')" true
+  "$(raw "$BASE/api/user-data" -H "Authorization: Bearer $KEY" | jq -r '.demo')" true
 check $((s++)) "api key list shows prefix, never the key" \
-  "$(curl -s "$BASE/auth/api-keys" -b "$JAR" | grep -c "$KEY")" 0
+  "$(raw "$BASE/auth/api-keys" -b "$JAR" | grep -c "$KEY")" 0
 check $((s++)) "revoke" "$(code -X POST "$BASE/auth/api-keys/$KID/revoke" -b "$JAR")" 200
 check $((s++)) "revoked key is dead instantly" "$(code "$BASE/api/me" -H "Authorization: Bearer $KEY")" 401
 
@@ -99,7 +105,7 @@ VT2=$(mail_token "$U2")
 check $((s++)) "second user verify" \
   "$(code -X POST "$BASE/auth/verify" -c "$JAR2" -H 'Content-Type: application/json' -d "{\"token\":\"$VT2\"}")" 200
 check $((s++)) "user B sees an empty doc (isolated from A)" \
-  "$(curl -s "$BASE/api/user-data" -b "$JAR2")" "{}"
+  "$(raw "$BASE/api/user-data" -b "$JAR2")" "{}"
 
 echo
 echo "=== demo: $PASS pass, $FAIL fail ==="
