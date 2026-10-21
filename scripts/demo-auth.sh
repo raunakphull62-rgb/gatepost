@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 BASE="${GP_PUBLIC_BASE_URL:-http://localhost:8090}"
 JAR="$(mktemp)"; JAR2="$(mktemp)"
 OUTDIR=outbox
-trap 'kill ${SRV_PID:-0} 2>/dev/null; rm -f "$JAR" "$JAR2"' EXIT
+trap 'kill ${SRV_PID:-0} 2>/dev/null; rm -f "${JAR:-}" "${JAR2:-}" "${J3:-}" "${J4:-}"' EXIT
 
 if [ ! -f .env ]; then
   echo "no .env at repo root (DB connection strings live there; create it yourself, never paste it here)" >&2
@@ -106,6 +106,48 @@ check $((s++)) "second user verify" \
   "$(code -X POST "$BASE/auth/verify" -c "$JAR2" -H 'Content-Type: application/json' -d "{\"token\":\"$VT2\"}")" 200
 check $((s++)) "user B sees an empty doc (isolated from A)" \
   "$(raw "$BASE/api/user-data" -b "$JAR2")" "{}"
+
+# --- sessions: sliding+rotation, list, revoke, logout-everywhere -------------
+J3="$(mktemp)"; J4="$(mktemp)"
+PW3="demo-password-3"
+
+# two extra devices logged in (password is demo-password-2 right now)
+check $((s++)) "login device 2" \
+  "$(code -X POST "$BASE/auth/login" -c "$J3" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"demo-password-2\"}")" 200
+check $((s++)) "login device 4" \
+  "$(code -X POST "$BASE/auth/login" -c "$J4" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"demo-password-2\"}")" 200
+check $((s++)) "sessions list: 3 rows, 1 current (fresh session per login)" \
+  "$(raw "$BASE/auth/sessions" -b "$JAR" | jq -r '[(.sessions|length), ([.sessions[]|select(.current)]|length)] | join(" of ")')" "3 of 1"
+check $((s++)) "sessions list leaks no token material" \
+  "$(raw "$BASE/auth/sessions" -b "$JAR" | grep -ci token)" 0
+
+# password change: current password required; wrong answer counts like login
+check $((s++)) "password change with wrong current password → 401" \
+  "$(code -X POST "$BASE/auth/password-change" -b "$JAR" -c "$JAR" -H 'Content-Type: application/json' -d "{\"current_password\":\"nope-nope\",\"new_password\":\"$PW3\"}")" 401
+check $((s++)) "password change (correct current password)" \
+  "$(code -X POST "$BASE/auth/password-change" -b "$JAR" -c "$JAR" -H 'Content-Type: application/json' -d "{\"current_password\":\"demo-password-2\",\"new_password\":\"$PW3\"}")" 200
+check $((s++)) "rotated session cookie still works (/api/me)" "$(pcode -b "$JAR" "$BASE/api/me")" 200
+check $((s++)) "other devices logged out by the password change" "$(pcode -b "$J3" "$BASE/api/me")" 401
+check $((s++)) "previous password rejected" \
+  "$(code -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"demo-password-2\"}")" 401
+
+# list & revoke: back to exactly 2 live sessions (jar + new j3 login)
+check $((s++)) "login again (new password)" \
+  "$(code -X POST "$BASE/auth/login" -c "$J3" -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW3\"}")" 200
+SID=$(raw "$BASE/auth/sessions" -b "$JAR" | jq -r '[.sessions[] | select(.current == false)][0].id // empty')
+check $((s++)) "revoke one session by id" \
+  "$(code -X POST "$BASE/auth/sessions/$SID/revoke" -b "$JAR")" 200
+check $((s++)) "revoked device session is dead instantly" "$(pcode -b "$J3" "$BASE/api/me")" 401
+check $((s++)) "revoke of an absent id → 404" \
+  "$(code -X POST "$BASE/auth/sessions/00000000-0000-0000-0000-000000000000/revoke" -b "$JAR")" 404
+check $((s++)) "list shrunk to 1 (current only)" \
+  "$(raw "$BASE/auth/sessions" -b "$JAR" | jq '.sessions | length')" 1
+
+# logout everywhere: every session of the user dies in one call
+check $((s++)) "logout everywhere" "$(code -X POST "$BASE/auth/logout-everywhere" -b "$JAR")" 200
+check $((s++)) "device 1 session dead" "$(pcode -b "$JAR" "$BASE/api/me")" 401
+check $((s++)) "login still possible afterwards" \
+  "$(code -X POST "$BASE/auth/login" -c /dev/null -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW3\"}")" 200
 
 echo
 echo "=== demo: $PASS pass, $FAIL fail ==="

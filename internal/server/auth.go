@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -292,6 +293,91 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	done(w, http.StatusOK)
+}
+
+// GET /auth/sessions — the caller's sessions (id/times + which row is the
+// current one). Token hashes never leave the database.
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
+	p, th, err := s.principal(r)
+	if err != nil || th == "" {
+		fail(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	rows, err := s.pool.Query(r.Context(), `SELECT id::text, created_at, expires_at,
+		token_hash = $2 FROM sessions WHERE user_id = $1 ORDER BY created_at`, p.UserID, th)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer rows.Close()
+	type row struct {
+		ID        string    `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		ExpiresAt time.Time `json:"expires_at"`
+		Current   bool      `json:"current"`
+	}
+	list := []row{}
+	for rows.Next() {
+		var v row
+		if err := rows.Scan(&v.ID, &v.CreatedAt, &v.ExpiresAt, &v.Current); err != nil {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		list = append(list, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": list})
+}
+
+// POST /auth/sessions/{id}/revoke — ends one of the caller's sessions by its
+// opaque id. Revoking the current session also clears the cookie; foreign or
+// absent ids are the same 404.
+func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
+	p, th, err := s.principal(r)
+	if err != nil || th == "" {
+		fail(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var current string
+	if th != "" {
+		err = s.pool.QueryRow(r.Context(), `SELECT id::text FROM sessions
+			WHERE token_hash = $1`, th).Scan(&current)
+		if err != nil && err != pgx.ErrNoRows {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	ct, err := s.pool.Exec(r.Context(), `DELETE FROM sessions
+		WHERE id = $1 AND user_id = $2`, r.PathValue("id"), p.UserID)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		fail(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.PathValue("id") == current {
+		s.clearSession(w)
+	}
+	done(w, http.StatusOK)
+}
+
+// POST /auth/logout-everywhere — ends every session of the caller.
+func (s *Server) logoutEverywhere(w http.ResponseWriter, r *http.Request) {
+	p, th, err := s.principal(r)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if th != "" { // API keys have no sessions; still 200, nothing to end
+		if _, err := s.pool.Exec(r.Context(),
+			`DELETE FROM sessions WHERE user_id = $1`, p.UserID); err != nil {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	s.clearSession(w)
 	done(w, http.StatusOK)
 }
 

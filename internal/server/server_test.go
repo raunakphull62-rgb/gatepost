@@ -637,6 +637,124 @@ func TestSessionRotation(t *testing.T) {
 	c.must("POST", "/auth/login", `{"email":"`+email+`","password":"newpw123456"}`, http.StatusOK)
 }
 
+// TestListAndRevokeSessions: list shows metadata + the current flag but no
+// token material; revoke ends exactly one session; revoking the current one
+// also clears the cookie; absent/foreign ids are the same 404.
+func TestListAndRevokeSessions(t *testing.T) {
+	pool := testPool(t)
+	email := "sess-" + randHex(t, 4) + "@x.test"
+	c := signupVerify(t, pool, email, "secretpw123")
+	c2 := unfollow(c)
+	c2.must("POST", "/auth/login", `{"email":"`+email+`","password":"secretpw123"}`, http.StatusOK)
+
+	// bearer is refused: session management is session-only
+	keyBody := c.must("POST", "/auth/api-keys", `{"name":"t"}`, http.StatusCreated)
+	var kb struct{ Key string }
+	if err := json.Unmarshal([]byte(keyBody), &kb); err != nil {
+		t.Fatalf("key json: %v: %s", err, keyBody)
+	}
+	bearer := tc{t: t, base: c.base, ip: c.ip, hc: &http.Client{Transport: bearerRT(kb.Key)}}
+	if code, _ := bearer.do("GET", "/auth/sessions", ""); code != http.StatusUnauthorized {
+		t.Fatalf("bearer sessions list: want 401, got %d", code)
+	}
+	if code, _ := bearer.do("POST", "/auth/sessions/00000000-0000-0000-0000-000000000000/revoke", ""); code != http.StatusUnauthorized {
+		t.Fatalf("bearer revoke: want 401, got %d", code)
+	}
+
+	body := c.must("GET", "/auth/sessions", "", http.StatusOK)
+	var list struct {
+		Sessions []struct {
+			ID        string    `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			ExpiresAt time.Time `json:"expires_at"`
+			Current   bool      `json:"current"`
+		}
+	}
+	if err := json.Unmarshal([]byte(body), &list); err != nil {
+		t.Fatalf("list json: %v: %s", err, body)
+	}
+	if len(list.Sessions) != 2 {
+		t.Fatalf("want 2 sessions, got %d", len(list.Sessions))
+	}
+	currents, others := 0, []string{}
+	for _, s := range list.Sessions {
+		if s.ExpiresAt.Before(s.CreatedAt) || time.Until(s.ExpiresAt) < 24*time.Hour {
+			t.Fatalf("row %s window nonsense: created %v, expires %v", s.ID, s.CreatedAt, s.ExpiresAt)
+		}
+		if s.Current {
+			currents++
+		} else {
+			others = append(others, s.ID)
+		}
+	}
+	if currents != 1 || len(others) != 1 {
+		t.Fatalf("want 1 current + 1 other, got %d current, %d other", currents, len(others))
+	}
+	// no token material: stored hashes must not appear in the response body
+	for _, h := range columnStrings(t, pool, `SELECT token_hash FROM sessions`) {
+		if strings.Contains(body, h) {
+			t.Fatal("sessions list leaks token_hash")
+		}
+	}
+	if countRows(t, pool, "sessions", "") != 2 {
+		t.Fatal("rows changed during listing")
+	}
+
+	// revoke the other session (c2's) from c
+	c.must("POST", "/auth/sessions/"+others[0]+"/revoke", "", http.StatusOK)
+	if code, _ := c2.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("revoked session still valid: %d", code)
+	}
+	c.must("GET", "/api/me", "", http.StatusOK)
+	if n := countRows(t, pool, "sessions", ""); n != 1 {
+		t.Fatalf("want 1 session left, got %d", n)
+	}
+
+	// absent id is 404
+	if code, _ := c.do("POST", "/auth/sessions/00000000-0000-0000-0000-000000000000/revoke", ""); code != http.StatusNotFound {
+		t.Fatalf("absent revoke: want 404, got %d", code)
+	}
+
+	// revoking the current session also clears the cookie: caller is logged out
+	currentID := ""
+	for _, s := range list.Sessions {
+		if s.Current {
+			currentID = s.ID
+		}
+	}
+	c.must("POST", "/auth/sessions/"+currentID+"/revoke", "", http.StatusOK)
+	if code, _ := c.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("current session survived self-revoke: %d", code)
+	}
+	if code, _ := bearer.do("GET", "/api/me", ""); code != http.StatusOK {
+		t.Fatalf("api key should survive session revocation: %d", code)
+	}
+}
+
+// TestLogoutEverywhere: one request ends every session of the caller.
+func TestLogoutEverywhere(t *testing.T) {
+	pool := testPool(t)
+	email := "wipe-" + randHex(t, 4) + "@x.test"
+	c := signupVerify(t, pool, email, "secretpw123")
+	c.must("POST", "/auth/login", `{"email":"`+email+`","password":"secretpw123"}`, http.StatusOK)
+	c2 := unfollow(c)
+	c2.must("POST", "/auth/login", `{"email":"`+email+`","password":"secretpw123"}`, http.StatusOK)
+	if n := countRows(t, pool, "sessions", ""); n != 3 {
+		t.Fatalf("want 3 sessions, got %d", n)
+	}
+
+	c.must("POST", "/auth/logout-everywhere", "", http.StatusOK)
+	if code, _ := c.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("caller survived logout-everywhere: %d", code)
+	}
+	if code, _ := c2.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("other device survived logout-everywhere: %d", code)
+	}
+	if n := countRows(t, pool, "sessions", ""); n != 0 {
+		t.Fatalf("want 0 sessions, got %d", n)
+	}
+}
+
 func TestAPIKeys(t *testing.T) {
 	pool := testPool(t)
 	email := "keys@x.test"
