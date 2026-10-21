@@ -755,6 +755,32 @@ func TestLogoutEverywhere(t *testing.T) {
 	}
 }
 
+// TestSpoofedXFFIgnoredWithoutTrustedProxy — with the default (empty)
+// GP_TRUSTED_PROXIES the server ignores X-Forwarded-For: signups claiming
+// different spoofed IPs share one rate bucket (the real socket IP), so the
+// cap trips on the third.
+func TestSpoofedXFFIgnoredWithoutTrustedProxy(t *testing.T) {
+	pool := testPool(t)
+	c, _ := newTestServer(t, pool, func(cfg *Config) {
+		cfg.AuthCap = 2
+		cfg.TrustedProxes = nil // the default: trust nothing
+	})
+	for i, want := range []int{http.StatusOK, http.StatusOK, http.StatusTooManyRequests} {
+		c.ip = fmt.Sprintf("spoof.%d-%s.x", i, randHex(t, 3))
+		code, _ := c.do("POST", "/auth/signup",
+			`{"email":"xffno-proxy-`+c.ip+`@x.test","password":"secretpw123"}`)
+		if code != want {
+			t.Fatalf("request %d (XFF %q): want %d, got %d", i+1, c.ip, want, code)
+		}
+	}
+	// an honest request with NO XFF at all lands in the same bucket (429).
+	c.ip = ""
+	if code, _ := c.do("POST", "/auth/signup",
+		`{"email":"honest@x.test","password":"secretpw123"}`); code != http.StatusTooManyRequests {
+		t.Fatalf("request without XFF: want 429 (same bucket), got %d", code)
+	}
+}
+
 func TestAPIKeys(t *testing.T) {
 	pool := testPool(t)
 	email := "keys@x.test"
