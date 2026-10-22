@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -94,29 +95,83 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request, p *Princip
 
 	rctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	txts, err := lookupTXT(rctx, s.dnsResolvers, "_gatepost-verify."+d.Hostname)
-	if err != nil {
-		fail(w, http.StatusBadGateway, "dns lookup failed: "+err.Error())
-		return
-	}
-	want := "gatepost-verify=" + tok
-	found := false
-	for _, t := range txts {
-		if strings.TrimSpace(t) == want { // TXT values are fairly loose: trim
-			found = true
-			break
+	if d.SetupType == "nameserver" {
+		// item 11: the customer delegated the zone — the hostname's NS set
+		// must be exactly the assigned pair (order/case/trailing-dot free).
+		if d.Ns1 == "" || d.Ns2 == "" {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
 		}
-	}
-	if !found {
-		fail(w, http.StatusBadRequest,
-			"verification failed: no TXT record "+want+" at _gatepost-verify."+d.Hostname)
-		return
+		nss, err := lookupNS(rctx, s.dnsResolvers, d.Hostname)
+		if err != nil {
+			fail(w, http.StatusBadGateway, "dns lookup failed: "+err.Error())
+			return
+		}
+		want := map[string]struct{}{
+			strings.ToLower(strings.TrimSuffix(d.Ns1, ".")): {},
+			strings.ToLower(strings.TrimSuffix(d.Ns2, ".")): {},
+		}
+		got := map[string]struct{}{}
+		for _, n := range nss {
+			n = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(n), "."))
+			if n != "" {
+				got[n] = struct{}{}
+			}
+		}
+		if len(got) == 0 {
+			fail(w, http.StatusBadRequest, "verification failed: no NS records for "+d.Hostname)
+			return
+		}
+		var missing, extra []string
+		for n := range want {
+			if _, ok := got[n]; !ok {
+				missing = append(missing, n)
+			}
+		}
+		for n := range got {
+			if _, ok := want[n]; !ok {
+				extra = append(extra, n)
+			}
+		}
+		if len(missing)+len(extra) > 0 {
+			fail(w, http.StatusBadRequest, "verification failed: NS records"+
+				sortedList(" missing", missing)+sortedList(" unexpected", extra))
+			return
+		}
+	} else {
+		txts, err := lookupTXT(rctx, s.dnsResolvers, "_gatepost-verify."+d.Hostname)
+		if err != nil {
+			fail(w, http.StatusBadGateway, "dns lookup failed: "+err.Error())
+			return
+		}
+		want := "gatepost-verify=" + tok
+		found := false
+		for _, t := range txts {
+			if strings.TrimSpace(t) == want { // TXT values are fairly loose: trim
+				found = true
+				break
+			}
+		}
+		if !found {
+			fail(w, http.StatusBadRequest,
+				"verification failed: no TXT record "+want+" at _gatepost-verify."+d.Hostname)
+			return
+		}
 	}
 	if reason := s.markVerified(r, d, p.UserID); reason != "" {
 		fail(w, http.StatusConflict, reason)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "verified"})
+}
+
+// sortedList renders " <prefix>a, b" for stable error messages.
+func sortedList(prefix string, xs []string) string {
+	if len(xs) == 0 {
+		return ""
+	}
+	sort.Strings(xs)
+	return " " + prefix + ":" + strings.Join(xs, ", ")
 }
 
 // markVerified runs the one-transaction win: this claim verified, competing
