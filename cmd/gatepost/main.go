@@ -40,14 +40,14 @@ func main() {
 	defer pool.Close()
 
 	mailCfg := mailer.Config{
-		Driver:     os.Getenv("GP_MAIL_DRIVER"),
-		OutboxDir:  "outbox",
-		From:       os.Getenv("GP_MAIL_FROM"),
-		Production: envfile.Production(),
-		SMTPHost:   os.Getenv("GP_SMTP_HOST"),
-		SMTPPort:   os.Getenv("GP_SMTP_PORT"),
-		SMTPUser:  os.Getenv("GP_SMTP_USER"),
-		SMTPPass:  os.Getenv("GP_SMTP_PASSWORD"),
+		Driver:      os.Getenv("GP_MAIL_DRIVER"),
+		OutboxDir:   "outbox",
+		From:        os.Getenv("GP_MAIL_FROM"),
+		Production:  envfile.Production(),
+		SMTPHost:    os.Getenv("GP_SMTP_HOST"),
+		SMTPPort:    os.Getenv("GP_SMTP_PORT"),
+		SMTPUser:    os.Getenv("GP_SMTP_USER"),
+		SMTPPass:    os.Getenv("GP_SMTP_PASSWORD"),
 		SMTPTLS:     os.Getenv("GP_SMTP_TLS"),
 		InsecureTLS: os.Getenv("GP_SMTP_INSECURE") == "true",
 	}
@@ -91,8 +91,27 @@ func main() {
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 		AuthCap:            atoiEnv("GP_AUTH_CAP"),
 		LockoutAfter:       atoiEnv("GP_LOCKOUT_AFTER"),
-		TrustedProxes:      splitCIDRs(os.Getenv("GP_TRUSTED_PROXIES")),
+		DomainMaxTotal:     atoiEnv("GP_DOMAIN_MAX"),
+		DomainMaxPending:   atoiEnv("GP_DOMAIN_PENDING"),
+		ServiceHostnames:   splitCommas(os.Getenv("GP_SERVICE_HOSTNAMES")),
+		TrustedProxes:      splitCommas(os.Getenv("GP_TRUSTED_PROXIES")),
 	}, pool, sender)
+
+	// Domain claim expiry runs hourly (live-window: no fixed sleeps).
+	go func() {
+		for {
+			if n, err := srv.ExpireDomainClaims(context.Background()); err != nil {
+				log.Printf("domain claim expiry: %v", err)
+			} else if n > 0 {
+				log.Printf("expired %d domain claim(s)", n)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Hour):
+			}
+		}
+	}()
 
 	httpSrv := &http.Server{
 		Addr:              srv.Addr(),
@@ -114,7 +133,9 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-func splitCIDRs(s string) []string {
+// splitCommas: shared by the CIDR list and the comma-separated env lists
+// (service hostnames, resolvers).
+func splitCommas(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {

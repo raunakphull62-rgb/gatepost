@@ -40,6 +40,11 @@ type Config struct {
 	AuthCap       int
 	LockoutAfter  int
 	TrustedProxes []string // CIDR list of trusted reverse proxies; default: trust nothing
+	// Domains (B2): per-user quotas and the service hostnames nobody may claim.
+	// Zeros fall back to the design defaults (20 active / 5 pending).
+	DomainMaxTotal   int
+	DomainMaxPending int
+	ServiceHostnames []string // comma-split env list; e.g. api.gatepost.net
 }
 
 type Principal struct {
@@ -48,13 +53,14 @@ type Principal struct {
 }
 
 type Server struct {
-	cfg          Config
-	pool         *pgxpool.Pool
-	mail         mailer.Sender
-	mux          *http.ServeMux
-	secureCookie bool
-	providers    map[string]oauthProvider
-	dummy        string // argon2id hash verified against when the user is unknown, for uniform timing
+	cfg              Config
+	pool             *pgxpool.Pool
+	mail             mailer.Sender
+	mux              *http.ServeMux
+	secureCookie     bool
+	providers        map[string]oauthProvider
+	dummy            string              // argon2id hash verified against when the user is unknown, for uniform timing
+	serviceHostnames map[string]struct{} // B2 item 2: hostnames nobody may claim
 }
 
 func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
@@ -65,6 +71,16 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.LockoutAfter <= 0 {
 		s.cfg.LockoutAfter = 5 // design default: 5 failed logins lock the pair
+	}
+	if s.cfg.DomainMaxTotal <= 0 {
+		s.cfg.DomainMaxTotal = 20 // B2 default: 20 active claims per user
+	}
+	if s.cfg.DomainMaxPending <= 0 {
+		s.cfg.DomainMaxPending = 5 // B2 default: 5 pending claims per user
+	}
+	s.serviceHostnames = map[string]struct{}{}
+	for _, h := range cfg.ServiceHostnames {
+		s.serviceHostnames[strings.ToLower(h)] = struct{}{}
 	}
 	s.dummy, _ = password.Hash("gatepost-dummy-credentials")
 	s.providers = defaultProviders(cfg)
@@ -111,6 +127,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/me", s.requireAuth(s.me))
 	s.mux.HandleFunc("GET /api/user-data", s.requireAuth(s.getUserData))
 	s.mux.HandleFunc("PUT /api/user-data", s.requireAuth(s.putUserData))
+	s.mux.HandleFunc("POST /v1/domains", s.requireAuth(s.addDomain))
+	s.mux.HandleFunc("GET /v1/domains", s.requireAuth(s.listDomains))
+	s.mux.HandleFunc("GET /v1/domains/{id}", s.requireAuth(s.getDomain))
+	s.mux.HandleFunc("DELETE /v1/domains/{id}", s.requireAuth(s.deleteDomain))
+	s.mux.HandleFunc("GET /v1/domains/{id}/verification", s.requireAuth(s.domainVerification))
 }
 
 // --- http helpers -----------------------------------------------------------
