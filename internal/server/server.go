@@ -149,6 +149,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/domains/{id}/origin", s.requireAuth(s.addOrigin))
 	s.mux.HandleFunc("GET /v1/domains/{id}/origin", s.requireAuth(s.getOrigin))
 	s.mux.HandleFunc("PUT /v1/domains/{id}/origin", s.requireAuth(s.putOrigin))
+	s.mux.HandleFunc("POST /v1/domains/{id}/origin/test", s.requireAuth(s.testOrigin))
 }
 
 // --- http helpers -----------------------------------------------------------

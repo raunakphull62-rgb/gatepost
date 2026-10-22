@@ -4,8 +4,13 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -204,5 +209,209 @@ func TestOriginSettingsFlow(t *testing.T) {
 	s.owned = domains.ParseOwned([]string{"dots.gatepost.net"})
 	if code, _ := originCall(t, a, fresh.ID, map[string]any{"address": "dots.gatepost.net"}); code != http.StatusUnprocessableEntity {
 		t.Fatalf("owned origin address: want 422, got %d", code)
+	}
+}
+
+// ---- item 6: test connection ----
+
+// hookSetup builds a server with the TEST loopback hook and a fake resolver,
+// plus a verified session.
+func hookSetup(t *testing.T) (tc, *fakeDNS) {
+	t.Helper()
+	pool := testPool(t)
+	a, s := newTestServer(t, pool, func(cfg *Config) { cfg.TestAllowLoopback = true })
+	signupOn(t, pool, a, "hook@x.test")
+	f := originDNS()
+	setResolvers(s, f)
+	return a, f
+}
+
+// originTestCall runs the probe and decodes the report.
+func originTestCall(t *testing.T, c tc, domID string) testResult {
+	t.Helper()
+	code, body := c.do("POST", "/v1/domains/"+domID+"/origin/test", "")
+	if code != http.StatusOK {
+		t.Fatalf("origin test: %d %s", code, body)
+	}
+	var got struct {
+		Test testResult `json:"test"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("test json: %v: %s", err, body)
+	}
+	return got.Test
+}
+
+func portOfURL(t *testing.T, rawurl string) int {
+	t.Helper()
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestOriginTestLocalOrigins — the local test origin via the test hook:
+// plain http reachable (any status is reachable), TLS verify reported as the
+// exact x509 failure, and tls_verify=false succeeds with tls_ok=true.
+func TestOriginTestLocalOrigins(t *testing.T) {
+	a, _ := hookSetup(t)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot) // any status code counts as reachable
+	}))
+	t.Cleanup(httpSrv.Close)
+	p := portOfURL(t, httpSrv.URL)
+	d := claimRow(t, a, "htt.local.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "127.0.0.1", "port": p}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if !tr.Reachable || tr.StatusCode != http.StatusTeapot || tr.TLSOK {
+		t.Fatalf("http probe: %+v", tr)
+	}
+	if tr.DurationMs < 0 || tr.DurationMs > 5000 {
+		t.Fatalf("duration outside the 5s total: %d", tr.DurationMs)
+	}
+
+	// TLS: httptest's self-signed cert fails exact verification
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(tlsSrv.Close)
+	p2 := portOfURL(t, tlsSrv.URL)
+	d2 := claimRow(t, a, "tls.local.example.com").ID
+	if code, body := originCall(t, a, d2, map[string]any{"scheme": "https", "address": "127.0.0.1", "port": p2}); code != http.StatusCreated {
+		t.Fatalf("tls origin create: %d %s", code, body)
+	}
+	tr2 := originTestCall(t, a, d2)
+	if tr2.Reachable || tr2.TLSOK || !strings.Contains(tr2.Error, "x509") {
+		t.Fatalf("tls verify must fail with the exact x509 error: %+v", tr2)
+	}
+	// tls_verify=false → the probe succeeds and reports tls_ok
+	if code, body := a.do("PUT", "/v1/domains/"+d2+"/origin",
+		`{"scheme":"https","address":"127.0.0.1","port":`+strconv.Itoa(p2)+`,"tls_verify":false}`); code != http.StatusOK {
+		t.Fatalf("tls_verify=false update: %d %s", code, body)
+	}
+	tr3 := originTestCall(t, a, d2)
+	if !tr3.Reachable || tr3.StatusCode != http.StatusOK || !tr3.TLSOK {
+		t.Fatalf("insecure tls probe: %+v", tr3)
+	}
+}
+
+// TestOriginTestHostMoves — the probe dials the CHECKED IP: the fake
+// resolves "moves.example.com" → the loopback address of the local server,
+// even though nothing on the real internet answers for that name.
+func TestOriginTestHostMoves(t *testing.T) {
+	a, f := hookSetup(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	f.ips["moves.example.com"] = []net.IP{net.ParseIP("127.0.0.1")}
+	d := claimRow(t, a, "moves-target.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "moves.example.com", "port": portOfURL(t, srv.URL)}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if !tr.Reachable || tr.StatusCode != http.StatusOK {
+		t.Fatalf("probe must hit the resolved IP: %+v", tr)
+	}
+}
+
+// TestOriginTestRecheckRefuses — an origin created over a good address whose
+// hostname ALSO starts resolving to 127.0.0.1 and 169.254.169.254 is refused
+// again at test time, with the exact reason and no connection attempt.
+func TestOriginTestRecheckRefuses(t *testing.T) {
+	a, f := hookSetup(t)
+	f.ips["flip.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
+	d := claimRow(t, a, "flip-target.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "flip.example.com"}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	f.ips["flip.example.com"] = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("169.254.169.254")}
+	tr := originTestCall(t, a, d)
+	if tr.Reachable || !strings.Contains(tr.Error, "169.254") {
+		t.Fatalf("recheck must refuse a metadata shadowing: %+v", tr)
+	}
+}
+
+// TestOriginTestNoRedirects — a 302 is reported as-is and the target is
+// never fetched.
+func TestOriginTestNoRedirects(t *testing.T) {
+	a, _ := hookSetup(t)
+	var hits atomic.Int32
+	flag := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(flag.Close)
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, flag.URL+"/flag", http.StatusFound)
+	}))
+	t.Cleanup(redir.Close)
+	d := claimRow(t, a, "redir.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "127.0.0.1", "port": portOfURL(t, redir.URL)}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if !tr.Reachable || tr.StatusCode != http.StatusFound {
+		t.Fatalf("302 must be reported as-is: %+v", tr)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("redirect was followed %d times", hits.Load())
+	}
+}
+
+// TestOriginTestRefusedPort — a closed TCP port surfaces the exact OS error.
+func TestOriginTestRefusedPort(t *testing.T) {
+	a, _ := hookSetup(t)
+	d := claimRow(t, a, "closed.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "127.0.0.1", "port": 1}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if tr.Reachable || !strings.Contains(strings.ToLower(tr.Error), "connection refused") {
+		t.Fatalf("closed port must report the exact error: %+v", tr)
+	}
+}
+
+// TestOriginTest64KB — a 1 MB response: the probe stops reading around the
+// 64 KB cap (the server notices the closed socket), and the status is right.
+func TestOriginTest64KB(t *testing.T) {
+	a, _ := hookSetup(t)
+	var written atomic.Int64
+	chunk := make([]byte, 4<<10) // 4 KiB drips: the stop shows up deterministically
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 250; i++ { // 1 MB total, but the client caps reads sooner
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return // client stopped reading and closed: expected after the cap
+			}
+			flusher.Flush()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	d := claimRow(t, a, "bigbody.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "127.0.0.1", "port": portOfURL(t, srv.URL)}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if !tr.Reachable || tr.StatusCode != http.StatusOK {
+		t.Fatalf("probe: %+v", tr)
+	}
+	// The LimitReader stops pulling at 64 KB; a bit more may leave the
+	// server before it notices the closed socket (TCP buffers) — the point
+	// is nowhere near the full megabyte.
+	if n := written.Load(); n > 260_000 {
+		t.Fatalf("client must stop reading near the 64 KB cap; server wrote %d", n)
 	}
 }

@@ -5,9 +5,13 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -218,4 +222,138 @@ func (s *Server) putOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"origin": o})
+}
+
+// B2 item 6: "test connection" — resolve the stored origin address,
+// re-check every answered IP against the deny rules, connect to the
+// resolved IP itself (DNS cannot redirect between check and connect),
+// GET the health path, never follow redirects, read at most 64 KB.
+// IP itself (DNS can't redirect us between check and connect), GET the
+// health path with no redirects, read at most 64 KB, report the truth.
+
+// testResult is the JSON report of one test connection.
+type testResult struct {
+	Reachable  bool   `json:"reachable"`
+	StatusCode int    `json:"status_code,omitempty"`
+	TLSOK      bool   `json:"tls_ok"`
+	DurationMs int64  `json:"duration_ms"`
+	Error      string `json:"error,omitempty"`
+}
+
+func writeTest(w http.ResponseWriter, tr testResult, elapsed time.Duration) {
+	tr.DurationMs = elapsed.Milliseconds()
+	writeJSON(w, http.StatusOK, map[string]any{"test": tr})
+}
+
+// reportRefusal writes a reachable=false report with the exact refusal.
+func writeTestRefusal(w http.ResponseWriter, err error, elapsed time.Duration) {
+	writeTest(w, testResult{Error: err.Error()}, elapsed)
+}
+
+// POST /v1/domains/{id}/origin/test — probe the stored origin.
+func (s *Server) testOrigin(w http.ResponseWriter, r *http.Request, p *Principal) {
+	d, ok := s.ownerDomain(w, r, p)
+	if !ok {
+		return
+	}
+	o, gerr := s.scanOrigin(s.pool.QueryRow(r.Context(),
+		`SELECT `+originCols+` FROM origins WHERE domain_id = $1`, d.ID))
+	if gerr != nil {
+		if errors.Is(gerr, pgx.ErrNoRows) {
+			fail(w, http.StatusNotFound, "no origin set")
+			return
+		}
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	start := time.Now()
+	rctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// resolve + re-check every answered IP (the strict rules apply again)
+	oAddr, verr := domains.ValidateOrigin(o.Address, s.owned, s.cfg.TestAllowLoopback)
+	if verr != nil {
+		writeTestRefusal(w, verr, time.Since(start))
+		return
+	}
+	var ips []net.IP
+	if oAddr.IP != nil {
+		ips = []net.IP{oAddr.IP}
+	} else {
+		got, lerr := lookupIP(rctx, s.dnsResolvers, oAddr.Canonical)
+		if lerr != nil {
+			writeTestRefusal(w, fmt.Errorf("origin %s: cannot resolve", oAddr.Canonical), time.Since(start))
+			return
+		}
+		if len(got) == 0 {
+			writeTestRefusal(w, fmt.Errorf("origin %s: no A/AAAA record", oAddr.Canonical), time.Since(start))
+			return
+		}
+		for _, ip := range got {
+			if cverr := domains.CheckIP(ip, s.owned, s.cfg.TestAllowLoopback); cverr != nil {
+				writeTestRefusal(w, cverr, time.Since(start))
+				return
+			}
+		}
+		ips = got
+	}
+
+	// dial each resolved IP until one answers with an HTTP response
+	var last testResult
+	for _, ip := range ips {
+		last = s.probeOrigin(rctx, o, oAddr.Canonical, ip)
+		if last.Reachable {
+			writeTest(w, last, time.Since(start))
+			return
+		}
+	}
+	writeTest(w, last, time.Since(start))
+}
+
+// probeOrigin performs one full attempt against one resolved IP.
+func (s *Server) probeOrigin(rctx context.Context, o originRow, canonical string, ip net.IP) testResult {
+	portStr := strconv.Itoa(o.Port)
+	dialer := &net.Dialer{}
+	transport := &http.Transport{
+		// Connect to the checked IP itself: a DNS change between the check
+		// above and this dial cannot redirect the probe.
+		DialContext: func(cctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(cctx, network, net.JoinHostPort(ip.String(), portStr))
+		},
+		Proxy:               nil,
+		DisableKeepAlives:   true,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !o.TLSVerify, ServerName: canonical},
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Until(deadlineOf(rctx)),
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // never follow redirects
+		},
+	}
+	host := canonical
+	if o.HostHeader != nil && *o.HostHeader != "" {
+		host = *o.HostHeader
+	}
+	url := o.Scheme + "://" + host + ":" + portStr + o.HealthPath
+	req, rerr := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+	if rerr != nil {
+		return testResult{Error: rerr.Error()}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return testResult{Error: err.Error()}
+	}
+	defer resp.Body.Close()
+	tlsOK := resp.TLS != nil && resp.TLS.HandshakeComplete
+	// at most 64 KB of the response is ever read
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return testResult{Reachable: true, StatusCode: resp.StatusCode, TLSOK: tlsOK}
+}
+
+// deadlineOf extracts a request's deadline (zero when none).
+func deadlineOf(ctx context.Context) (d time.Time) {
+	d, _ = ctx.Deadline()
+	return d
 }
