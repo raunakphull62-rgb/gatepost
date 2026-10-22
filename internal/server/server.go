@@ -60,6 +60,14 @@ type Config struct {
 	DomainAddCap  int
 	VerifyCap     int
 	OriginTestCap int
+	// Nameserver mode (B2 item 10): the assigned nameserver pair every
+	// nameserver-mode claim advertises (one shared pair for now),
+	// GP_NS1/GP_NS2; GP_ALLOW_SUBDOMAIN_ZONES=true permits a delegated
+	// subdomain claim only under the GP_TEST_ZONE suffix (test domain only).
+	Ns1                 string
+	Ns2                 string
+	TestZone            string
+	AllowSubdomainZones bool
 }
 
 type Principal struct {

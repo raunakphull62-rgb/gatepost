@@ -7,9 +7,11 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/net/publicsuffix"
 
 	"gatepost/internal/domains"
 	"gatepost/internal/token"
@@ -28,13 +30,15 @@ type domainRow struct {
 	ClaimedAt  time.Time  `json:"claimed_at"`
 	VerifiedAt *time.Time `json:"verified_at"`
 	ExpiresAt  *time.Time `json:"expires_at"`
+	Ns1        string     `json:"ns1"`
+	Ns2        string     `json:"ns2"`
 }
 
-const domainCols = `id::text, hostname, status, setup_type, claimed_at, verified_at, expires_at`
+const domainCols = `id::text, hostname, status, setup_type, claimed_at, verified_at, expires_at, coalesce(ns1,'') as ns1, coalesce(ns2,'') as ns2`
 
 func (s *Server) scanDomain(row pgx.Row) (domainRow, error) {
 	var d domainRow
-	err := row.Scan(&d.ID, &d.Hostname, &d.Status, &d.SetupType, &d.ClaimedAt, &d.VerifiedAt, &d.ExpiresAt)
+	err := row.Scan(&d.ID, &d.Hostname, &d.Status, &d.SetupType, &d.ClaimedAt, &d.VerifiedAt, &d.ExpiresAt, &d.Ns1, &d.Ns2)
 	return d, err
 }
 
@@ -93,10 +97,6 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 	if body.SetupType == "" {
 		body.SetupType = "cname"
 	}
-	if body.SetupType != "cname" {
-		fail(w, http.StatusBadRequest, "only cname setup is supported yet")
-		return
-	}
 	host, err := domains.NormalizeHostname(body.Hostname, s.serviceHostnames)
 	if err != nil {
 		if errors.Is(err, domains.ErrReservedServiceHostname) {
@@ -104,6 +104,31 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 			return
 		}
 		fail(w, http.StatusUnprocessableEntity, "invalid hostname: "+err.Error())
+		return
+	}
+	var ns1, ns2 string
+	switch body.SetupType {
+	case "cname":
+	case "nameserver":
+		if s.cfg.Ns1 == "" || s.cfg.Ns2 == "" {
+			fail(w, http.StatusInternalServerError, "nameserver mode is not configured (GP_NS1/GP_NS2 missing)")
+			return
+		}
+		// a nameserver-mode claim must be a registrable domain; a delegated
+		// subdomain only when the test-zone flag names it (item 10).
+		if reg, rerr := publicsuffix.EffectiveTLDPlusOne(host); rerr != nil || reg != host {
+			zoneOK := s.cfg.AllowSubdomainZones && s.cfg.TestZone != "" &&
+				(host == strings.ToLower(s.cfg.TestZone) ||
+					strings.HasSuffix(host, "."+strings.ToLower(s.cfg.TestZone)))
+			if !zoneOK {
+				fail(w, http.StatusUnprocessableEntity,
+					"nameserver setup needs a registrable domain (delegated subdomains require GP_ALLOW_SUBDOMAIN_ZONES and the GP_TEST_ZONE suffix)")
+				return
+			}
+		}
+		ns1, ns2 = s.cfg.Ns1, s.cfg.Ns2
+	default:
+		fail(w, http.StatusUnprocessableEntity, "setup_type must be cname or nameserver")
 		return
 	}
 	if !s.domainRate(w, r, p, "add", s.cfg.DomainAddCap) {
@@ -178,10 +203,10 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 
 	tok := token.New()
 	d, err := s.scanDomain(s.pool.QueryRow(ctx, `INSERT INTO domains
-		(owner_user_id, hostname, setup_type, verify_token, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+		(owner_user_id, hostname, setup_type, verify_token, expires_at, ns1, ns2)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''))
 		RETURNING `+domainCols,
-		p.UserID, host, body.SetupType, tok, time.Now().Add(claimTTL)))
+		p.UserID, host, body.SetupType, tok, time.Now().Add(claimTTL), ns1, ns2))
 	if err != nil {
 		if isUniqueViolation(err) { // lost a race → someone re-claimed first
 			if d, gerr := s.scanDomain(s.pool.QueryRow(ctx,
@@ -241,27 +266,38 @@ func (s *Server) deleteDomain(w http.ResponseWriter, r *http.Request, p *Princip
 }
 
 // GET /v1/domains/{id}/verification — the DNS instructions the customer
-// points at: TXT _gatepost-verify.<hostname> "gatepost-verify=<token>".
+// points at. Cname mode: TXT _gatepost-verify.<hostname> "gatepost-verify=
+// <token>". Nameserver mode: the assigned nameserver pair to delegate to.
 func (s *Server) domainVerification(w http.ResponseWriter, r *http.Request, p *Principal) {
 	d, ok := s.ownerDomain(w, r, p)
 	if !ok {
 		return
 	}
-	var tok string
-	if err := s.pool.QueryRow(r.Context(), `SELECT verify_token FROM domains
-		WHERE id::text = $1 AND owner_user_id = $2`, d.ID, p.UserID).Scan(&tok); err != nil {
-		fail(w, http.StatusInternalServerError, "internal error")
-		return
+	v := map[string]any{
+		"domain_id":  d.ID,
+		"hostname":   d.Hostname,
+		"setup_type": d.SetupType,
+		"status":     d.Status,
+		"expires_at": d.ExpiresAt,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"verification": map[string]any{
-		"domain_id":    d.ID,
-		"hostname":     d.Hostname,
-		"setup_type":   d.SetupType,
-		"status":       d.Status,
-		"record_name":  "_gatepost-verify." + d.Hostname,
-		"record_value": "gatepost-verify=" + tok,
-		"expires_at":   d.ExpiresAt,
-	}})
+	switch d.SetupType {
+	case "nameserver":
+		if d.Ns1 == "" || d.Ns2 == "" {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		v["nameservers"] = []string{d.Ns1, d.Ns2}
+	default:
+		var tok string
+		if err := s.pool.QueryRow(r.Context(), `SELECT verify_token FROM domains
+			WHERE id::text = $1 AND owner_user_id = $2`, d.ID, p.UserID).Scan(&tok); err != nil {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		v["record_name"] = "_gatepost-verify." + d.Hostname
+		v["record_value"] = "gatepost-verify=" + tok
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"verification": v})
 }
 
 // ExpireDomainClaims flips past-TTL pending claims to expired. Wired into
