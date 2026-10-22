@@ -68,6 +68,9 @@ type Config struct {
 	Ns2                 string
 	TestZone            string
 	AllowSubdomainZones bool
+	// Records cap (B2 item 12): GP_MAX_RECORDS per zone. Zero falls back
+	// to the design default (100).
+	MaxRecords int
 }
 
 type Principal struct {
@@ -111,6 +114,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.OriginTestCap <= 0 {
 		s.cfg.OriginTestCap = 10 // B2 default: 10 connection tests / user+IP / 15 min
+	}
+	if s.cfg.MaxRecords <= 0 {
+		s.cfg.MaxRecords = 100 // B2 default: 100 records per zone
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {
@@ -173,6 +179,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/domains/{id}/origin", s.requireAuth(s.getOrigin))
 	s.mux.HandleFunc("PUT /v1/domains/{id}/origin", s.requireAuth(s.putOrigin))
 	s.mux.HandleFunc("POST /v1/domains/{id}/origin/test", s.requireAuth(s.testOrigin))
+	s.mux.HandleFunc("POST /v1/domains/{id}/records", s.requireAuth(s.addRecord))
+	s.mux.HandleFunc("GET /v1/domains/{id}/records", s.requireAuth(s.listRecords))
+	s.mux.HandleFunc("GET /v1/domains/{id}/records/{rid}", s.requireAuth(s.getRecord))
+	s.mux.HandleFunc("PATCH /v1/domains/{id}/records/{rid}", s.requireAuth(s.patchRecord))
+	s.mux.HandleFunc("DELETE /v1/domains/{id}/records/{rid}", s.requireAuth(s.deleteRecord))
 }
 
 // --- http helpers -----------------------------------------------------------

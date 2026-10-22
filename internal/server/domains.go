@@ -177,10 +177,10 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 		p.UserID, host)); ferr == nil {
 		switch d.Status {
 		case "pending", "verified": // held: return untouched
-			writeJSON(w, http.StatusOK, map[string]any{"domain": d, "existing": true})
+			s.writeDomain(w, r, http.StatusOK, d, true)
 			return
 		case "disabled":
-			writeJSON(w, http.StatusOK, map[string]any{"domain": d, "existing": true})
+			s.writeDomain(w, r, http.StatusOK, d, true)
 			return
 		case "rejected", "expired":
 			tok := token.New()
@@ -193,7 +193,7 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 				fail(w, http.StatusInternalServerError, "internal error")
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"domain": d, "existing": true})
+			s.writeDomain(w, r, http.StatusOK, d, true)
 			return
 		}
 	} else if !errors.Is(ferr, pgx.ErrNoRows) {
@@ -212,14 +212,28 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 			if d, gerr := s.scanDomain(s.pool.QueryRow(ctx,
 				`SELECT `+domainCols+` FROM domains WHERE owner_user_id = $1 AND hostname = $2`,
 				p.UserID, host)); gerr == nil {
-				writeJSON(w, http.StatusOK, map[string]any{"domain": d, "existing": true})
+				s.writeDomain(w, r, http.StatusOK, d, true)
 				return
 			}
 		}
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"domain": d, "existing": false})
+	s.writeDomain(w, r, http.StatusCreated, d, false)
+}
+
+// writeDomain answers {domain, existing} for every claim-return path, and
+// keeps the one-per-domain zone row of nameserver claims ensured (the
+// UNIQUE makes retries a no-op).
+func (s *Server) writeDomain(w http.ResponseWriter, r *http.Request, code int, d domainRow, existing bool) {
+	if d.SetupType == "nameserver" {
+		if _, err := s.pool.Exec(r.Context(), `INSERT INTO zones (domain_id)
+			VALUES ($1) ON CONFLICT (domain_id) DO NOTHING`, d.ID); err != nil {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	writeJSON(w, code, map[string]any{"domain": d, "existing": existing})
 }
 
 // GET /v1/domains — the caller's claims.

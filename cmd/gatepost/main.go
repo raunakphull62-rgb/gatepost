@@ -104,6 +104,7 @@ func main() {
 		Ns2:                 strings.TrimSpace(os.Getenv("GP_NS2")),
 		TestZone:            strings.ToLower(strings.TrimSpace(os.Getenv("GP_TEST_ZONE"))),
 		AllowSubdomainZones: boolEnv("GP_ALLOW_SUBDOMAIN_ZONES"),
+		MaxRecords:          atoiEnv("GP_MAX_RECORDS"),
 		ServiceHostnames:    splitCommas(os.Getenv("GP_SERVICE_HOSTNAMES")),
 		DNSResolvers:        splitCommas(os.Getenv("GP_DNS_RESOLVERS")),
 		OwnedAddresses:      splitCommas(os.Getenv("GP_OWNED_ADDRESSES")),

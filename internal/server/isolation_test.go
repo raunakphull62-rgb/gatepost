@@ -26,6 +26,8 @@ var isolationRoutes = []struct {
 	{"origin update", "PUT", "/v1/domains/{id}/origin",
 		`{"scheme":"https","address":"93.184.216.34","port":443}`},
 	{"origin test", "POST", "/v1/domains/{id}/origin/test", ""},
+	{"records create", "POST", "/v1/domains/{id}/records", `{"name":"@","type":"A","value":"93.184.216.34"}`},
+	{"records list", "GET", "/v1/domains/{id}/records", ""},
 }
 
 // TestDomainOriginIsolationTable — for every listed route, a second user
