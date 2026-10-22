@@ -255,6 +255,95 @@ func portOfURL(t *testing.T, rawurl string) int {
 	return n
 }
 
+// TestOriginNumericFormRefusals — browser-style numeric encodings must never
+// reach the resolver: denied addresses are refused with the range reason,
+// malformed spellings outright ("origin address", never "no A/AAAA record"),
+// and harmless numeric spellings canonicalize. Through POST /origin (item 5).
+func TestOriginNumericFormRefusals(t *testing.T) {
+	_, a, _ := originSetup(t)
+	dec := func(o ...byte) string {
+		var u uint32
+		for _, b := range o {
+			u = u<<8 | uint32(b)
+		}
+		return strconv.FormatUint(uint64(u), 10)
+	}
+	ref := claimRow(t, a, "numform.example.com").ID
+	for _, c := range []struct {
+		name, addr, sub string
+	}{
+		{"octal loopback", "0177.0.0.1", "127.0.0.0/8"},
+		{"decimal loopback", dec(127, 0, 0, 1), "127.0.0.0/8"},
+		{"hex loopback", "0x7f000001", "127.0.0.0/8"},
+		{"hex dotted", "0x7f.0.0.1", "127.0.0.0/8"},
+		{"octal partial", "0177.1", "127.0.0.0/8"},
+		{"decimal partial", "127.1", "127.0.0.0/8"},
+		{"decimal metadata", dec(169, 254, 169, 254), "169.254.0.0/16"},
+		{"decimal cgnat", dec(100, 64, 0, 1), "100.64.0.0/10"},
+		{"0 slash 8", "0.1.2.3", "0.0.0.0/8"},
+		{"decimal multicast", dec(224, 0, 0, 1), "224.0.0.0/4"},
+		{"hex multicast", "0xe0000001", "224.0.0.0/4"},
+		{"benchmarking dec", "198.18.0.1", "198.18.0.0/15"},
+		{"benchmarking edge", "198.19.255.254", "198.18.0.0/15"},
+		{"doc v6", "2001:db8::1", "2001:db8::/32"},
+		{"mapped hex loopback", "::ffff:7f00:1", "127.0.0.0/8"},
+		{"malformed quad", "300.1.1.1", "malformed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, body := originCall(t, a, ref, map[string]any{"address": c.addr})
+			if code != http.StatusUnprocessableEntity {
+				t.Fatalf("want 422, got %d: %s", code, body)
+			}
+			if !strings.Contains(body, c.sub) {
+				t.Fatalf("reason must name %q, got: %s", c.sub, body)
+			}
+		})
+	}
+	// harmless numeric spellings are accepted and stored canonicalized
+	for _, c := range []struct{ name, addr, canonical string }{
+		{"decimal public", "134744072", "8.8.8.8"},
+		{"decimal partial public", "3.13.4", "3.13.0.4"},
+		{"uppercase host", "OK.EXample.COM.", "ok.example.com"},
+	} {
+		slug := strings.ReplaceAll(c.name, " ", "-")
+		d := claimRow(t, a, slug+"-acc.example.com").ID
+		if code, body := originCall(t, a, d, map[string]any{"address": c.addr}); code != http.StatusCreated {
+			t.Fatalf("%s: want 201, got %d: %s", c.name, code, body)
+		}
+		if got := a.must("GET", "/v1/domains/"+d+"/origin", "", http.StatusOK); !strings.Contains(got, `"address":"`+c.canonical+`"`) {
+			t.Fatalf("%s must store %q: %s", c.name, c.canonical, got)
+		}
+		a.must("DELETE", "/v1/domains/"+d, "", http.StatusOK)
+	}
+}
+
+// TestOriginTestRedirectToMetadata — an origin that 302s to cloud metadata:
+// the response is reported verbatim (302, empty error) and the metadata URL
+// is never fetched. Observable through the origin's own hit counter: if the
+// probe followed the redirect, the second request would re-enter the SAME
+// transport (the dial-the-checked-IP dialer) and hit this listener again, so
+// hits would be ≥ 2. One hit = no follow.
+func TestOriginTestRedirectToMetadata(t *testing.T) {
+	a, _ := hookSetup(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	d := claimRow(t, a, "metaredir.example.com").ID
+	if code, body := originCall(t, a, d, map[string]any{"scheme": "http", "address": "127.0.0.1", "port": portOfURL(t, srv.URL)}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	tr := originTestCall(t, a, d)
+	if !tr.Reachable || tr.StatusCode != http.StatusFound || tr.Error != "" {
+		t.Fatalf("302 must be reported verbatim: %+v", tr)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("redirect must not be followed; origin saw %d requests", n)
+	}
+}
+
 // TestOriginTestLocalOrigins — the local test origin via the test hook:
 // plain http reachable (any status is reachable), TLS verify reported as the
 // exact x509 failure, and tls_verify=false succeeds with tls_ok=true.

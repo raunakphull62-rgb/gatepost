@@ -99,7 +99,7 @@ type originBody struct {
 	HealthInterval *int    `json:"health_interval"`
 }
 
-func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (scheme string, tlsVerify bool, hostHeader, healthPath string, interval int, ok bool) {
+func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (scheme, canon string, tlsVerify bool, hostHeader, healthPath string, interval int, ok bool) {
 	if b.Scheme != "http" && b.Scheme != "https" {
 		fail(w, http.StatusUnprocessableEntity, "scheme must be http or https")
 		return
@@ -108,9 +108,11 @@ func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (s
 		fail(w, http.StatusUnprocessableEntity, "port: "+err.Error())
 		return
 	}
-	if _, valid := s.checkOrigin(w, r, b.Address); !valid {
+	o, valid := s.checkOrigin(w, r, b.Address)
+	if !valid {
 		return
 	}
+	canon = o.Canonical // store the validated form, not the raw spelling
 	tlsVerify = true
 	if b.TLSVerify != nil {
 		tlsVerify = *b.TLSVerify
@@ -141,7 +143,7 @@ func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (s
 		}
 		interval = *b.HealthInterval
 	}
-	return b.Scheme, tlsVerify, hostHeader, healthPath, interval, true
+	return b.Scheme, canon, tlsVerify, hostHeader, healthPath, interval, true
 }
 
 // POST /v1/domains/{id}/origin — create the one origin for the domain.
@@ -154,7 +156,7 @@ func (s *Server) addOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 	if !readJSON(w, r, &body) {
 		return
 	}
-	scheme, tlsVerify, hostHeader, healthPath, interval, ok := body.check(w, s, r)
+	scheme, canon, tlsVerify, hostHeader, healthPath, interval, ok := body.check(w, s, r)
 	if !ok {
 		return
 	}
@@ -162,7 +164,7 @@ func (s *Server) addOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 		(domain_id, scheme, address, port, host_header, tls_verify, health_path, health_interval_secs)
 		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8)
 		RETURNING `+originCols,
-		d.ID, scheme, body.Address, body.Port, hostHeader, tlsVerify, healthPath, interval))
+		d.ID, scheme, canon, body.Port, hostHeader, tlsVerify, healthPath, interval))
 	if err != nil {
 		if isUniqueViolation(err) {
 			fail(w, http.StatusConflict, "origin already set; use PUT")
@@ -203,7 +205,7 @@ func (s *Server) putOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 	if !readJSON(w, r, &body) {
 		return
 	}
-	scheme, tlsVerify, hostHeader, healthPath, interval, ok := body.check(w, s, r)
+	scheme, canon, tlsVerify, hostHeader, healthPath, interval, ok := body.check(w, s, r)
 	if !ok {
 		return
 	}
@@ -212,7 +214,7 @@ func (s *Server) putOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 		tls_verify = $6, health_path = $7, health_interval_secs = $8, updated_at = now()
 		WHERE domain_id = $1
 		RETURNING `+originCols,
-		d.ID, scheme, body.Address, body.Port, hostHeader, tlsVerify, healthPath, interval))
+		d.ID, scheme, canon, body.Port, hostHeader, tlsVerify, healthPath, interval))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			fail(w, http.StatusNotFound, "no origin set; POST to create")

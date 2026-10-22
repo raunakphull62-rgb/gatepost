@@ -3,6 +3,7 @@ package domains
 import (
 	"errors"
 	"net"
+	"strconv"
 	"testing"
 )
 
@@ -66,7 +67,7 @@ func TestCheckIP(t *testing.T) {
 		{net.ParseIP("fe80::1"), false, false},                // link-local
 		{net.ParseIP("fe00::"), false, false},                 // ::/8 edge
 		{net.ParseIP("ff02::1"), false, false},                // multicast v6
-		{net.ParseIP("2001:db8::1"), false, true},             // doc range: allowed here
+		{net.ParseIP("2001:db8::1"), false, false},            // doc range (RFC 3849)
 		{net.ParseIP("127.0.0.1"), true, true},                // TEST HOOK: loopback waived
 		{net.ParseIP("::1"), true, true},                      // TEST HOOK: loopback waived
 		{net.ParseIP("10.1.2.3"), true, false},                // hook must NOT waive private
@@ -82,6 +83,80 @@ func TestCheckIP(t *testing.T) {
 		}
 		if !c.wantNull && err == nil {
 			t.Errorf("CheckIP(%s, hook=%v) allowed, want refused", c.ip, c.hook)
+		}
+	}
+}
+
+// TestValidateOriginNumericForms — browser-style numeric encodings. Whatever
+// a browser would numeric-expand must be range-checked as an address here,
+// never handed to the resolver as a hostname (hardening item: SSRF encodings).
+func TestValidateOriginNumericForms(t *testing.T) {
+	dec := func(o ...byte) string { // the decimal spelling of a dotted quad
+		var u uint32
+		for _, b := range o {
+			u = u<<8 | uint32(b)
+		}
+		return strconv.FormatUint(uint64(u), 10)
+	}
+	cases := []struct {
+		in       string
+		hook     bool
+		want     string
+		wantIP   bool // decoded address rows carry a literal IP
+		wantNull bool
+	}{
+		// denied ranges behind numeric encodings
+		{dec(127, 0, 0, 1), false, "", false, false},       // "2130706433"
+		{"0x7f000001", false, "", false, false},            // hex, one label
+		{"0x7f.0.0.1", false, "", false, false},            // hex label
+		{"0177.0.0.1", false, "", false, false},            // octal
+		{"0177.1", false, "", false, false},                // octal partial quad
+		{"127.1", false, "", false, false},                 // decimal partial quad
+		{dec(169, 254, 169, 254), false, "", false, false}, // decimal metadata
+		{"::ffff:a9fe:a9fe", false, "", false, false},      // mapped metadata, hex groups
+		{"0.1.2.3", false, "", false, false},               // 0.0.0.0/8
+		{"0.0.0.0", false, "", false, false},
+		{dec(224, 0, 0, 1), false, "", false, false}, // decimal multicast
+		{"0xe0000001", false, "", false, false},      // hex multicast
+		{"224.0.0.1", false, "", false, false},
+		{"198.18.0.1", false, "", false, false}, // benchmarking range
+		{"198.19.255.254", false, "", false, false},
+		{"192.0.2.1", false, "", false, false},   // TEST-NET-1
+		{"2001:db8::1", false, "", false, false}, // doc range (new deny)
+		// malformed numeric spellings: refused outright, never resolved
+		{"300.1.1.1", false, "", false, false},
+		{"256.2.3", false, "", false, false},   // byte position overflow
+		{"1.2.99999", false, "", false, false}, // > 16-bit last label
+		{"127.99999999", false, "", false, false},
+		{"1.2.256", false, "1.2.1.0", true, true}, // carries into the next byte, like every browser
+		// public numeric spellings are accepted and canonicalized
+		{"134744072", false, "8.8.8.8", true, true},
+		{dec(198, 41, 0, 4), false, "198.41.0.4", true, true},
+		{"1.5.6", false, "1.5.0.6", true, true}, // 3-part quad
+		{"1.2.3.4.", false, "1.2.3.4", true, true},
+		{"::ffff:5db8:d822", false, "93.184.216.34", true, true}, // mapped public
+		// names that merely look numberish stay hostnames
+		{"1.2.3.4.5.6", false, "1.2.3.4.5.6", false, true},
+		{"0x.example.com", false, "0x.example.com", false, true},
+		{"09.example.com", false, "09.example.com", false, true},
+	}
+	for _, c := range cases {
+		got, err := ValidateOrigin(c.in, nil, c.hook)
+		if c.wantNull {
+			if err != nil {
+				t.Errorf("ValidateOrigin(%q) = %v err=%v", c.in, got.Canonical, err)
+				continue
+			}
+			if got.Canonical != c.want || (c.wantIP && got.IP == nil) || (!c.wantIP && got.IP != nil) {
+				t.Errorf("ValidateOrigin(%q): want %q (literal %v), got %q (ip %v)", c.in, c.want, c.wantIP, got.Canonical, got.IP)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("ValidateOrigin(%q) accepted %q, want refused", c.in, got.Canonical)
+		}
+		if !errors.Is(err, ErrForbiddenOrigin) && !errors.Is(err, ErrInvalidOrigin) {
+			t.Errorf("ValidateOrigin(%q): wrong error class: %v", c.in, err)
 		}
 	}
 }

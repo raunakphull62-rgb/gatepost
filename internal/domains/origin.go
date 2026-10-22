@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -38,9 +39,9 @@ var forbidV4 = []string{
 
 var forbidV4Nets = mustCIDRs(forbidV4)
 
-// IPv6: loopback (single), unique-local, link-local, v4-mapped handled by the
-// To4() path above.
-var forbidV6Nets = mustCIDRs([]string{"::/8", "fe00::/9", "fe80::/10", "fc00::/7", "ff00::/8"})
+// IPv6: loopback (single), unique-local, link-local, RFC 3849 documentation
+// (2001:db8::/32); v4-mapped handled by the To4() path above.
+var forbidV6Nets = mustCIDRs([]string{"::/8", "fe00::/9", "fe80::/10", "fc00::/7", "ff00::/8", "2001:db8::/32"})
 
 func mustCIDRs(list []string) []*net.IPNet {
 	out := make([]*net.IPNet, 0, len(list))
@@ -138,6 +139,63 @@ func CheckIP(ip net.IP, owned *OwnedAddresses, allowLoopback bool) error {
 
 var hostLike = regexp.MustCompile(`^[a-z0-9._-]+$`)
 
+// numericIP decodes the numeric address spellings browsers (and attackers)
+// accept beyond plain dotted quads: a single 32-bit decimal ("2130706433" =
+// 127.0.0.1), hex labels ("0x7f000001", "0x7f.0.0.1"), octal labels
+// ("0177.0.0.1") and partial quads ("127.1"). Everything left of the last
+// label is one byte; the last label spreads over the bits that remain.
+// numeric=true means s spelled an address, so it must never fall through to
+// the hostname path — a resolver may well answer such a name.
+func numericIP(s string) (net.IP, bool) {
+	labels := strings.Split(s, ".")
+	if len(labels) == 0 || len(labels) > 4 { // 5+ labels stays a hostname (WHATWG agrees)
+		return nil, false
+	}
+	var v [4]uint32
+	for i, l := range labels {
+		base := 10
+		if l == "" { // "1..2" is a (rejected) hostname, not an address spelling
+			return nil, false
+		}
+		if strings.HasPrefix(l, "0x") {
+			base, l = 16, l[2:]
+			if l == "" {
+				return nil, false
+			}
+		} else if l[0] == '0' && len(l) > 1 {
+			base = 8
+		}
+		n, err := strconv.ParseUint(l, base, 32)
+		if err != nil { // not numeric after all ("backend", "09")
+			return nil, false
+		}
+		v[i] = uint32(n)
+	}
+	var u uint32
+	switch len(labels) { // overflow means malformed spelling — refuse, never resolve
+	case 1: // full 32-bit value
+		u = v[0]
+	case 2:
+		if v[0] > 255 || v[1] > 0xFFFFFF {
+			return nil, true
+		}
+		u = v[0]<<24 | v[1]
+	case 3:
+		if v[0] > 255 || v[1] > 255 || v[2] > 0xFFFF {
+			return nil, true
+		}
+		u = v[0]<<24 | v[1]<<16 | v[2]
+	case 4:
+		for _, n := range v {
+			if n > 255 {
+				return nil, true
+			}
+		}
+		u = v[0]<<24 | v[1]<<16 | v[2]<<8 | v[3]
+	}
+	return net.IPv4(byte(u>>24), byte(u>>16), byte(u>>8), byte(u)), true
+}
+
 // OriginAddr is the validated origin address: either a canonical IP literal
 // or a normalised hostname.
 type OriginAddr struct {
@@ -165,6 +223,15 @@ func ValidateOrigin(raw string, owned *OwnedAddresses, allowLoopback bool) (Orig
 		return OriginAddr{Canonical: ip.String(), IP: ip}, nil
 	}
 	if ip := net.ParseIP(s); ip != nil {
+		if err := CheckIP(ip, owned, allowLoopback); err != nil {
+			return OriginAddr{}, err
+		}
+		return OriginAddr{Canonical: ip.String(), IP: ip}, nil
+	}
+	if ip, numeric := numericIP(s); numeric {
+		if ip == nil { // looks like an address but can't parse — never a DNS name
+			return OriginAddr{}, fmt.Errorf("%w: %q is a malformed numeric address", ErrInvalidOrigin, raw)
+		}
 		if err := CheckIP(ip, owned, allowLoopback); err != nil {
 			return OriginAddr{}, err
 		}
