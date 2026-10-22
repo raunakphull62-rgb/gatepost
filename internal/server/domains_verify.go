@@ -177,6 +177,7 @@ func sortedList(prefix string, xs []string) string {
 // markVerified runs the one-transaction win: this claim verified, competing
 // pending claims rejected. Returns a user-facing reason on any conflict.
 func (s *Server) markVerified(r *http.Request, d domainRow, ownerID string) string {
+	contended := func(err error) bool { return isUniqueViolation(err) || isDeadlock(err) }
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		return "internal error"
@@ -185,6 +186,9 @@ func (s *Server) markVerified(r *http.Request, d domainRow, ownerID string) stri
 	ct, err := tx.Exec(r.Context(), `UPDATE domains SET status = 'verified',
 		verified_at = now(), expires_at = NULL WHERE id::text = $1 AND status = 'pending'`, d.ID)
 	if err != nil {
+		if contended(err) {
+			return "verification raced another attempt, try again"
+		}
 		return "internal error"
 	}
 	if ct.RowsAffected() == 0 { // we lost some race; say so plainly
@@ -193,10 +197,13 @@ func (s *Server) markVerified(r *http.Request, d domainRow, ownerID string) stri
 	// every other pending claim on this hostname loses (they can re-claim).
 	if _, err := tx.Exec(r.Context(), `UPDATE domains SET status = 'rejected', verified_at = NULL
 		WHERE hostname = $1 AND status = 'pending' AND owner_user_id <> $2`, d.Hostname, ownerID); err != nil {
+		if contended(err) {
+			return "verification raced another attempt, try again"
+		}
 		return "internal error"
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		if isUniqueViolation(err) { // someone else won this exact hostname
+		if contended(err) { // someone else won this exact hostname
 			return "hostname already verified by another user"
 		}
 		return "internal error"

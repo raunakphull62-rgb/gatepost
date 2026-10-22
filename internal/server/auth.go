@@ -36,6 +36,14 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pg) && pg.Code == "23505"
 }
 
+// isDeadlock — 40P01: two racing verifications cross-lock the two claim
+// rows; losing that fight is a benign lost race (the other one wins), so it
+// reads as a retryable conflict, never as a 500.
+func isDeadlock(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "40P01"
+}
+
 // POST /auth/signup {email, password}
 func (s *Server) signup(w http.ResponseWriter, r *http.Request) {
 	var c creds

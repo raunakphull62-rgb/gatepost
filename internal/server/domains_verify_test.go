@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,6 +19,7 @@ import (
 // for the 502/400 paths.
 type fakeDNS struct {
 	txt    map[string]string   // record name → TXT value
+	multi  map[string][]string // record name → several TXT values (head-to-head races)
 	ns     map[string][]string // zone → NS names
 	ips    map[string][]net.IP // hostname → A/AAAA answers
 	txtErr error
@@ -27,6 +29,9 @@ type fakeDNS struct {
 func (f *fakeDNS) LookupTXT(ctx context.Context, name string) ([]string, error) {
 	if f.txtErr != nil {
 		return nil, f.txtErr
+	}
+	if v, ok := f.multi[name]; ok {
+		return append([]string{}, v...), nil
 	}
 	if v, ok := f.txt[name]; ok {
 		return []string{v}, nil
@@ -178,6 +183,93 @@ func TestVerifyTokenNotInListResponses(t *testing.T) {
 	if !strings.Contains(v, tok) {
 		t.Fatalf("instructions must carry the token: %s", v)
 	}
+}
+
+// TestVerifyHeadToHead50Rounds — hardening: two users verify the same
+// hostname at the same instant, 50 rounds. The zone genuinely carries BOTH
+// users' tokens (a real hostname can have several TXT strings, here set up
+// by two owners), so both attempts pass the token check and only the
+// database decides. Invariant per round: exactly one 200, exactly one row
+// verified and one rejected — no round may end with two winners or none.
+// Claim rows are deleted in between so caps/pending counts never trip.
+func TestVerifyHeadToHead50Rounds(t *testing.T) {
+	pool := testPool(t)
+	a, srv := newTestServer(t, pool, func(cfg *Config) {
+		cfg.DomainAddCap, cfg.VerifyCap = 500, 500 // 50 rounds of both per user
+	})
+	signupOn(t, pool, a, "h2h-a@x.test")
+	b := secondUser(t, pool, a, "h2h-b@x.test")
+
+	rounds := [][2]int{} // per-round verification codes
+	for i := 0; i < 50; i++ {
+		host := "h2h-" + strings.ToLower(randHex(t, 6)) + ".example.com"
+		da, db := claimRow(t, a, host), claimRow(t, b, host)
+		tokA, tokB := verifyTokenOf(t, pool, da.ID), verifyTokenOf(t, pool, db.ID)
+		setResolvers(srv, &fakeDNS{multi: map[string][]string{
+			"_gatepost-verify." + host: {
+				"gatepost-verify=" + tokA, "gatepost-verify=" + tokB,
+			},
+		}})
+		ids := [2]string{da.ID, db.ID}
+		codes := [2]int{}
+		var wg sync.WaitGroup
+		for j, q := range []tc{a, b} { // fire both verifications simultaneously
+			wg.Add(1)
+			go func(j int, q tc) {
+				defer wg.Done()
+				code, _ := q.do("POST", "/v1/domains/"+ids[j]+"/verify", "")
+				codes[j] = code
+			}(j, q)
+		}
+		wg.Wait()
+		tallies := map[string]int{}
+		for j, q := range []tc{a, b} {
+			got := q.must("GET", "/v1/domains/"+ids[j], "", http.StatusOK)
+			switch {
+			case strings.Contains(got, `"status":"verified"`):
+				tallies["verified"]++
+			case strings.Contains(got, `"status":"rejected"`):
+				tallies["rejected"]++
+			default:
+				tallies["other"]++
+			}
+			q.must("DELETE", "/v1/domains/"+ids[j], "", http.StatusOK) // next round's caps
+		}
+		rounds = append(rounds, codes)
+
+		if tallies["verified"] != 1 || tallies["rejected"] != 1 {
+			t.Fatalf("round %d: exactly one winner expected, tallies %v (codes %v)",
+				i+1, tallies, codes)
+		}
+		var wins int
+		var losers []int
+		for _, code := range codes {
+			if code == http.StatusOK {
+				wins++
+			} else {
+				losers = append(losers, code)
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("round %d: want exactly one 200, got codes %v", i+1, codes)
+		}
+		for _, code := range losers {
+			if code != http.StatusConflict && code != http.StatusGone {
+				t.Fatalf("round %d: loser got status %d, want 409/410", i+1, code)
+			}
+		}
+	}
+	// both users should have collected some wins across the 50 rounds
+	var winA, winB int
+	for _, c := range rounds {
+		if c[0] == http.StatusOK {
+			winA++
+		}
+		if c[1] == http.StatusOK {
+			winB++
+		}
+	}
+	t.Logf("50 rounds: a won %d, b won %d", winA, winB)
 }
 
 // TestVerifyWinnerTokenMismatch — a loser who points their TXT records at
