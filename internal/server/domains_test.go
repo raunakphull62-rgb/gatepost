@@ -23,19 +23,117 @@ func insertUser(t *testing.T, pool *pgxpool.Pool, email string) string {
 	return id
 }
 
-// TestDomainsSchema checks the migration-level invariants B2 relies on:
-// pending claims can pile up on one hostname, exactly one is ever verified,
-// one origin per domain, and deleting a domain takes its origin with it.
-// TestDomainsCRUD — claim/list/get/delete with the ownership 404 rule and
-// the add-same-hostname dedupe ("adding a hostname you hold returns the
-// existing claim").
+// secondUser spins up a second login on a's server (own cookie jar, own
+// spoofed IP → own rate bucket).
+func secondUser(t *testing.T, pool *pgxpool.Pool, a tc, email string) tc {
+	t.Helper()
+	b := unfollow(a)
+	b.must("POST", "/auth/signup", `{"email":"`+email+`","password":"secretpw123"}`, http.StatusOK)
+	b.must("POST", "/auth/verify", `{"token":"`+lastEmailToken(t, pool, "verify")+`"}`, http.StatusOK)
+	return b
+}
+
+func claimHost(t *testing.T, c tc, host string) (int, string) {
+	t.Helper()
+	return c.do("POST", "/v1/domains", `{"hostname":"`+host+`"}`)
+}
+
+func claimRow(t *testing.T, c tc, host string) domainRow {
+	t.Helper()
+	code, body := claimHost(t, c, host)
+	if code != http.StatusCreated && code != http.StatusOK {
+		t.Fatalf("claim %s: %d %s", host, code, body)
+	}
+	var d struct {
+		Domain domainRow `json:"domain"`
+	}
+	if err := json.Unmarshal([]byte(body), &d); err != nil {
+		t.Fatalf("claim json %s: %v: %s", body, err, body)
+	}
+	return d.Domain
+}
+
+func verifyTokenOf(t *testing.T, pool *pgxpool.Pool, id string) string {
+	t.Helper()
+	var tok string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT verify_token FROM domains WHERE id::text = $1`, id).Scan(&tok); err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+func uniqueViolation(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "23505"
+}
+
+func TestDomainsSchema(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	u1 := insertUser(t, pool, "dom1@x.test")
+	u2 := insertUser(t, pool, "dom2@x.test")
+
+	claim := func(user string) string {
+		var id string
+		if err := pool.QueryRow(ctx, `INSERT INTO domains
+				(owner_user_id, hostname, verify_token) VALUES ($1, 'shop.example.com', 'tok-'||$2)
+				RETURNING id::text`, user, user).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	id1, id2 := claim(u1), claim(u2)
+	if id1 == id2 {
+		t.Fatal("claim ids must differ")
+	}
+
+	// many pending claims on one hostname: allowed (two made above)
+	// but the same user cannot hold the same hostname twice
+	if _, err := pool.Exec(ctx, `INSERT INTO domains (owner_user_id, hostname, verify_token)
+		VALUES ($1, 'shop.example.com', 'dup')`, u1); !uniqueViolation(err) {
+		t.Fatalf("re-claim by same user must fail on (owner, hostname) unique: %v", err)
+	}
+
+	// exactly one verified claim per hostname
+	for i, uid := range []string{u1, u2} {
+		_, err := pool.Exec(ctx, `UPDATE domains SET status='verified', verified_at = now()
+			WHERE owner_user_id = $1`, uid)
+		if i == 0 && err != nil {
+			t.Fatalf("first verify of a hostname must succeed: %v", err)
+		}
+		if i == 1 && !uniqueViolation(err) {
+			t.Fatalf("second verify must violate the partial unique index: %v", err)
+		}
+	}
+
+	// one origin per domain
+	if _, err := pool.Exec(ctx, `INSERT INTO origins (domain_id, scheme, address, port)
+		VALUES ($1, 'https', 'example.org', 443)`, id1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO origins (domain_id, scheme, address, port)
+		VALUES ($1, 'https', 'example.org', 443)`, id1); !uniqueViolation(err) {
+		t.Fatalf("second origin for a domain must violate UNIQUE(domain_id): %v", err)
+	}
+
+	// deleting the domain removes its origin (and claims) with it
+	if _, err := pool.Exec(ctx, `DELETE FROM domains WHERE id = $1`, id1); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM origins WHERE domain_id = $1`, id1).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("origin survived domain delete: n=%d err=%v", n, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM domains WHERE hostname = 'shop.example.com'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("one claim should remain after delete: n=%d err=%v", n, err)
+	}
+}
+
 func TestDomainsCRUD(t *testing.T) {
 	pool := testPool(t)
-	aEmail := "dom-a-crud@x.test"
-	a := signupVerify(t, pool, aEmail, "secretpw123")
-	b := unfollow(a)
-	b.must("POST", "/auth/signup", `{"email":"dom-b-crud@x.test","password":"secretpw123"}`, http.StatusOK)
-	b.must("POST", "/auth/verify", `{"token":"`+lastEmailToken(t, pool, "verify")+`"}`, http.StatusOK)
+	a := signupVerify(t, pool, "dom-a-crud@x.test", "secretpw123")
+	b := secondUser(t, pool, a, "dom-b-crud@x.test")
 
 	body := a.must("POST", "/v1/domains", `{"hostname":"shop.Example.com."}`, http.StatusCreated)
 	var created struct {
@@ -132,8 +230,6 @@ func TestDomainCaps(t *testing.T) {
 	_ = d2
 }
 
-// TestDomainsSchema checks the migration-level invariants B2 relies on:}
-
 // TestDomainClaimExpiry — a claim past its expires_at becomes expired (the
 // live hourly job): then re-claiming revives the row with a fresh TTL.
 func TestDomainClaimExpiry(t *testing.T) {
@@ -166,74 +262,4 @@ func TestDomainClaimExpiry(t *testing.T) {
 	if !again.Existing || again.Domain.ID != d.Domain.ID || again.Domain.Status != "pending" {
 		t.Fatalf("revived claim: %+v", again.Domain)
 	}
-}
-
-// TestDomainsSchema checks the migration-level invariants B2 relies on:
-// pending claims can pile up on one hostname, exactly one is ever verified,
-// one origin per domain, and deleting a domain takes its origin with it.
-func TestDomainsSchema(t *testing.T) {
-	pool := testPool(t)
-	ctx := context.Background()
-	u1 := insertUser(t, pool, "dom1@x.test")
-	u2 := insertUser(t, pool, "dom2@x.test")
-
-	claim := func(user string) string {
-		var id string
-		if err := pool.QueryRow(ctx, `INSERT INTO domains
-				(owner_user_id, hostname, verify_token) VALUES ($1, 'shop.example.com', 'tok-'||$2)
-				RETURNING id::text`, user, user).Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		return id
-	}
-	id1, id2 := claim(u1), claim(u2)
-	if id1 == id2 {
-		t.Fatal("claim ids must differ")
-	}
-
-	// many pending claims on one hostname: allowed (two made above)
-	// but the same user cannot hold the same hostname twice
-	if _, err := pool.Exec(ctx, `INSERT INTO domains (owner_user_id, hostname, verify_token)
-		VALUES ($1, 'shop.example.com', 'dup')`, u1); !uniqueViolation(err) {
-		t.Fatalf("re-claim by same user must fail on (owner, hostname) unique: %v", err)
-	}
-
-	// exactly one verified claim per hostname
-	for i, uid := range []string{u1, u2} {
-		_, err := pool.Exec(ctx, `UPDATE domains SET status='verified', verified_at = now()
-			WHERE owner_user_id = $1`, uid)
-		if i == 0 && err != nil {
-			t.Fatalf("first verify of a hostname must succeed: %v", err)
-		}
-		if i == 1 && !uniqueViolation(err) {
-			t.Fatalf("second verify must violate the partial unique index: %v", err)
-		}
-	}
-
-	// one origin per domain
-	if _, err := pool.Exec(ctx, `INSERT INTO origins (domain_id, scheme, address, port)
-		VALUES ($1, 'https', 'example.org', 443)`, id1); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO origins (domain_id, scheme, address, port)
-		VALUES ($1, 'https', 'example.org', 443)`, id1); !uniqueViolation(err) {
-		t.Fatalf("second origin for a domain must violate UNIQUE(domain_id): %v", err)
-	}
-
-	// deleting the domain removes its origin (and claims) with it
-	if _, err := pool.Exec(ctx, `DELETE FROM domains WHERE id = $1`, id1); err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM origins WHERE domain_id = $1`, id1).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("origin survived domain delete: n=%d err=%v", n, err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM domains WHERE hostname = 'shop.example.com'`).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("one claim should remain after delete: n=%d err=%v", n, err)
-	}
-}
-
-func uniqueViolation(err error) bool {
-	var pe *pgconn.PgError
-	return errors.As(err, &pe) && pe.Code == "23505"
 }

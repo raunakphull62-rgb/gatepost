@@ -94,6 +94,7 @@ func main() {
 		DomainMaxTotal:     atoiEnv("GP_DOMAIN_MAX"),
 		DomainMaxPending:   atoiEnv("GP_DOMAIN_PENDING"),
 		ServiceHostnames:   splitCommas(os.Getenv("GP_SERVICE_HOSTNAMES")),
+		DNSResolvers:       splitCommas(os.Getenv("GP_DNS_RESOLVERS")),
 		TrustedProxes:      splitCommas(os.Getenv("GP_TRUSTED_PROXIES")),
 	}, pool, sender)
 
