@@ -49,6 +49,8 @@ ORIGIN_PID=$!
 BASE="${GP_PUBLIC_BASE_URL:-http://localhost:8091}"
 ENV=development GP_TRUSTED_PROXIES=127.0.0.1/32 GP_HTTP_ADDR=127.0.0.1:8091 \
   GP_TEST_ALLOW_LOOPBACK=true GP_SERVICE_HOSTNAMES=api.gatepost.net \
+  GP_NS1=ns1.gatepost.test GP_NS2=ns2.gatepost.test \
+  GP_TEST_ZONE=gatepost.test GP_ALLOW_SUBDOMAIN_ZONES=true \
   GP_DNS_RESOLVERS=127.0.0.1:5333 \
   ./gatepost >/tmp/gatepost-domains-demo-server.log 2>&1 &
 SRV_PID=$!
@@ -125,6 +127,37 @@ check "B tests A's origin: 404"             "$(codeof "$(cb2 -X POST "$BASE/v1/d
 check "B deletes A's domain: 404"           "$(codeof "$(cb2 -X DELETE "$BASE/v1/domains/$DOM")")" "404"
 check "B's instructions call returns no token" "$(bodyof "$(cb2 "$BASE/v1/domains/$DOM/verification")" | grep -c 'gatepost-verify=')" "0"
 check "B's list shows none of A's row ids"  "$(bodyof "$(cb2 "$BASE/v1/domains")" | grep -c "$DOM")" "0"
+
+# --- nameserver mode + zone records (items 10–12 walkthrough) ---
+OUT=$(cb -X POST "$BASE/v1/domains" -H 'Content-Type: application/json' \
+  -d "{\"hostname\":\"dm-$TS.gatepost.test\",\"setup_type\":\"nameserver\"}")
+check "nameserver claim accepted (test-zone subdomain)" "$(codeof "$OUT")" "201"
+DOM2=$(bodyof "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["domain"]["id"])' 2>/dev/null)
+check "claim carries the assigned nameserver pair" \
+  "$(bodyof "$OUT" | grep -c '"ns1":"ns1.gatepost.test"')" "1"
+check "instructions list the pair" \
+  "$(bodyof "$(cb "$BASE/v1/domains/$DOM2/verification")" | grep -c '"nameservers":\["ns1.gatepost.test","ns2.gatepost.test"\]')" "1"
+check "nameserver TXT leak absent" \
+  "$(bodyof "$(cb "$BASE/v1/domains/$DOM2/verification")" | grep -c 'gatepost-verify=')" "0"
+check "delegation verification fails while resolvers are dead (502)" \
+  "$(codeof "$(cb -X POST "$BASE/v1/domains/$DOM2/verify")")" "502"
+
+rrecord() { cb -X POST "$BASE/v1/domains/$DOM2/records" -H 'Content-Type: application/json' -d "$1"; }
+ROUT=$(rrecord '{"name":"@","type":"A","value":"93.184.216.34"}')
+check "A record created" "$(codeof "$ROUT")" "201"
+R1=$(bodyof "$ROUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["record"]["id"])' 2>/dev/null)
+check "AAAA record created" "$(codeof "$(rrecord '{"name":"v6","type":"AAAA","value":"2606:4700::1111"}')")" "201"
+check "MX with priority created" "$(codeof "$(rrecord '{"name":"@","type":"MX","value":"mail.example.net","priority":10}')")" "201"
+check "CNAME beside the apex A refused (409)" "$(codeof "$(rrecord '{"name":"@","type":"CNAME","value":"other.example.net"}')")" "409"
+check "garbage type refused" "$(codeof "$(rrecord '{"name":"g","type":"WIFI","value":"x"}')")" "422"
+check "record patched (value + ttl)" \
+  "$(codeof "$(cb -X PATCH "$BASE/v1/domains/$DOM2/records/$R1" -H 'Content-Type: application/json' -d '{"value":"93.184.216.35","ttl":600}')")" "200"
+HIST=$(cb "$BASE/v1/domains/$DOM2/records/$R1")
+check "history has create+update" "$(printf '%s' "$(bodyof "$HIST")" | grep -c '"action":"create"')" "1"
+check "history shows the old value" "$(printf '%s' "$(bodyof "$HIST")" | grep -c '"old_value":"93.184.216.34"')" "1"
+check "record deleted" "$(codeof "$(cb -X DELETE "$BASE/v1/domains/$DOM2/records/$R1")")" "200"
+check "zone keeps AAAA + MX, not the deleted A" \
+  "$(bodyof "$(cb "$BASE/v1/domains/$DOM2/records")" | grep -o '"id":' | grep -c '')" "2"
 
 echo
 echo "=== domains/origins demo: $PASS passed, $FAIL failed ==="
