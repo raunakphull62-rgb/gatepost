@@ -252,6 +252,9 @@ func writeTestRefusal(w http.ResponseWriter, err error, elapsed time.Duration) {
 
 // POST /v1/domains/{id}/origin/test — probe the stored origin.
 func (s *Server) testOrigin(w http.ResponseWriter, r *http.Request, p *Principal) {
+	if !s.domainRate(w, r, p, "origin-test", s.cfg.OriginTestCap) {
+		return
+	}
 	d, ok := s.ownerDomain(w, r, p)
 	if !ok {
 		return

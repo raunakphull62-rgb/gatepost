@@ -57,6 +57,9 @@ func lookupNS(ctx context.Context, resolvers []domains.Resolver, name string) ([
 
 // POST /v1/domains/{id}/verify — TXT-based ownership proof.
 func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request, p *Principal) {
+	if !s.domainRate(w, r, p, "verify", s.cfg.VerifyCap) {
+		return
+	}
 	d, ok := s.ownerDomain(w, r, p)
 	if !ok {
 		return

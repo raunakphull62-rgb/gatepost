@@ -55,6 +55,31 @@ func (s *Server) ownerDomain(w http.ResponseWriter, r *http.Request, p *Principa
 	return row, true
 }
 
+// domainRate consumes one rate-limit unit for a domain action, per user and
+// per IP (B2 item 8). ok=false means a 429 was already written.
+func (s *Server) domainRate(w http.ResponseWriter, r *http.Request, p *Principal, action string, limit int) bool {
+	ctx := r.Context()
+	ok, err := s.bumpRate(ctx, "domains:"+action+"|user:"+p.UserID, limit)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	if !ok {
+		fail(w, http.StatusTooManyRequests, "rate limit exceeded for domains:"+action)
+		return false
+	}
+	ok, err = s.bumpRate(ctx, "domains:"+action+"|ip:"+s.clientIP(r), limit)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	if !ok {
+		fail(w, http.StatusTooManyRequests, "rate limit exceeded for domains:"+action)
+		return false
+	}
+	return true
+}
+
 // POST /v1/domains {hostname} — claim a hostname; repeated claims of one the
 // caller already holds return that claim (not a second row).
 func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal) {
@@ -79,6 +104,9 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 			return
 		}
 		fail(w, http.StatusUnprocessableEntity, "invalid hostname: "+err.Error())
+		return
+	}
+	if !s.domainRate(w, r, p, "add", s.cfg.DomainAddCap) {
 		return
 	}
 	ctx := r.Context()

@@ -54,6 +54,12 @@ type Config struct {
 	// binaries. Never set it in production.
 	OwnedAddresses    []string
 	TestAllowLoopback bool
+	// Domain rate caps (B2 item 8): per user AND per IP, 15-minute window,
+	// GP_DOMAIN_ADD_CAP / GP_DOMAIN_VERIFY_CAP / GP_ORIGIN_TEST_CAP.
+	// Zeros fall back to design defaults (20/20/10).
+	DomainAddCap  int
+	VerifyCap     int
+	OriginTestCap int
 }
 
 type Principal struct {
@@ -88,6 +94,15 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.DomainMaxPending <= 0 {
 		s.cfg.DomainMaxPending = 5 // B2 default: 5 pending claims per user
+	}
+	if s.cfg.DomainAddCap <= 0 {
+		s.cfg.DomainAddCap = 20 // B2 default: 20 adds / user+IP / 15 min
+	}
+	if s.cfg.VerifyCap <= 0 {
+		s.cfg.VerifyCap = 20 // B2 default: 20 verify attempts / user+IP / 15 min
+	}
+	if s.cfg.OriginTestCap <= 0 {
+		s.cfg.OriginTestCap = 10 // B2 default: 10 connection tests / user+IP / 15 min
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {
