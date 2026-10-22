@@ -48,6 +48,12 @@ type Config struct {
 	ServiceHostnames []string // comma-split env list; e.g. api.gatepost.net
 	// DNS resolvers (B2 item 4): GP_DNS_RESOLVERS, default 1.1.1.1:53, 8.8.8.8:53.
 	DNSResolvers []string
+	// Origins (B2 item 5): our own edge/API addresses nobody may target
+	// (GP_OWNED_ADDRESSES; IPs or hostnames), and the TEST-ONLY loopback hook
+	// (GP_TEST_ALLOW_LOOPBACK): waives 127/8+::1 checks for test/demo
+	// binaries. Never set it in production.
+	OwnedAddresses    []string
+	TestAllowLoopback bool
 }
 
 type Principal struct {
@@ -62,9 +68,10 @@ type Server struct {
 	mux              *http.ServeMux
 	secureCookie     bool
 	providers        map[string]oauthProvider
-	dummy            string              // argon2id hash verified against when the user is unknown, for uniform timing
-	serviceHostnames map[string]struct{} // B2 item 2: hostnames nobody may claim
-	dnsResolvers     []domains.Resolver  // B2 items 4/5/6: TXT/NS/IP lookups, injectable in tests
+	dummy            string                  // argon2id hash verified against when the user is unknown, for uniform timing
+	serviceHostnames map[string]struct{}     // B2 item 2: hostnames nobody may claim
+	dnsResolvers     []domains.Resolver      // B2 items 4/5/6: TXT/NS/IP lookups, injectable in tests
+	owned            *domains.OwnedAddresses // B2 item 5: our edge/API addresses to refuse as origins
 }
 
 func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
@@ -87,6 +94,7 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 		s.serviceHostnames[strings.ToLower(h)] = struct{}{}
 	}
 	s.dnsResolvers = buildResolvers(cfg.DNSResolvers)
+	s.owned = domains.ParseOwned(cfg.OwnedAddresses)
 	s.dummy, _ = password.Hash("gatepost-dummy-credentials")
 	s.providers = defaultProviders(cfg)
 	s.routes()
@@ -138,6 +146,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/domains/{id}", s.requireAuth(s.deleteDomain))
 	s.mux.HandleFunc("GET /v1/domains/{id}/verification", s.requireAuth(s.domainVerification))
 	s.mux.HandleFunc("POST /v1/domains/{id}/verify", s.requireAuth(s.verifyDomain))
+	s.mux.HandleFunc("POST /v1/domains/{id}/origin", s.requireAuth(s.addOrigin))
+	s.mux.HandleFunc("GET /v1/domains/{id}/origin", s.requireAuth(s.getOrigin))
+	s.mux.HandleFunc("PUT /v1/domains/{id}/origin", s.requireAuth(s.putOrigin))
 }
 
 // --- http helpers -----------------------------------------------------------

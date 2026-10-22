@@ -81,6 +81,10 @@ func main() {
 	if envfile.Production() && !strings.HasPrefix(base, "https://") {
 		log.Fatalf("GP_PUBLIC_BASE_URL must be https in production, got %q", base)
 	}
+	// The loopback hook exists for tests and local demos only.
+	if envfile.Production() && os.Getenv("GP_TEST_ALLOW_LOOPBACK") == "true" {
+		log.Fatalf("GP_TEST_ALLOW_LOOPBACK is a test-only hook; it must not be set in production")
+	}
 	srv := server.New(server.Config{
 		Addr:               firstNonEmpty(os.Getenv("GP_HTTP_ADDR"), ":8080"),
 		BaseURL:            base,
@@ -95,6 +99,8 @@ func main() {
 		DomainMaxPending:   atoiEnv("GP_DOMAIN_PENDING"),
 		ServiceHostnames:   splitCommas(os.Getenv("GP_SERVICE_HOSTNAMES")),
 		DNSResolvers:       splitCommas(os.Getenv("GP_DNS_RESOLVERS")),
+		OwnedAddresses:     splitCommas(os.Getenv("GP_OWNED_ADDRESSES")),
+		TestAllowLoopback:  boolEnv("GP_TEST_ALLOW_LOOPBACK"),
 		TrustedProxes:      splitCommas(os.Getenv("GP_TRUSTED_PROXIES")),
 	}, pool, sender)
 
@@ -148,6 +154,22 @@ func splitCommas(s string) []string {
 
 // atoiEnv returns 0 when the key is unset; the server falls back to its
 // design defaults for 0. Garbage values fail loudly at boot.
+// boolEnv parses a boolean env value; anything but true/false is fatal.
+func boolEnv(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	switch strings.ToLower(v) {
+	case "":
+		return false
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
+	default:
+		log.Fatalf("%q: set %s=true or %s=false", v, key, key)
+		return false
+	}
+}
+
 func atoiEnv(key string) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {

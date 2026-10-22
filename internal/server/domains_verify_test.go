@@ -14,10 +14,12 @@ import (
 )
 
 // fakeDNS is the injectable resolver: TXT records keyed by record name,
-// NS answers via the ns() map, optional failure modes for the 502/400 paths.
+// NS answers via the ns() map, IP answers via ips, optional failure modes
+// for the 502/400 paths.
 type fakeDNS struct {
-	txt    map[string]string // record name → TXT value
-	ns     map[string][]string
+	txt    map[string]string   // record name → TXT value
+	ns     map[string][]string // zone → NS names
+	ips    map[string][]net.IP // hostname → A/AAAA answers
 	txtErr error
 	nsErr  error
 }
@@ -40,7 +42,7 @@ func (f *fakeDNS) LookupNS(ctx context.Context, name string) ([]string, error) {
 }
 
 func (f *fakeDNS) LookupIP(ctx context.Context, name string) ([]net.IP, error) {
-	return nil, nil // origin flows (items 5/6) use their own fake
+	return append([]net.IP{}, f.ips[name]...), nil
 }
 
 // setResolvers swaps the injectable DNS backend wholesale.
