@@ -74,6 +74,10 @@ type Config struct {
 	// Nodes (B3a item 1): GP_OPERATOR_EMAILS — verified users allowed to
 	// create/list/revoke nodes. Unset means nobody is an operator.
 	OperatorEmails []string
+	// Snapshot (B3a item 2): GP_SNAPSHOT_KEY signs the config snapshot for
+	// node polls (HMAC-SHA256). A development default covers tests/demos;
+	// production refuses to boot without it.
+	SnapshotKey string
 }
 
 type Principal struct {
@@ -121,6 +125,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.MaxRecords <= 0 {
 		s.cfg.MaxRecords = 100 // B2 default: 100 records per zone
+	}
+	if s.cfg.SnapshotKey == "" {
+		s.cfg.SnapshotKey = "gatepost-development-snapshot-key" // B3a test/dev default
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {

@@ -22,10 +22,12 @@ const MaxBytes = 256 << 10
 
 // Content is what versioning hashes: the snapshot's meaning, WITHOUT the
 // volatile bookkeeping (generation, built_at) — an identical rebuild hashes
-// to the same content. Domains joins in B3a item 2 with the builder.
+// to the same content.
 type Content struct {
 	SchemaVersion    int      `json:"schema_version"`
+	Domains          []Domain `json:"domains"`
 	AllowedHostnames []string `json:"allowed_hostnames"`
+	Defaults         Defaults `json:"defaults"`
 }
 
 // Document is the full snapshot a node applies; its canonical JSON is what
@@ -34,12 +36,45 @@ type Document struct {
 	SchemaVersion    int       `json:"schema_version"`
 	Generation       int64     `json:"generation"`
 	BuiltAt          time.Time `json:"built_at"`
+	Domains          []Domain  `json:"domains"`
 	AllowedHostnames []string  `json:"allowed_hostnames"`
+	Defaults         Defaults  `json:"defaults"`
 }
 
 // ToContent strips the volatile fingerprint inputs.
 func (d Document) ToContent() Content {
-	return Content{SchemaVersion: d.SchemaVersion, AllowedHostnames: d.AllowedHostnames}
+	return Content{
+		SchemaVersion:    d.SchemaVersion,
+		Domains:          d.Domains,
+		AllowedHostnames: d.AllowedHostnames,
+		Defaults:         d.Defaults,
+	}
+}
+
+// SchemaVersion — bump when the snapshot shape changes meaningfully;
+// consumers pin to one.
+const SchemaVersion = 1
+
+// Defaults carries the fixed site posture of this version.
+type Defaults struct {
+	FirewallMode string `json:"firewall_mode"` // log_only at B3a
+	Cache        bool   `json:"cache"`
+}
+
+// Origin is one origin exactly as configured (address is the canonical form).
+type Origin struct {
+	Scheme     string  `json:"scheme"`
+	Address    string  `json:"address"`
+	Port       int     `json:"port"`
+	HostHeader *string `json:"host_header"`
+	TLSVerify  bool    `json:"tls_verify"`
+}
+
+// Domain is one verified-and-served customer hostname.
+type Domain struct {
+	Hostname  string `json:"hostname"`
+	SetupType string `json:"setup_type"`
+	Origin    Origin `json:"origin"`
 }
 
 var (

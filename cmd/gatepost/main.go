@@ -85,6 +85,9 @@ func main() {
 	if envfile.Production() && os.Getenv("GP_TEST_ALLOW_LOOPBACK") == "true" {
 		log.Fatalf("GP_TEST_ALLOW_LOOPBACK is a test-only hook; it must not be set in production")
 	}
+	if envfile.Production() && os.Getenv("GP_SNAPSHOT_KEY") == "" {
+		log.Fatalf("GP_SNAPSHOT_KEY must be set in production (snapshot signing key)")
+	}
 	srv := server.New(server.Config{
 		Addr:                firstNonEmpty(os.Getenv("GP_HTTP_ADDR"), ":8080"),
 		BaseURL:             base,
