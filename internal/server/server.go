@@ -71,6 +71,9 @@ type Config struct {
 	// Records cap (B2 item 12): GP_MAX_RECORDS per zone. Zero falls back
 	// to the design default (100).
 	MaxRecords int
+	// Nodes (B3a item 1): GP_OPERATOR_EMAILS — verified users allowed to
+	// create/list/revoke nodes. Unset means nobody is an operator.
+	OperatorEmails []string
 }
 
 type Principal struct {
@@ -89,6 +92,7 @@ type Server struct {
 	serviceHostnames map[string]struct{}     // B2 item 2: hostnames nobody may claim
 	dnsResolvers     []domains.Resolver      // B2 items 4/5/6: TXT/NS/IP lookups, injectable in tests
 	owned            *domains.OwnedAddresses // B2 item 5: our edge/API addresses to refuse as origins
+	operators        map[string]struct{}     // B3a: operator emails, normalised
 }
 
 func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
@@ -124,6 +128,12 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	s.dnsResolvers = buildResolvers(cfg.DNSResolvers)
 	s.owned = domains.ParseOwned(cfg.OwnedAddresses)
+	s.operators = map[string]struct{}{}
+	for _, e := range cfg.OperatorEmails {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			s.operators[e] = struct{}{}
+		}
+	}
 	s.dummy, _ = password.Hash("gatepost-dummy-credentials")
 	s.providers = defaultProviders(cfg)
 	s.routes()
@@ -184,6 +194,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/domains/{id}/records/{rid}", s.requireAuth(s.getRecord))
 	s.mux.HandleFunc("PATCH /v1/domains/{id}/records/{rid}", s.requireAuth(s.patchRecord))
 	s.mux.HandleFunc("DELETE /v1/domains/{id}/records/{rid}", s.requireAuth(s.deleteRecord))
+	// B3a item 1: operator-only node management (node itself calls /node/*).
+	s.mux.HandleFunc("POST /v1/nodes", s.requireOperator(s.createNode))
+	s.mux.HandleFunc("GET /v1/nodes", s.requireOperator(s.listNodes))
+	s.mux.HandleFunc("POST /v1/nodes/{id}/revoke", s.requireOperator(s.revokeNode))
 }
 
 // --- http helpers -----------------------------------------------------------

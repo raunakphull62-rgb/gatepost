@@ -149,6 +149,14 @@ POST /auth/api-keys/{id}/revoke                          (session)
 GET  /api/me                                             (session or API key)
 GET  /api/user-data                                      (session or API key)
 PUT  /api/user-data                        {json doc}    (session or API key, ≤32 KiB, must parse as JSON)
+
+Node management (v1, operator-only; operator = verified user on `GP_OPERATOR_EMAILS`; node tokens are 256 random bits, echoed once, only a SHA-256 stored, revocable):
+
+```
+POST /v1/nodes                         {name, role}    (operator; role edge|dns; reply carries the node token exactly once)
+GET  /v1/nodes                                         (operator; roster, no token material)
+POST /v1/nodes/{id}/revoke                             (operator; idempotent; a revoked token dies on its next request)
+```
 ```
 
 ## 12. Configuration (env / untracked `.env`)

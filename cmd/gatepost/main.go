@@ -108,6 +108,7 @@ func main() {
 		ServiceHostnames:    splitCommas(os.Getenv("GP_SERVICE_HOSTNAMES")),
 		DNSResolvers:        splitCommas(os.Getenv("GP_DNS_RESOLVERS")),
 		OwnedAddresses:      splitCommas(os.Getenv("GP_OWNED_ADDRESSES")),
+		OperatorEmails:      splitCommas(os.Getenv("GP_OPERATOR_EMAILS")),
 		TestAllowLoopback:   boolEnv("GP_TEST_ALLOW_LOOPBACK"),
 		TrustedProxes:       splitCommas(os.Getenv("GP_TRUSTED_PROXIES")),
 	}, pool, sender)
