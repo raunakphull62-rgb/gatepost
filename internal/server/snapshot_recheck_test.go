@@ -135,3 +135,111 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 		t.Fatalf("kept entries must never raise alerts, got %d", n)
 	}
 }
+
+// TestBuildUnsafeAlertAutoResolves — the origin_unsafe alert is not a scar
+// forever: the first build that re-checks the origin as safe clears it, and
+// a later violation raises a fresh open row.
+func TestBuildUnsafeAlertAutoResolves(t *testing.T) {
+	pool, a, f, s := snapshotSetup(t)
+	f.ips["flap.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
+	row := verifiedClaim(t, pool, a, f, "flap.example.com")
+	if code, body := originCall(t, a, row.ID, map[string]any{"address": "flap.example.com", "port": 80}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	ctx := context.Background()
+	flip := func(ip string) {
+		f.ips["flap.example.com"] = []net.IP{net.ParseIP(ip)}
+	}
+	open := func() int {
+		return countRows(t, pool, "operator_alerts", "kind = 'origin_unsafe' AND resolved_at IS NULL")
+	}
+
+	flip("169.254.169.254")
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 1 {
+		t.Fatalf("the violation must raise one open alert, got %d", open())
+	}
+
+	flip("93.184.216.34") // safe again by resolution → resolved_at stamps
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 0 {
+		t.Fatalf("recovering builds must auto-resolve the alert, %d still open", open())
+	}
+
+	flip("169.254.169.254") // a new violation: a new open alert
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 1 {
+		t.Fatalf("a fresh violation must raise a fresh alert, got %d", open())
+	}
+}
+
+// TestBuildUnresolvedStreakAlerts — unresolvable never drops the entry; at
+// GP_ORIGIN_UNRESOLVED_BUILDS (here the untouched default: 12) consecutive
+// unresolved builds a second alert kind is raised, resolved by recovery, and
+// a fresh outage counts fresh.
+func TestBuildUnresolvedStreakAlerts(t *testing.T) {
+	pool, a, f, s := snapshotSetup(t)
+	f.ips["kx.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
+	row := verifiedClaim(t, pool, a, f, "kx.example.com")
+	if code, body := originCall(t, a, row.ID, map[string]any{"address": "kx.example.com", "port": 80}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+	ctx := context.Background()
+	fail := func() {
+		setResolvers(s, &nameFailDNS{fakeDNS: f, failIP: map[string]error{
+			"kx.example.com": errors.New("read udp: i/o timeout"),
+		}})
+	}
+	recover := func() { setResolvers(s, f) }
+	open := func() int {
+		return countRows(t, pool, "operator_alerts", "kind = 'origin_unresolved' AND resolved_at IS NULL")
+	}
+
+	fail()
+	for i := 1; i < 12; i++ {
+		doc, _, err := s.buildSnapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(doc.Domains) != 1 {
+			t.Fatalf("build %d: unresolved must never drop the entry: %+v", i, doc.Domains)
+		}
+		if open() != 0 {
+			t.Fatalf("build %d: below the threshold no alert may exist, got %d", i, open())
+		}
+	}
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 1 {
+		t.Fatalf("build 12 must raise the persistence alert, got %d", open())
+	}
+
+	recover() // resolved by the next good re-check
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 0 {
+		t.Fatalf("recovery must auto-resolve the persistence alert, %d open", open())
+	}
+
+	// a second outage is a fresh count: another 12 builds until the re-raise
+	fail()
+	for i := 1; i <= 12; i++ {
+		if _, _, err := s.buildSnapshot(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if open() != 1 {
+		t.Fatalf("a fresh outage must re-raise after 12 builds, got %d", open())
+	}
+	if n := countRows(t, pool, "operator_alerts", "kind = 'origin_unresolved'"); n != 2 {
+		t.Fatalf("the first alert stays as history (resolved), total rows want 2, got %d", n)
+	}
+}

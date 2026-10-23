@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -87,6 +88,7 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 			return snapshot.Document{}, snapshot.Envelope{}, err
 		}
 		verdict := s.originVerdict(ctx, address)
+		s.noteVerdict(ctx, id, hostname, verdict)
 		switch {
 		case verdict.unsafe: // definitely unsafe: it IS in a blocked range now
 			log.Printf("snapshot build: dropped %s (origin %s): %s", hostname, address, verdict.reason)
@@ -192,5 +194,46 @@ func (s *Server) recordAlert(ctx context.Context, kind, subject, detail string) 
 		VALUES ($1, $2, $3) ON CONFLICT (kind, subject) WHERE resolved_at IS NULL DO NOTHING`,
 		kind, subject, detail); err != nil {
 		log.Printf("snapshot build: alert %s/%s not recorded: %v", kind, subject, err)
+	}
+}
+
+// resolveAlert clears the open alert(s) for (kind, subject). Called when a
+// build finds the origin safe again; failure is logged, never fatal.
+func (s *Server) resolveAlert(ctx context.Context, kind, subject string) {
+	if _, err := s.pool.Exec(ctx, `UPDATE operator_alerts SET resolved_at = now()
+		WHERE kind = $1 AND subject = $2 AND resolved_at IS NULL`, kind, subject); err != nil {
+		log.Printf("snapshot build: alert %s/%s not resolved: %v", kind, subject, err)
+	}
+}
+
+// noteVerdict records the per-origin re-check bookkeeping: the streak of
+// consecutive builds that could not re-check the origin (state lives in the
+// database per lessons.md), the persistence alert past the threshold, and the
+// auto-resolve when a build finds the origin safe again.
+func (s *Server) noteVerdict(ctx context.Context, domainID, hostname string, v originVerdict) {
+	switch {
+	case v.unsafe: // a resolution IS a re-check result — the streak restarts
+		if _, err := s.pool.Exec(ctx, `INSERT INTO origin_unresolved (domain_id, streak)
+			VALUES ($1, 0) ON CONFLICT (domain_id)
+			DO UPDATE SET streak = 0, updated_at = now()`, domainID); err != nil {
+			log.Printf("snapshot build: streak state for %s not updated: %v", hostname, err)
+		}
+	case v.keep && v.reason != "": // unresolvable: kept, but not silently
+		var streak int
+		if err := s.pool.QueryRow(ctx, `INSERT INTO origin_unresolved (domain_id, streak)
+			VALUES ($1, 1) ON CONFLICT (domain_id)
+			DO UPDATE SET streak = origin_unresolved.streak + 1, updated_at = now()
+			RETURNING streak`, domainID).Scan(&streak); err != nil {
+			log.Printf("snapshot build: streak state for %s not updated: %v", hostname, err)
+		} else if streak >= s.cfg.OriginUnresolvedBuilds {
+			s.recordAlert(ctx, "origin_unresolved", hostname, fmt.Sprintf(
+				"%d consecutive builds could not re-check %s: %s (entry kept)", streak, hostname, v.reason))
+		}
+	default: // safe again by re-check: clear the marks and the domain's alerts
+		if _, err := s.pool.Exec(ctx, `DELETE FROM origin_unresolved WHERE domain_id = $1`, domainID); err != nil {
+			log.Printf("snapshot build: streak state for %s not cleared: %v", hostname, err)
+		}
+		s.resolveAlert(ctx, "origin_unsafe", hostname)
+		s.resolveAlert(ctx, "origin_unresolved", hostname)
 	}
 }

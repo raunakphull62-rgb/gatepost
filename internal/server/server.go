@@ -78,6 +78,10 @@ type Config struct {
 	// node polls (HMAC-SHA256). A development default covers tests/demos;
 	// production refuses to boot without it.
 	SnapshotKey string
+	// Re-check bookkeeping (B3a): consecutive builds an origin may sit
+	// unresolvable before the origin_unresolved alert is raised (the entry
+	// is still kept), GP_ORIGIN_UNRESOLVED_BUILDS. Zero falls back to 12.
+	OriginUnresolvedBuilds int
 }
 
 type Principal struct {
@@ -128,6 +132,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.SnapshotKey == "" {
 		s.cfg.SnapshotKey = "gatepost-development-snapshot-key" // B3a test/dev default
+	}
+	if s.cfg.OriginUnresolvedBuilds <= 0 {
+		s.cfg.OriginUnresolvedBuilds = 12 // B3a default: builds of unresolved tolerance
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {
