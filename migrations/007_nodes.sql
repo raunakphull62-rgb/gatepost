@@ -1,10 +1,7 @@
 -- 007: B3a item 1. Edge and DNS nodes authenticate with their own bearer
 -- token — random 256 bits, echoed once at create time, only the SHA-256
 -- stored here, revocable by flipping status. Nodes never touch the database
--- themselves; they poll the signed config snapshot, so snapshot_versions
--- houses the monotonic generation: one row per distinct content hash,
--- insertion order is the generation, and the version only moves when the
--- content actually changes.
+-- themselves; they poll the signed config snapshot.
 CREATE TABLE nodes (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 50),
@@ -16,8 +13,13 @@ CREATE TABLE nodes (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Snapshot generations: one row per OBSERVED content change. The recorder
+-- compares the new content hash with the LATEST row's hash only and inserts
+-- the next number when they differ — so content that returns to an earlier
+-- shape (A→B→A) still takes the next generation, and an identical rebuild
+-- keeps the current one. Never match an older row by hash.
 CREATE TABLE snapshot_versions (
   generation bigserial PRIMARY KEY,
-  content_hash text NOT NULL UNIQUE,
+  content_hash text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
