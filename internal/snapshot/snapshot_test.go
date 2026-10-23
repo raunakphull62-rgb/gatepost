@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -84,5 +85,77 @@ func TestCanonicalStableAndSorted(t *testing.T) {
 	a2, _ := Canonical(map[string]any{"z": 1, "a": map[string]any{"k": int64(42), "b": true}})
 	if string(a2) != string(a) {
 		t.Fatal("canonical is not stable across calls")
+	}
+}
+
+// TestTamperRefused — the artifact is authenticated byte-for-byte: one
+// flipped payload character breaks the HMAC (before the content is ever
+// read), one flipped signature character does too, and equal/older
+// generations are refused outright.
+func TestTamperRefused(t *testing.T) {
+	key := []byte("test-snapshot-key")
+	mk := func(gen int64, host string) Envelope {
+		e, err := Sign(key, Document{
+			SchemaVersion: 1, Generation: gen,
+			BuiltAt:          time.Unix(1_700_000_000+gen, 0).UTC(),
+			AllowedHostnames: []string{host},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	env := mk(3, "a.test")
+	if _, err := Verify(key, env, 2); err != nil {
+		t.Fatalf("untouched must verify after 2: %v", err)
+	}
+
+	// one byte flipped in the payload
+	mutated := Envelope{
+		Payload:   strings.Replace(env.Payload, `"generation":3`, `"generation":4`, 1),
+		Signature: env.Signature,
+	}
+	if mutated.Payload == env.Payload {
+		t.Fatal("tamper target not found in the canonical payload")
+	}
+	if _, err := Verify(key, mutated, 2); !errors.Is(err, ErrTampered) {
+		t.Fatalf("one-byte payload tamper must be ErrTampered, got %v", err)
+	}
+
+	// one nibble flipped in the signature
+	sig := []byte(env.Signature)
+	sig[0] = '0'
+	if sig[0] == env.Signature[0] {
+		sig[0] = '1'
+	}
+	if _, err := Verify(key, Envelope{Payload: env.Payload, Signature: string(sig)}, 2); !errors.Is(err, ErrTampered) {
+		t.Fatalf("signature tamper must be ErrTampered, got %v", err)
+	}
+
+	// equal AND lower generations refused, not just strictly-lower ones
+	if _, err := Verify(key, mk(3, "a.test"), 3); !errors.Is(err, ErrBackwards) {
+		t.Fatalf("re-applying the same generation must be ErrBackwards, got %v", err)
+	}
+	if _, err := Verify(key, mk(2, "b.test"), 3); !errors.Is(err, ErrBackwards) {
+		t.Fatalf("older generation after newer must be ErrBackwards, got %v", err)
+	}
+}
+
+// TestSizeLimitBothSides — the cap refuses before anything parses: Sign
+// refuses to produce an oversized artifact, and Verify refuses an oversized
+// envelope before it even touches the payload's bytes.
+func TestSizeLimitBothSides(t *testing.T) {
+	key := []byte("test-snapshot-key")
+	big := Document{
+		SchemaVersion: 1, Generation: 1,
+		BuiltAt:          time.Unix(1_700_000_003, 0).UTC(),
+		AllowedHostnames: []string{strings.Repeat("a", MaxBytes)},
+	}
+	if _, err := Sign(key, big); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized Sign must be ErrTooLarge, got %v", err)
+	}
+	over := Envelope{Payload: strings.Repeat(" ", MaxBytes+1), Signature: "00"}
+	if _, err := Verify(key, over, 0); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized Verify must be ErrTooLarge before any parsing, got %v", err)
 	}
 }
