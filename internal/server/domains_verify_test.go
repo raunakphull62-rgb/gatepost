@@ -24,6 +24,7 @@ type fakeDNS struct {
 	ips    map[string][]net.IP // hostname → A/AAAA answers
 	txtErr error
 	nsErr  error
+	ipErr  error // wholesale LookupIP failure (timeout/SERVFAIL class)
 }
 
 func (f *fakeDNS) LookupTXT(ctx context.Context, name string) ([]string, error) {
@@ -47,6 +48,9 @@ func (f *fakeDNS) LookupNS(ctx context.Context, name string) ([]string, error) {
 }
 
 func (f *fakeDNS) LookupIP(ctx context.Context, name string) ([]net.IP, error) {
+	if f.ipErr != nil {
+		return nil, f.ipErr
+	}
 	return append([]net.IP{}, f.ips[name]...), nil
 }
 

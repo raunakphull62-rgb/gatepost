@@ -86,9 +86,15 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 		if err := rows.Scan(&id, &hostname, &setupType, &scheme, &address, &port, &hh, &tlsVerify); err != nil {
 			return snapshot.Document{}, snapshot.Envelope{}, err
 		}
-		if reason := s.originNowUnsafe(ctx, address); reason != "" {
-			log.Printf("snapshot build: dropped %s (origin %s): %s", hostname, address, reason)
+		verdict := s.originVerdict(ctx, address)
+		switch {
+		case verdict.unsafe: // definitely unsafe: it IS in a blocked range now
+			log.Printf("snapshot build: dropped %s (origin %s): %s", hostname, address, verdict.reason)
+			s.recordAlert(ctx, "origin_unsafe", hostname, verdict.reason)
 			continue
+		case verdict.keep && verdict.reason != "": // unresolvable: not a verdict
+			log.Printf("snapshot build: WARNING %s (origin %s): %s — keeping the current entry, retrying next build",
+				hostname, address, verdict.reason)
 		}
 		domainsOut = append(domainsOut, snapshot.Domain{
 			Hostname:  hostname,
@@ -136,30 +142,55 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 	return doc, env, nil
 }
 
-// originNowUnsafe re-applies the SSRF rules at build time. Origins may be
-// hostnames that MOVED: resolution runs again and every answered IP must be
-// outside the deny ranges. Non-empty string = the reason it must be dropped.
-func (s *Server) originNowUnsafe(ctx context.Context, address string) string {
+// originVerdict is the build-time read on one stored origin: keep it, it is
+// DEFINITELY unsafe (resolved into a blocked address), or it could not be
+// re-checked right now (timeout, SERVFAIL, NXDOMAIN after previously ok) —
+// then the snapshot keeps the entry from the latest good state and the next
+// build retries.
+type originVerdict struct {
+	unsafe bool   // drop + log + operator alert
+	keep   bool   // unresolved → keep the current entry, warn, retry later
+	reason string // the message for the log/alert either way
+}
+
+// originVerdict re-applies the SSRF rules at build time. A hostname origin
+// may have MOVED: resolution runs again and every answered IP must be outside
+// the deny ranges. An unresolvable name is NOT a verdict — origins passed
+// validation when stored, so the absence of answers today is treated as an
+// outage, never as permission to silently unregister a customer.
+func (s *Server) originVerdict(ctx context.Context, address string) originVerdict {
 	o, err := domains.ValidateOrigin(address, s.owned, s.cfg.TestAllowLoopback)
 	if err != nil {
-		return err.Error() // range/syntax: refused just like at create time
+		return originVerdict{unsafe: true, reason: err.Error()} // range/syntax: refused at create too
 	}
 	if o.IP != nil {
-		return ""
+		return originVerdict{keep: true}
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	ips, lerr := lookupIP(cctx, s.dnsResolvers, o.Canonical)
 	if lerr != nil {
-		return "cannot resolve " + o.Canonical
+		return originVerdict{keep: true, reason: "cannot resolve " + o.Canonical + ": " + lerr.Error()}
 	}
 	if len(ips) == 0 {
-		return "no A/AAAA record for " + o.Canonical
+		return originVerdict{keep: true, reason: "no A/AAAA record (NXDOMAIN?) for " + o.Canonical}
 	}
 	for _, ip := range ips {
 		if verr := domains.CheckIP(ip, s.owned, s.cfg.TestAllowLoopback); verr != nil {
-			return verr.Error()
+			return originVerdict{unsafe: true, reason: verr.Error()}
 		}
 	}
-	return ""
+	return originVerdict{keep: true}
+}
+
+// recordAlert raises one open operator alert; an already-open alert for the
+// same (kind, subject) stays alone (dedupe in the database per lessons.md —
+// multiple instances would otherwise each fire). Failure to alert is logged,
+// never fatal: the snapshot must build.
+func (s *Server) recordAlert(ctx context.Context, kind, subject, detail string) {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO operator_alerts (kind, subject, detail)
+		VALUES ($1, $2, $3) ON CONFLICT (kind, subject) WHERE resolved_at IS NULL DO NOTHING`,
+		kind, subject, detail); err != nil {
+		log.Printf("snapshot build: alert %s/%s not recorded: %v", kind, subject, err)
+	}
 }
