@@ -272,3 +272,66 @@ func TestNodePollRateCap(t *testing.T) {
 		t.Fatalf("r2 must have its own bucket: want 200, got %d", code)
 	}
 }
+
+// TestSnapshotCacheOneBuild — 100 polls cost exactly ONE build (the fake
+// resolver counts IP resolutions); a write invalidates so the next poll
+// rebuilds with the new content; the TTL expiry path rebuilds too. Every
+// 304-bearing poll still maps to at most one build per miss window.
+func TestSnapshotCacheOneBuild(t *testing.T) {
+	pool, a, f, s, tok := nodeSetup(t)
+	n := asNode(t, a, tok)
+
+	// one hostname origin (a build resolves it: exactly 1 lookup per build)
+	f.ips["cache.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
+	row := verifiedClaim(t, pool, a, f, "cache.example.com")
+	if code, body := originCall(t, a, row.ID, map[string]any{"address": "cache.example.com", "port": 80}); code != http.StatusCreated {
+		t.Fatalf("origin create: %d %s", code, body)
+	}
+
+	f.ipCalls.Store(0) // setup traffic (claim verification, origin create) out of the count
+
+	// first poll: a miss → one build, generation 1
+	code, body, etag := pollConfig(t, n, "GET", "/node/v1/config", tok, "", "")
+	if code != http.StatusOK || strings.Trim(etag, `"`) != "1" {
+		t.Fatalf("first poll: want 200 gen 1, got %d %s (etag %q)", code, body, etag)
+	}
+
+	// 99 more rapid polls, If-None-Match along: all served from the cache
+	for i := 0; i < 99; i++ {
+		code, body, _ := pollConfig(t, n, "GET", "/node/v1/config", tok, "", etag)
+		if code != http.StatusNotModified {
+			t.Fatalf("cache must serve poll %d of the window: want 304, got %d %s", i+2, code, body)
+		}
+	}
+	if got := f.ipCalls.Load(); got != 1 {
+		t.Fatalf("100 polls in a row must cost exactly 1 build (1 lookup), got %d", got)
+	}
+
+	// a write invalidates: the very next poll rebuilds with new content.
+	// The counter then reads 3 — the loop's build (1) + the PUT's own
+	// origin validation (1) + the changed-content rebuild (1).
+	if code, body := a.do("PUT", "/v1/domains/"+row.ID+"/origin",
+		`{"scheme":"https","address":"cache.example.com","port":443}`); code != http.StatusOK {
+		t.Fatalf("origin update: %d %s", code, body)
+	}
+	code, body, etag2 := pollConfig(t, n, "GET", "/node/v1/config", tok, "", "")
+	if code != http.StatusOK || strings.Trim(etag2, `"`) != "2" {
+		t.Fatalf("after a write the next poll must rebuild to gen 2, got %d %s (etag %q)", code, body, etag2)
+	}
+	if got := f.ipCalls.Load(); got != 3 {
+		t.Fatalf("one post-write rebuild expected (3 = 1 + PUT check + rebuild), got %d", got)
+	}
+
+	// and the TTL expiry path rebuilds even for identical content: wind the
+	// cache timestamp back and watch one more build — generation stays 2
+	s.snapMu.Lock()
+	s.snapCache.built = s.snapCache.built.Add(-time.Hour)
+	s.snapMu.Unlock()
+	code, _, etag3 := pollConfig(t, n, "GET", "/node/v1/config", tok, "", etag2)
+	if code != http.StatusNotModified || strings.Trim(etag3, `"`) != "2" {
+		t.Fatalf("expired cache: one rebuild but unchanged content keeps the ETag, got %d (etag %q)", code, etag3)
+	}
+	if got := f.ipCalls.Load(); got != 4 {
+		t.Fatalf("the expiry rebuild is one more lookup, got %d", got)
+	}
+}

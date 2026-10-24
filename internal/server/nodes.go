@@ -172,12 +172,12 @@ func (s *Server) nodeAuth(next func(http.ResponseWriter, *http.Request, nodeRow)
 // payload). If-None-Match matching that generation short-circuits to an
 // empty 304 so a node can ask for free until content actually changes.
 func (s *Server) nodeConfig(w http.ResponseWriter, r *http.Request, n nodeRow) {
-	doc, env, err := s.buildSnapshot(r.Context())
+	env, gen, err := s.currentSnapshot(r.Context())
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	etag := `"` + strconv.FormatInt(doc.Generation, 10) + `"`
+	etag := `"` + strconv.FormatInt(gen, 10) + `"`
 	if etagMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusNotModified)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,13 +19,14 @@ import (
 // NS answers via the ns() map, IP answers via ips, optional failure modes
 // for the 502/400 paths.
 type fakeDNS struct {
-	txt    map[string]string   // record name → TXT value
-	multi  map[string][]string // record name → several TXT values (head-to-head races)
-	ns     map[string][]string // zone → NS names
-	ips    map[string][]net.IP // hostname → A/AAAA answers
-	txtErr error
-	nsErr  error
-	ipErr  error // wholesale LookupIP failure (timeout/SERVFAIL class)
+	txt     map[string]string   // record name → TXT value
+	multi   map[string][]string // record name → several TXT values (head-to-head races)
+	ns      map[string][]string // zone → NS names
+	ips     map[string][]net.IP // hostname → A/AAAA answers
+	txtErr  error
+	nsErr   error
+	ipErr   error        // wholesale LookupIP failure (timeout/SERVFAIL class)
+	ipCalls atomic.Int32 // build-cost probe: every IP resolution counts
 }
 
 func (f *fakeDNS) LookupTXT(ctx context.Context, name string) ([]string, error) {
@@ -48,6 +50,7 @@ func (f *fakeDNS) LookupNS(ctx context.Context, name string) ([]string, error) {
 }
 
 func (f *fakeDNS) LookupIP(ctx context.Context, name string) ([]net.IP, error) {
+	f.ipCalls.Add(1)
 	if f.ipErr != nil {
 		return nil, f.ipErr
 	}

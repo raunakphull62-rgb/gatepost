@@ -226,6 +226,9 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 // keeps the one-per-domain zone row of nameserver claims ensured (the
 // UNIQUE makes retries a no-op).
 func (s *Server) writeDomain(w http.ResponseWriter, r *http.Request, code int, d domainRow, existing bool) {
+	// any claim write (verified-rotate, fresh insert, re-claim) may change
+	// the artifact's content later — drop the cache now
+	s.invalidateSnapshot()
 	if d.SetupType == "nameserver" {
 		if _, err := s.pool.Exec(r.Context(), `INSERT INTO zones (domain_id)
 			VALUES ($1) ON CONFLICT (domain_id) DO NOTHING`, d.ID); err != nil {
@@ -276,6 +279,7 @@ func (s *Server) deleteDomain(w http.ResponseWriter, r *http.Request, p *Princip
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	s.invalidateSnapshot() // the entry disappears from the next artifact
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

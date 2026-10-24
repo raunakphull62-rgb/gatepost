@@ -173,6 +173,7 @@ func (s *Server) addOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	s.invalidateSnapshot() // a new origin joins the next artifact
 	writeJSON(w, http.StatusCreated, map[string]any{"origin": o})
 }
 
@@ -223,6 +224,7 @@ func (s *Server) putOrigin(w http.ResponseWriter, r *http.Request, p *Principal)
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	s.invalidateSnapshot() // the artifact carries the origin as configured
 	writeJSON(w, http.StatusOK, map[string]any{"origin": o})
 }
 

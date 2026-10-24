@@ -185,6 +185,49 @@ func (s *Server) originVerdict(ctx context.Context, address string) originVerdic
 	return originVerdict{keep: true}
 }
 
+// --- the poll cache (B3a addition) -------------------------------------------
+
+// snapCache — THE artifact polls are served between writes and TTL expiry.
+type snapCache struct {
+	env   snapshot.Envelope
+	gen   int64
+	built time.Time
+}
+
+// currentSnapshot — what GET /node/v1/config serves. A cache miss or a
+// stale artifact (older than SnapshotTTLSeconds, default 30) triggers one
+// build; writes invalidate regardless (see invalidateSnapshot), so 100
+// polls in a row cost exactly one build. Concurrent misses may both build;
+// same content always records the same generation (head-hash rule), the
+// last cache write wins.
+func (s *Server) currentSnapshot(ctx context.Context) (snapshot.Envelope, int64, error) {
+	s.snapMu.Lock()
+	if c := s.snapCache; c != nil &&
+		time.Since(c.built) < time.Duration(s.cfg.SnapshotTTLSeconds)*time.Second {
+		env, gen := c.env, c.gen
+		s.snapMu.Unlock()
+		return env, gen, nil
+	}
+	s.snapMu.Unlock() // build outside the lock; a second racer repeats the work, not the damage
+
+	doc, env, err := s.buildSnapshot(ctx)
+	if err != nil {
+		return snapshot.Envelope{}, 0, err
+	}
+	s.snapMu.Lock()
+	s.snapCache = &snapCache{env: env, gen: doc.Generation, built: time.Now()}
+	s.snapMu.Unlock()
+	return env, doc.Generation, nil
+}
+
+// invalidateSnapshot — drop the cached artifact; the next poll rebuilds.
+// Called after every domain/origin/verification write.
+func (s *Server) invalidateSnapshot() {
+	s.snapMu.Lock()
+	s.snapCache = nil
+	s.snapMu.Unlock()
+}
+
 // recordAlert raises one open operator alert; an already-open alert for the
 // same (kind, subject) stays alone (dedupe in the database per lessons.md —
 // multiple instances would otherwise each fire). Failure to alert is logged,

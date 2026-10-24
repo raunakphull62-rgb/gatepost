@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -85,6 +86,10 @@ type Config struct {
 	// Node poll cap (B3a item 4): config GETs + heartbeats per node per
 	// 15-minute window, GP_NODE_RATE_CAP. Zero falls back to 500.
 	NodePollCap int
+	// Snapshot cache TTL (B3a): seconds a cached artifact may age before the
+	// next poll rebuilds, GP_SNAPSHOT_TTL. Writes invalidate it regardless.
+	// Zero falls back to 30.
+	SnapshotTTLSeconds int
 }
 
 type Principal struct {
@@ -104,6 +109,10 @@ type Server struct {
 	dnsResolvers     []domains.Resolver      // B2 items 4/5/6: TXT/NS/IP lookups, injectable in tests
 	owned            *domains.OwnedAddresses // B2 item 5: our edge/API addresses to refuse as origins
 	operators        map[string]struct{}     // B3a: operator emails, normalised
+	// B3a: polls serve this in-memory artifact; writes invalidate it and
+	// the age window rebuilds (SnapshotTTLSeconds). See currentSnapshot.
+	snapMu    sync.Mutex
+	snapCache *snapCache
 }
 
 func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
@@ -141,6 +150,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.NodePollCap <= 0 {
 		s.cfg.NodePollCap = 500 // B3a default: ~33 config polls+beats / minute / node
+	}
+	if s.cfg.SnapshotTTLSeconds <= 0 {
+		s.cfg.SnapshotTTLSeconds = 30 // B3a default: rebuild a stale artifact at most twice a minute
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {

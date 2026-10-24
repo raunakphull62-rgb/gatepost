@@ -162,6 +162,7 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request, p *Princip
 		fail(w, http.StatusConflict, reason)
 		return
 	}
+	s.invalidateSnapshot() // a verification flips the domain's snapshot relevancy
 	writeJSON(w, http.StatusOK, map[string]any{"status": "verified"})
 }
 

@@ -117,6 +117,7 @@ func main() {
 		SnapshotKey:            os.Getenv("GP_SNAPSHOT_KEY"),
 		OriginUnresolvedBuilds: atoiEnv("GP_ORIGIN_UNRESOLVED_BUILDS"),
 		NodePollCap:            atoiEnv("GP_NODE_RATE_CAP"),
+		SnapshotTTLSeconds:     atoiEnv("GP_SNAPSHOT_TTL"),
 	}, pool, sender)
 
 	// Domain claim expiry runs hourly (live-window: no fixed sleeps).
