@@ -179,11 +179,12 @@ func TestBuildUnsafeAlertAutoResolves(t *testing.T) {
 	}
 }
 
-// TestBuildUnresolvedStreakAlerts — unresolvable never drops the entry; at
-// GP_ORIGIN_UNRESOLVED_BUILDS (here the untouched default: 12) consecutive
-// unresolved builds a second alert kind is raised, resolved by recovery, and
-// a fresh outage counts fresh.
-func TestBuildUnresolvedStreakAlerts(t *testing.T) {
+// TestBuildUnresolvedTimeAlerts — unresolvable never drops the entry; the
+// persistence alert keys on WALL-CLOCK (GP_ORIGIN_UNRESOLVED_MINUTES,
+// here the untouched default: 60 minutes): any number of builds before the
+// hour stay silent, the first build after the.timestamp passes the threshold
+// raises (backdated via SQL, no sleeps), recovery resolves and clears.
+func TestBuildUnresolvedTimeAlerts(t *testing.T) {
 	pool, a, f, s := snapshotSetup(t)
 	f.ips["kx.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
 	row := verifiedClaim(t, pool, a, f, "kx.example.com")
@@ -202,7 +203,7 @@ func TestBuildUnresolvedStreakAlerts(t *testing.T) {
 	}
 
 	fail()
-	for i := 1; i < 12; i++ {
+	for i := 0; i < 5; i++ { // ANY number of builds inside the hour stays silent
 		doc, _, err := s.buildSnapshot(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -210,36 +211,40 @@ func TestBuildUnresolvedStreakAlerts(t *testing.T) {
 		if len(doc.Domains) != 1 {
 			t.Fatalf("build %d: unresolved must never drop the entry: %+v", i, doc.Domains)
 		}
-		if open() != 0 {
-			t.Fatalf("build %d: below the threshold no alert may exist, got %d", i, open())
-		}
 	}
+	if open() != 0 {
+		t.Fatalf("inside the hour no alert may exist, got %d", open())
+	}
+	if kind := countRows(t, pool, "origin_unresolved", "true"); kind != 1 {
+		t.Fatalf("the tracker row must exist (first_unresolved_at set), got %d", kind)
+	}
+
+	// tipping the clock via SQL — no sleeps: the next build sees an hour old
+	execSQL(t, pool, `UPDATE origin_unresolved SET first_unresolved_at = now() - interval '61 minutes'`)
 	if _, _, err := s.buildSnapshot(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if open() != 1 {
-		t.Fatalf("build 12 must raise the persistence alert, got %d", open())
+		t.Fatalf("past the threshold the next build must raise the alert, got %d", open())
 	}
 
-	recover() // resolved by the next good re-check
+	recover() // resolved by the next good re-check, and the tracker row cleared
 	if _, _, err := s.buildSnapshot(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if open() != 0 {
 		t.Fatalf("recovery must auto-resolve the persistence alert, %d open", open())
 	}
+	if got := countRows(t, pool, "origin_unresolved", "true"); got != 0 {
+		t.Fatalf("recovery must clear the tracker row, got %d", got)
+	}
 
-	// a second outage is a fresh count: another 12 builds until the re-raise
+	// a fresh outage is a fresh one-hour clock that does NOT inherit the old one
 	fail()
-	for i := 1; i <= 12; i++ {
-		if _, _, err := s.buildSnapshot(ctx); err != nil {
-			t.Fatal(err)
-		}
+	if _, _, err := s.buildSnapshot(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if open() != 1 {
-		t.Fatalf("a fresh outage must re-raise after 12 builds, got %d", open())
-	}
-	if n := countRows(t, pool, "operator_alerts", "kind = 'origin_unresolved'"); n != 2 {
-		t.Fatalf("the first alert stays as history (resolved), total rows want 2, got %d", n)
+	if open() != 0 {
+		t.Fatalf("the fresh outage starts its own clock, got an alert anyway (%d)", open())
 	}
 }
