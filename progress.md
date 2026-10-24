@@ -63,6 +63,10 @@ welcome message text.
 
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
+- **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:
+  `sudo docker run -d --name gatepost-auth-pg --restart unless-stopped -p 127.0.0.1:54330:5432 --env-file /home/ubuntu/gatepost/.env -v gatepost_auth_pgdata:/var/lib/postgresql/data postgres:16-alpine`
+  (`sudo` needed on this box; verified: `restart=unless-stopped`, binding `127.0.0.1:54330->5432`.)
+- Migrations ran via a one-shot server boot on 2026-10-24: `applied 10 migration(s)` (runner applies `001`…`010` at boot); DB check: `schema_migrations` = 10 rows, 19 tables in `public`.
 - Serve: `bash scripts/regress.sh` or `./gatepost` after `go build -o gatepost ./cmd/gatepost` (listens on `GP_HTTP_ADDR`, demo default 127.0.0.1:8090).
 - NOTE discovered 2026-10-21: pre-existing containers `gatepost-edge[2]` + DB `gatepost-postgres-1`/volume `gatepost_pgdata` belong to a DIFFERENT (v1-era/edge) product — its `public` schema holds `edge_nodes`, `dns_records`, `orgs`, … Left untouched at the user's ground rule; v2 deliberately got its own database. One caveat: a login password for role `gatepost` in that old DB was reset while connecting (original value not recoverable); if any old edge process else reconnects to it, credentials may need updating on that side.
 
