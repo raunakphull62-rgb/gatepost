@@ -98,7 +98,9 @@ type Sender interface { Send(ctx context.Context, msg Message) error }
 
 ## 9. Trust boundaries & invariants
 
-- Random 256-bit tokens (sessions, API keys, states, email tokens) everywhere; stored only as SHA-256 hashes; compared only by index lookup (constant-time inside the hash → lookup, plus `crypto/subtle` where direct comparison exists).
+- Random 256-bit tokens (sessions, API keys, states, email tokens, node tokens) everywhere; stored only as SHA-256 hashes; compared only by index lookup (constant-time inside the hash → lookup, plus `crypto/subtle` where direct comparison exists).
+- Node routes (B3a) are an isolated principal: a node token authenticates only `/node/v1/*` (hash lookup; unknown and revoked tokens 401 identically), user sessions/API keys never open node routes and node tokens never open user routes — both directions 401.
+- The node-visible config snapshot carries hostname/origin/config material only — account emails, user IDs, verification tokens and password hashes never enter it; a test sweeps the whole serialized envelope (`payload`, `signature`, `key_id`) and proves no `@` occurs at all.
 - The user UUID is public; **no data is addressed by secret material** — API keys never form paths, filenames, or addresses; sessions never appear in URLs.
 - No plaintext in DB: passwords → argon2id; sessions/API keys/state/verify tokens → SHA-256. Test proves it with a `SELECT` (§ below).
 - JSON only; no user HTML is rendered server-side (no XSS surface in v1 backend).

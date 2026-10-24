@@ -24,6 +24,7 @@ run go-build build go build ./...
 run go-test  test  go test -count=1 ./...
 run demo     demo  bash scripts/demo-auth.sh
 run domains-demo domains bash scripts/demo-domains.sh
+run nodes-demo nodes bash scripts/demo-nodes.sh
 
 echo
 echo "=== regression: $pass passed, $fail failed ==="
