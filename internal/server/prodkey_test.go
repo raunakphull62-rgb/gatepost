@@ -24,9 +24,16 @@ func TestProductionSnapshotKeyBoot(t *testing.T) {
 	if err := ProductionGuards(Config{}); err == nil || !strings.Contains(err.Error(), "GP_SNAPSHOT_KEY") {
 		t.Fatalf("production without GP_SNAPSHOT_KEY must refuse at boot, got %v", err)
 	}
-	// with the key: boot allowed
+	// with the key: boot allowed (the prod key: 34 bytes ≥ the 32-floor)
 	if err := ProductionGuards(Config{SnapshotKey: key}); err != nil {
 		t.Fatalf("production with GP_SNAPSHOT_KEY set must boot, got %v", err)
+	}
+	// length floor exactly at the boundary: 31 bytes refused, 32 accepted
+	if err := ProductionGuards(Config{SnapshotKey: strings.Repeat("k", 31)}); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("a 31-byte GP_SNAPSHOT_KEY must be refused at boot, got %v", err)
+	}
+	if err := ProductionGuards(Config{SnapshotKey: strings.Repeat("k", 32)}); err != nil {
+		t.Fatalf("a 32-byte GP_SNAPSHOT_KEY must boot, got %v", err)
 	}
 	// and the loopback hook stays a test-only thing
 	if err := ProductionGuards(Config{TestAllowLoopback: true}); err == nil || !strings.Contains(err.Error(), "GP_TEST_ALLOW_LOOPBACK") {

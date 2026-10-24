@@ -250,6 +250,9 @@ func ProductionGuards(cfg Config) error {
 	if cfg.SnapshotKey == "" { // the loopback-style dev fallback must never sign prod artifacts
 		return errors.New("GP_SNAPSHOT_KEY must be set in production (snapshot signing key)")
 	}
+	if len(cfg.SnapshotKey) < 32 { // brute-force cost floor: this signs config nodes act on
+		return errors.New("GP_SNAPSHOT_KEY must be at least 32 bytes in production (CSPRNG key material)")
+	}
 	return nil
 }
 
