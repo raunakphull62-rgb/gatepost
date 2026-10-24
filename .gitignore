@@ -6,3 +6,4 @@ outbox/
 *.local
 # binaries
 /gatepost
+/gatepost-edge
