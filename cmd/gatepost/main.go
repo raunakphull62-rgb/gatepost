@@ -81,14 +81,9 @@ func main() {
 	if envfile.Production() && !strings.HasPrefix(base, "https://") {
 		log.Fatalf("GP_PUBLIC_BASE_URL must be https in production, got %q", base)
 	}
-	// The loopback hook exists for tests and local demos only.
-	if envfile.Production() && os.Getenv("GP_TEST_ALLOW_LOOPBACK") == "true" {
-		log.Fatalf("GP_TEST_ALLOW_LOOPBACK is a test-only hook; it must not be set in production")
-	}
-	if envfile.Production() && os.Getenv("GP_SNAPSHOT_KEY") == "" {
-		log.Fatalf("GP_SNAPSHOT_KEY must be set in production (snapshot signing key)")
-	}
-	srv := server.New(server.Config{
+	// The loopback hook and the snapshot key are production boot gates in
+	// one testable place (server.ProductionGuards).
+	cfg := server.Config{
 		Addr:                    firstNonEmpty(os.Getenv("GP_HTTP_ADDR"), ":8080"),
 		BaseURL:                 base,
 		Mail:                    mailCfg,
@@ -118,7 +113,12 @@ func main() {
 		OriginUnresolvedMinutes: atoiEnv("GP_ORIGIN_UNRESOLVED_MINUTES"),
 		NodePollCap:             atoiEnv("GP_NODE_RATE_CAP"),
 		SnapshotTTLSeconds:      atoiEnv("GP_SNAPSHOT_TTL"),
-	}, pool, sender)
+	}
+	// the boot gate runs on the fully parsed config: a message and exit
+	if err := server.ProductionGuards(cfg); err != nil {
+		log.Fatalf("%v", err)
+	}
+	srv := server.New(cfg, pool, sender)
 
 	// Domain claim expiry runs hourly (live-window: no fixed sleeps).
 	go func() {

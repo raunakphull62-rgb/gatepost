@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gatepost/internal/domains"
+	"gatepost/internal/envfile"
 	"gatepost/internal/mailer"
 	"gatepost/internal/password"
 	"gatepost/internal/token"
@@ -234,6 +235,22 @@ func (s *Server) routes() {
 	// the user routes), per-node rate cap, self-service config + heartbeat.
 	s.mux.HandleFunc("GET /node/v1/config", s.nodeAuth(s.nodeConfig))
 	s.mux.HandleFunc("POST /node/v1/heartbeat", s.nodeAuth(s.nodeHeartbeat))
+}
+
+// ProductionGuards — what production refuses to boot without (ENV anything
+// but "development" counts as production — a fail-safe default). main exits
+// on the returned error; tests drive the same rules through it.
+func ProductionGuards(cfg Config) error {
+	if !envfile.Production() {
+		return nil
+	}
+	if cfg.TestAllowLoopback {
+		return errors.New("GP_TEST_ALLOW_LOOPBACK is a test-only hook; it must not be set in production")
+	}
+	if cfg.SnapshotKey == "" { // the loopback-style dev fallback must never sign prod artifacts
+		return errors.New("GP_SNAPSHOT_KEY must be set in production (snapshot signing key)")
+	}
+	return nil
 }
 
 // --- http helpers -----------------------------------------------------------
