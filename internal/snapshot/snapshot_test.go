@@ -109,12 +109,14 @@ func TestTamperRefused(t *testing.T) {
 	if _, err := Verify(key, env, 2); err != nil {
 		t.Fatalf("untouched must verify after 2: %v", err)
 	}
+	// a key the node does not hold: "not my artifact", never tampering
+	if _, err := Verify([]byte("another-key"), env, 2); !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("foreign key must be ErrUnknownKey, got %v", err)
+	}
 
 	// one byte flipped in the payload
-	mutated := Envelope{
-		Payload:   strings.Replace(env.Payload, `"generation":3`, `"generation":4`, 1),
-		Signature: env.Signature,
-	}
+	mutated := env
+	mutated.Payload = strings.Replace(env.Payload, `"generation":3`, `"generation":4`, 1)
 	if mutated.Payload == env.Payload {
 		t.Fatal("tamper target not found in the canonical payload")
 	}
@@ -128,7 +130,9 @@ func TestTamperRefused(t *testing.T) {
 	if sig[0] == env.Signature[0] {
 		sig[0] = '1'
 	}
-	if _, err := Verify(key, Envelope{Payload: env.Payload, Signature: string(sig)}, 2); !errors.Is(err, ErrTampered) {
+	bad := env
+	bad.Signature = string(sig)
+	if _, err := Verify(key, bad, 2); !errors.Is(err, ErrTampered) {
 		t.Fatalf("signature tamper must be ErrTampered, got %v", err)
 	}
 

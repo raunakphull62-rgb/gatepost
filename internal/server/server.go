@@ -82,6 +82,9 @@ type Config struct {
 	// unresolvable before the origin_unresolved alert is raised (the entry
 	// is still kept), GP_ORIGIN_UNRESOLVED_BUILDS. Zero falls back to 12.
 	OriginUnresolvedBuilds int
+	// Node poll cap (B3a item 4): config GETs + heartbeats per node per
+	// 15-minute window, GP_NODE_RATE_CAP. Zero falls back to 500.
+	NodePollCap int
 }
 
 type Principal struct {
@@ -135,6 +138,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.OriginUnresolvedBuilds <= 0 {
 		s.cfg.OriginUnresolvedBuilds = 12 // B3a default: builds of unresolved tolerance
+	}
+	if s.cfg.NodePollCap <= 0 {
+		s.cfg.NodePollCap = 500 // B3a default: ~33 config polls+beats / minute / node
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {
@@ -212,6 +218,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/nodes", s.requireOperator(s.createNode))
 	s.mux.HandleFunc("GET /v1/nodes", s.requireOperator(s.listNodes))
 	s.mux.HandleFunc("POST /v1/nodes/{id}/revoke", s.requireOperator(s.revokeNode))
+	// B3a item 4: node poll routes — node-token-only auth (mutual 401s with
+	// the user routes), per-node rate cap, self-service config + heartbeat.
+	s.mux.HandleFunc("GET /node/v1/config", s.nodeAuth(s.nodeConfig))
+	s.mux.HandleFunc("POST /node/v1/heartbeat", s.nodeAuth(s.nodeHeartbeat))
 }
 
 // --- http helpers -----------------------------------------------------------

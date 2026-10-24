@@ -116,6 +116,7 @@ func main() {
 		TrustedProxes:          splitCommas(os.Getenv("GP_TRUSTED_PROXIES")),
 		SnapshotKey:            os.Getenv("GP_SNAPSHOT_KEY"),
 		OriginUnresolvedBuilds: atoiEnv("GP_ORIGIN_UNRESOLVED_BUILDS"),
+		NodePollCap:            atoiEnv("GP_NODE_RATE_CAP"),
 	}, pool, sender)
 
 	// Domain claim expiry runs hourly (live-window: no fixed sleeps).

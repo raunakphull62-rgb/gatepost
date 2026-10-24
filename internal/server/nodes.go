@@ -7,6 +7,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,4 +121,119 @@ func (s *Server) revokeNode(w http.ResponseWriter, r *http.Request, p *Principal
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"node": n})
+}
+
+// --- node poll routes (B3a item 4) -------------------------------------------
+
+// nodeAuth wraps the /node/v1/* routes. The presented bearer token is hashed
+// and looked up by hash — the plaintext is never stored or compared, and on
+// this path neither is logged. Unknown AND revoked nodes get the same 401;
+// only an active node proceeds, through its own rate bucket.
+//
+//   - Node tokens authenticate ONLY node routes (user routes reject them;
+//     mutual 401s); user sessions/API keys never authenticate node routes.
+//   - A node sees the snapshot here and nothing else — the helpers below
+//     echo no node roster and no other node's record.
+func (s *Server) nodeAuth(next func(http.ResponseWriter, *http.Request, nodeRow)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := s.bearerToken(r)
+		if !ok {
+			fail(w, http.StatusUnauthorized, "node authentication required")
+			return
+		}
+		n, err := s.scanNode(s.pool.QueryRow(r.Context(),
+			`SELECT `+nodeCols+` FROM nodes WHERE token_hash = $1`, token.SHA256Hex(tok)))
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			fail(w, http.StatusUnauthorized, "node authentication required")
+			return
+		case err != nil:
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		case n.Status != "active":
+			fail(w, http.StatusUnauthorized, "node authentication required")
+			return
+		}
+		ok, err = s.bumpRate(r.Context(), "node:"+n.ID, s.cfg.NodePollCap)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !ok {
+			fail(w, http.StatusTooManyRequests, "rate limit exceeded for node polls")
+			return
+		}
+		next(w, r, n)
+	}
+}
+
+// GET /node/v1/config — the current snapshot envelope: payload, signature
+// and key ID in the body; the generation is the ETag (and inside the signed
+// payload). If-None-Match matching that generation short-circuits to an
+// empty 304 so a node can ask for free until content actually changes.
+func (s *Server) nodeConfig(w http.ResponseWriter, r *http.Request, n nodeRow) {
+	doc, env, err := s.buildSnapshot(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	etag := `"` + strconv.FormatInt(doc.Generation, 10) + `"`
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("ETag", etag)
+	writeJSON(w, http.StatusOK, env)
+}
+
+// POST /node/v1/heartbeat {"generation": N} — last_seen and applied_version
+// are stamped ONLY after the payload validates: N must be a snapshot
+// generation that exists (a node may honestly report an older one it still
+// runs); a version that does not exist is refused and stamps nothing.
+func (s *Server) nodeHeartbeat(w http.ResponseWriter, r *http.Request, n nodeRow) {
+	var body struct {
+		Generation int64 `json:"generation"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	if body.Generation <= 0 {
+		fail(w, http.StatusBadRequest, "generation must be a positive integer")
+		return
+	}
+	var exists bool
+	if err := s.pool.QueryRow(r.Context(),
+		`SELECT EXISTS (SELECT 1 FROM snapshot_versions WHERE generation = $1)`,
+		body.Generation).Scan(&exists); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !exists {
+		fail(w, http.StatusBadRequest, "unknown snapshot version")
+		return
+	}
+	if _, err := s.pool.Exec(r.Context(),
+		`UPDATE nodes SET last_seen = now(), applied_version = $1 WHERE id = $2`,
+		body.Generation, n.ID); err != nil {
+		fail(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied_generation": body.Generation})
+}
+
+// etagMatches — If-None-Match may list candidates or "*" (any); quotes and
+// the W/ prefix are irrelevant here (generations are plain integers).
+func etagMatches(ifNoneMatch, etag string) bool {
+	if ifNoneMatch == "" {
+		return false
+	}
+	cur := strings.Trim(etag, `"`)
+	for _, v := range strings.Split(ifNoneMatch, ",") {
+		v = strings.TrimPrefix(strings.TrimSpace(v), "W/")
+		if v = strings.Trim(v, `"`); v == "*" || v == cur {
+			return true
+		}
+	}
+	return false
 }

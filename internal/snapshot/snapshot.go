@@ -80,6 +80,10 @@ type Domain struct {
 var (
 	// ErrTampered — signature check failed (or the envelope is deformed).
 	ErrTampered = errors.New("snapshot: signature verification failed")
+	// ErrUnknownKey — the envelope names a different key ID. A verifying
+	// node treats this as "not an artifact of my keys" (skip it during a
+	// rotation window), never as tampering.
+	ErrUnknownKey = errors.New("snapshot: envelope is signed with a different key")
 	// ErrBackwards — the generation is not strictly beyond the last applied.
 	ErrBackwards = errors.New("snapshot: generation must not go backwards")
 	// ErrTooLarge — payload above MaxBytes, refused before anything parses.
@@ -87,11 +91,21 @@ var (
 )
 
 // Envelope is what the API serves and the poller fetches: the canonical
-// payload verbatim plus its HMAC, so verification hashes bytes, and the
-// re-encoding can never drift.
+// payload verbatim, its HMAC, and the ID of the signing key — nodes map a
+// key ID to each key they hold and only verify when the ID matches one.
 type Envelope struct {
 	Payload   string `json:"payload"`
 	Signature string `json:"signature"` // hex HMAC-SHA256(Payload)
+	KeyID     string `json:"key_id"`    // short ID of the signing key, derived from the key itself
+}
+
+// keyID — a short stable identifier derived from the key material itself:
+// every holder of a key maps it to the same ID with zero configuration, so
+// a node can always tell WHICH of its held keys signed an artifact
+// (rotation, design §15: two keys → two IDs, both verify in transition).
+func keyID(key []byte) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // Canonical is THE encoding for hashing and signing: JSON re-marshalled with
@@ -135,6 +149,7 @@ func Sign(key []byte, d Document) (Envelope, error) {
 	return Envelope{
 		Payload:   string(payload),
 		Signature: hex.EncodeToString(mac.Sum(nil)),
+		KeyID:     keyID(key),
 	}, nil
 }
 
@@ -145,6 +160,9 @@ func Sign(key []byte, d Document) (Envelope, error) {
 func Verify(key []byte, env Envelope, prevGeneration int64) (Document, error) {
 	if len(env.Payload) > MaxBytes {
 		return Document{}, ErrTooLarge
+	}
+	if env.KeyID != keyID(key) { // a held key always names itself
+		return Document{}, ErrUnknownKey
 	}
 	want, err := hex.DecodeString(env.Signature)
 	if err != nil {
