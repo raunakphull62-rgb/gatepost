@@ -1,0 +1,23 @@
+# Gatepost edge, dev server (B3b). Host ports avoid the v1-era edge
+# containers that hold 80/443/8080/8443/8444/8084 on this box (progress.md):
+# 8081 -> HTTP, 8445 -> HTTPS. Test URLs therefore use those ports.
+name: gatepost-edge-dev
+
+services:
+  edge:
+    build:
+      context: .
+      dockerfile: Dockerfile.edge
+    image: gatepost-edge:dev
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+      - "8445:443"
+    volumes:
+      - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates (item 4) survive restarts
+      - caddy_config:/config  # Caddy's own persisted state
+
+volumes:
+  caddy_data:
+  caddy_config:

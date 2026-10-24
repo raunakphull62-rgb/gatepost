@@ -1,0 +1,18 @@
+# Bootstrap config only — proof that the image serves HTTP→HTTPS with
+# HTTP/3 off. Real site configuration arrives from the poller (B3b item 2)
+# through the admin API, which replaces this whole config atomically.
+{
+	# HTTP/3 stays off in every dev/test edge config (lessons.md: never
+	# advertise h3 unless UDP 443 is open — firmware on the nodes too).
+	servers {
+		protocols h1 h2
+	}
+	# The poller loads generated config here. Dev-only: reachable from the
+	# compose network, which is where the poller container lives.
+	admin 0.0.0.0:2019
+}
+
+localhost {
+	tls internal
+	respond "gatepost edge up" 200
+}

@@ -1,0 +1,28 @@
+# Gatepost edge image (B3b item 1): Caddy built with xcaddy, with the
+# coraza-caddy v2 (OWASP CRS) and Souin cache plugins COMPILED IN. Neither is
+# enabled here — they are switched on by later phases' config, not by this
+# build. Version pins are deliberate: one place to update all four together
+# (coraza v2.6.2 requires caddy >= v2.11.4 and Go >= 1.26).
+FROM golang:1.26-alpine AS build
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
+# coraza-caddy v2: OWASP CRS WAF (enabled in a later phase).
+# cache-handler: the official Caddy plugin built on Souin v1.7.9 (the souin
+# repo's own plugins/souin module is a standalone program, not a Caddy
+# module; cache-handler is what `caddyxcaddy` integrations use).
+RUN CGO_ENABLED=0 xcaddy build v2.11.7 \
+    --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 \
+    --with github.com/caddyserver/cache-handler@v0.17.0 \
+    --output /out/caddy
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S caddy && adduser -S -G caddy -h /data caddy \
+    && mkdir -p /etc/caddy /data /config && chown -R caddy:caddy /data /config
+COPY --from=build /out/caddy /usr/bin/caddy
+COPY Caddyfile.bootstrap /etc/caddy/Caddyfile
+ENV XDG_DATA_HOME=/data XDG_CONFIG_HOME=/config
+# caddy listens inside the container on 80/443 (the compose file maps the
+# dev host ports) and the admin API on 2019 for the poller.
+EXPOSE 80 443 2019
+USER caddy
+ENTRYPOINT ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
