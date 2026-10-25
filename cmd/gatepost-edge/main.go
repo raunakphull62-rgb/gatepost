@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -62,8 +63,8 @@ func loadConfig() Config {
 		log.Fatalf("%v", err)
 	}
 	allowLoopback := os.Getenv("GP_EDGE_ALLOW_LOOPBACK") == "true"
-	if issuer == issuerProduction && allowLoopback {
-		log.Fatalf("GP_EDGE_ISSUER=production is refused with GP_EDGE_ALLOW_LOOPBACK (production certs never come from a test/demo node)")
+	if err := issuerBootGuard(issuer, allowLoopback); err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	return Config{
@@ -85,6 +86,18 @@ func loadConfig() Config {
 		Issuer:        issuer,
 		CertHourlyCap: intEnv("GP_EDGE_CERT_HOURLY_CAP", 50),
 	}
+}
+
+// issuerBootGuard: the boot-time refusal around the production issuer.
+// GP_EDGE_ISSUER=production IS the explicit opt-in, and it is refused on a
+// loopback test/demo node (GP_EDGE_ALLOW_LOOPBACK) — a dev box must never
+// mint certificates against production Let's Encrypt. A function (not inline
+// log.Fatalf) so the boot test can pin every combination.
+func issuerBootGuard(issuer string, allowLoopback bool) error {
+	if issuer == issuerProduction && allowLoopback {
+		return fmt.Errorf("GP_EDGE_ISSUER=production is refused with GP_EDGE_ALLOW_LOOPBACK (production certs never come from a test/demo node)")
+	}
+	return nil
 }
 
 // caddyAdminEnv: the edge's admin API address, host:port (no scheme). The

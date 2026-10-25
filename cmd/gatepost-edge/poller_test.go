@@ -358,6 +358,29 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+// The production-issuer boot guard: GP_EDGE_ISSUER=production is the
+// explicit opt-in, and it is REFUSED at boot on a loopback test/demo node —
+// a dev box must never mint against production Let's Encrypt. Staging (the
+// default) and internal run fine with the loopback hook.
+func TestProductionIssuerBootGuard(t *testing.T) {
+	if err := issuerBootGuard(issuerProduction, true); err == nil {
+		t.Fatal("production issuer with the loopback hook was accepted at boot")
+	}
+	for _, c := range []struct {
+		issuer   string
+		loopback bool
+	}{
+		{issuerProduction, false}, // the explicit opt-in on a clean node
+		{issuerStaging, true},
+		{issuerStaging, false},
+		{issuerInternal, true},
+	} {
+		if err := issuerBootGuard(c.issuer, c.loopback); err != nil {
+			t.Fatalf("issuerBootGuard(%q, loopback=%v) = %v, want nil", c.issuer, c.loopback, err)
+		}
+	}
+}
+
 // Poll on the interval with Bearer auth; once a generation is applied the
 // polls carry If-None-Match; 304 means no change (no re-apply, no re-write);
 // a new generation applies and moves the ETag.
@@ -916,19 +939,19 @@ func TestAskHostMatrix(t *testing.T) {
 		}
 	}
 	for _, path := range []string{
-		"/check?domain=star.example.com",        // not in the snapshot
-		"/check",                                // missing
-		"/check?domain=",                        // empty
-		"/check?domain=one.example.com.",        // trailing dot is not an SNI
-		"/check?domain=one.example.com:443",     // ports never belong to SNI
-		"/check?domain=one.example.com:80",      // same
-		"/check?hostname=one.example.com:8443",  // port via the other anchor
-		"/check?domain=127.0.0.1",               // IP literal
-		"/check?domain=169.254.169.254",         // metadata, just in case
-		"/check?domain=[::1]",                   // IPv6 literal
-		"/check?domain=::1",                     // bare IPv6 literal
+		"/check?domain=star.example.com",          // not in the snapshot
+		"/check",                                  // missing
+		"/check?domain=",                          // empty
+		"/check?domain=one.example.com.",          // trailing dot is not an SNI
+		"/check?domain=one.example.com:443",       // ports never belong to SNI
+		"/check?domain=one.example.com:80",        // same
+		"/check?hostname=one.example.com:8443",    // port via the other anchor
+		"/check?domain=127.0.0.1",                 // IP literal
+		"/check?domain=169.254.169.254",           // metadata, just in case
+		"/check?domain=[::1]",                     // IPv6 literal
+		"/check?domain=::1",                       // bare IPv6 literal
 		"/check?domain=one.example.com.evil.test", // suffix trick
-		"/check?domain=*.example.com",            // wildcard
+		"/check?domain=*.example.com",             // wildcard
 	} {
 		if code := askGet(t, ask, path); code != http.StatusMisdirectedRequest {
 			t.Fatalf("ask %q = %d, want 421", path, code)
