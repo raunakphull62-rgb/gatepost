@@ -57,3 +57,16 @@ volumes:
   caddy_data:
   caddy_config:
   poller_state:
+
+# The edge network's subnet and bridge name are PINNED so the egress firewall
+# (scripts/edge-egress.sh) can match them by address across reboots and
+# network recreations; a pool-assigned subnet would drift and leave stale
+# rules. 172.28.0.0/24 avoids docker0 (172.17/16) and the EC2 VPC (172.31/16).
+networks:
+  default:
+    driver_opts:
+      com.docker.network.bridge.name: br-gpedge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1

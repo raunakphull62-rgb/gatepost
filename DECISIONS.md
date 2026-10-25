@@ -174,3 +174,46 @@ challenge). Revisit when multi-node HA lands.
 node must never mint certificates for names its signed config does not
 carry, and no default may touch production Let's Encrypt.
 
+## 2026-10-25 — Edge egress firewall: DOCKER-USER plus a scoped INPUT hook, REJECT not DROP, one explicit allowlist (B3b item 5)
+
+**Rule.** `scripts/edge-egress.sh` blocks everything the edge containers
+send to private, loopback, link-local and metadata space — 10/8, 172.16/12,
+192.168/16, 169.254/16 (metadata), 100.64/10, 127/8, the docker bridge
+gateway, every address the host itself owns, and the IPv6 equivalents
+(fc00::/7, fe80::/10, ::1, plus the v4-mapped ::ffff:0:0/96 to mirror
+`domains.CheckIP`'s To4 path). The only deliberate exception is the
+control-plane API at `EDGE_EGRESS_API` (explicit IP:PORT, required — on the
+dev server the API is a private address, so the exception is one visible
+rule, never a blanket allow). Public internet is what remains: public DNS,
+ACME and origins pass through the final RETURN. Rules live in one dedicated
+chain (`GATEPOST-EGRESS`) entered from TWO jump points: DOCKER-USER for
+routed container traffic, and INPUT — because traffic the edge sends to
+addresses the HOST owns is locally delivered, not forwarded, so
+DOCKER-USER alone can never block the bridge gateway or the host's IPs
+(br_netfilter is not loaded on this box, and local delivery hits INPUT even
+where it is). Both jumps are scoped (`-s` the compose subnet for v4, `-i`
+the pinned bridge for v6), so SSH, the host itself and every other container
+— gatepost-auth-pg — are untouched, and inbound ACME HTTP-01 never matches.
+The compose network's subnet (172.28.0.0/24) and bridge name (br-gpedge) are
+PINNED in compose.yaml: pool-assigned settings drift across recreations and
+would strand the persisted rules.
+
+**Mechanics.** REJECT, not DROP: fail fast and visibly (an instant refusal)
+rather than a black-hole timeout — the in-container probes show
+"Connection refused" in milliseconds where the unfirewalled baseline reaches
+metadata and answers. Idempotency is remove-then-install (`apply` first
+deletes every rule that jumps to our chain, whatever its match spec);
+`remove` reverses completely, including disabling the systemd unit;
+`dry-run` prints the exact commands without touching anything; `persist`
+installs a oneshot systemd unit (`After=docker.service`, settings baked
+into `Environment=` lines) that re-applies at boot. This is the OUTER ring:
+the forwarder's dial-time `domains.CheckIP` remains the rule that actually
+protects the edge; the firewall is what holds if that process is ever
+bypassed (a bug, a stray config, a replaced binary).
+
+**Why.** The edge is the one component that executes remote-controlled
+configuration; a second, independent layer must hold when the first fails.
+DOCKER-USER is docker's reserved hook for exactly this; and a firewall whose
+rules silently drift with DHCP-assigned pool subnets is not a firewall —
+hence the pins.
+
