@@ -81,8 +81,8 @@ type Config struct {
 	ReloadCooldown time.Duration // min spacing between caddy /loads (default 60s)
 	AllowLoopback  bool          // TEST/DEMO hook: egress may dial loopback origins
 
-	Issuer        string // staging (default) | internal | production
-	CertHourlyCap int    // on-demand cert approvals per fixed hour window (default 50)
+	Issuer        string           // staging (default) | internal | production
+	CertHourlyCap int              // on-demand cert approvals per fixed hour window (default 50)
 	Now           func() time.Time // clock for the cap window (tests)
 }
 

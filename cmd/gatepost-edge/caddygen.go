@@ -165,8 +165,8 @@ type staticResponseHandler struct {
 }
 
 type caddyTLSApp struct {
-	Certificates *caddyAutomate    `json:"certificates,omitempty"`
-	Automation   *caddyAutomation  `json:"automation,omitempty"`
+	Certificates *caddyAutomate   `json:"certificates,omitempty"`
+	Automation   *caddyAutomation `json:"automation,omitempty"`
 }
 
 type caddyAutomate struct {

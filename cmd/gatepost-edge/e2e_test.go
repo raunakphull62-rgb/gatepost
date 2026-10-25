@@ -559,8 +559,8 @@ func TestEdgeOnDemandTLS(t *testing.T) {
 	cfg.CaddyHTTP = net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpPort))
 	cfg.CaddyHTTPS = net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpsPort))
 	cfg.ReloadCooldown = 60 * time.Second // hold caddy one generation back on purpose
-	cfg.Issuer = issuerInternal            // instant local issuance; no ACME here
-	cfg.AllowLoopback = true               // TEST ONLY: the origin of this test is loopback
+	cfg.Issuer = issuerInternal           // instant local issuance; no ACME here
+	cfg.AllowLoopback = true              // TEST ONLY: the origin of this test is loopback
 	ask := startPoller(t, cfg)
 	until(t, 15*time.Second, "caddy /load of the snapshot", func() bool {
 		return hook.count("applied snapshot") >= 1
