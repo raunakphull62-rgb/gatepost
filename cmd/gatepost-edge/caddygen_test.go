@@ -67,7 +67,7 @@ func fixtureDoc(name string) *snapshot.Document {
 					Hostname: "api.customer-three.test",
 					Origin: snapshot.Origin{
 						Scheme: "https", Address: "api-origin.internal", Port: 8443,
-						TLSVerify: false, // self-signed origin → insecure_skip_verify
+						TLSVerify: true,
 					},
 				},
 			},
@@ -95,12 +95,20 @@ func fixturePorts() map[string]int {
 	}
 }
 
+// fixtureParams: issuer left empty so the golden pins the DEFAULT (staging).
+func fixtureParams() CaddyParams {
+	return CaddyParams{
+		EgressPorts: fixturePorts(),
+		AskURL:      "http://127.0.0.1:8099/check",
+	}
+}
+
 // TestGenerateGolden pins the generator's output per fixture.
 func TestGenerateGolden(t *testing.T) {
 	for _, name := range []string{"deny", "single", "multi", "hostile"} {
 		name := name
 		t.Run(name, func(t *testing.T) {
-			got, err := Generate(fixtureDoc(name), CaddyParams{EgressPorts: fixturePorts()})
+			got, err := Generate(fixtureDoc(name), fixtureParams())
 			if err != nil {
 				t.Fatalf("generate: %v", err)
 			}
@@ -129,7 +137,7 @@ func TestGenerateGolden(t *testing.T) {
 // structure — exactly two routes (the one host route + the catch-all), the
 // hostile name inside a single matcher value, everything else intact.
 func TestGenerateHostileIsOneHostString(t *testing.T) {
-	cfgBytes, err := Generate(fixtureDoc("hostile"), CaddyParams{EgressPorts: fixturePorts()})
+	cfgBytes, err := Generate(fixtureDoc("hostile"), fixtureParams())
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -175,12 +183,198 @@ func TestGenerateHostileIsOneHostString(t *testing.T) {
 func TestGenerateDetectsBrokenInput(t *testing.T) {
 	d := fixtureDoc("single")
 	d.Domains[0].Origin.Scheme = "gopher"
-	if _, err := Generate(d, CaddyParams{EgressPorts: fixturePorts()}); err == nil {
+	if _, err := Generate(d, fixtureParams()); err == nil {
 		t.Fatal("unknown origin scheme accepted")
 	}
 	d.Domains[0].Origin.Scheme = "http"
 	if _, err := Generate(d, CaddyParams{EgressPorts: map[string]int{}}); err == nil {
 		t.Fatal("missing egress port accepted — caddy would dial an unlistened port")
+	}
+	// https + tls_verify=false is a hard refusal: the edge NEVER skips origin
+	// certificate verification (item 3 check 1).
+	d = fixtureDoc("multi")
+	d.Domains[0].Origin.TLSVerify = false
+	_, err := Generate(d, fixtureParams())
+	if err == nil || !strings.Contains(err.Error(), "tls_verify=false") {
+		t.Fatalf("https origin with tls_verify=false = %v, want a refusal", err)
+	}
+}
+
+// TestGenerateNeverSkipsOriginVerification: no generated shape can carry an
+// insecure transport, and every https origin pins its real name as SNI.
+func TestGenerateNeverSkipsOriginVerification(t *testing.T) {
+	for _, name := range []string{"deny", "single", "multi", "hostile"} {
+		cfgBytes, err := Generate(fixtureDoc(name), fixtureParams())
+		if err != nil {
+			t.Fatalf("generate %s: %v", name, err)
+		}
+		if strings.Contains(string(cfgBytes), "insecure_skip_verify") {
+			t.Fatalf("%s config contains insecure_skip_verify:\n%s", name, cfgBytes)
+		}
+	}
+	cfgBytes, err := Generate(fixtureDoc("multi"), fixtureParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Handle []struct {
+							Transport *struct {
+								TLS *struct {
+									ServerName string `json:"server_name"`
+								} `json:"tls"`
+							} `json:"transport"`
+						} `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	var snis []string
+	for _, r := range cfg.Apps.HTTP.Servers["edge"].Routes {
+		for _, h := range r.Handle {
+			if h.Transport != nil && h.Transport.TLS != nil {
+				snis = append(snis, h.Transport.TLS.ServerName)
+			}
+		}
+	}
+	want := []string{"api-origin.internal", "shop-origin.internal", "shop-origin.internal"}
+	if strings.Join(snis, ",") != strings.Join(want, ",") {
+		t.Fatalf("https origin SNIs = %v, want %v (the configured origin addresses)", snis, want)
+	}
+}
+
+// TestGenerateOnDemandPolicy: the on-demand policy is scoped to the snapshot
+// hostnames (unknown SNI keeps the fallback cert for item 3's 421), the ask
+// endpoint is the poller's, and cert issuance never installs the internal CA
+// into the host trust store.
+func TestGenerateOnDemandPolicy(t *testing.T) {
+	cfgBytes, err := Generate(fixtureDoc("single"), fixtureParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Apps struct {
+			TLS struct {
+				Automation struct {
+					OnDemand *struct {
+						Permission struct {
+							Module   string `json:"module"`
+							Endpoint string `json:"endpoint"`
+						} `json:"permission"`
+					} `json:"on_demand"`
+					Policies []struct {
+						Subjects []string `json:"subjects"`
+						Issuers  []struct {
+							Module string `json:"module"`
+							CA     string `json:"ca"`
+						} `json:"issuers"`
+						OnDemand bool `json:"on_demand"`
+					} `json:"policies"`
+				} `json:"automation"`
+			} `json:"tls"`
+			PKI struct {
+				CAs map[string]struct {
+					InstallTrust *bool `json:"install_trust"`
+				} `json:"certificate_authorities"`
+			} `json:"pki"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	od := cfg.Apps.TLS.Automation.OnDemand
+	if od == nil || od.Permission.Module != "http" || od.Permission.Endpoint != fixtureParams().AskURL {
+		t.Fatalf("on_demand = %+v, want the http permission at the poller ask URL", od)
+	}
+	pols := cfg.Apps.TLS.Automation.Policies
+	if len(pols) != 2 {
+		t.Fatalf("policies = %d, want 2 (fallback + site on-demand)", len(pols))
+	}
+	if strings.Join(pols[0].Subjects, ",") != fallbackSubject || pols[0].Issuers[0].Module != "internal" {
+		t.Fatalf("fallback policy = %+v, want internal edge.invalid", pols[0])
+	}
+	if strings.Join(pols[1].Subjects, ",") != "www.customer-one.test" || !pols[1].OnDemand {
+		t.Fatalf("site policy = %+v, want on-demand scoped to the snapshot hostnames", pols[1])
+	}
+	if got := pols[1].Issuers[0]; got.Module != "acme" || got.CA != stagingDirectory {
+		t.Fatalf("default issuer = %+v, want ACME staging (never production by default)", got)
+	}
+	trust, ok := cfg.Apps.PKI.CAs["local"]
+	if !ok || trust.InstallTrust == nil || *trust.InstallTrust {
+		t.Fatalf("pki local install_trust = %+v, want explicit false", trust.InstallTrust)
+	}
+}
+
+// TestGenerateIssuerSetting: the knob is explicit; staging is the empty
+// default, internal is for dev/test, production is a deliberate opt-in.
+func TestGenerateIssuerSetting(t *testing.T) {
+	cases := []struct {
+		name, setting, module, ca string
+	}{
+		{"default", "", "acme", stagingDirectory},
+		{"staging", "staging", "acme", stagingDirectory},
+		{"internal", "internal", "internal", ""},
+		{"production", "production", "acme", productionDirectory},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fixtureParams()
+			p.Issuer = tc.setting
+			cfgBytes, err := Generate(fixtureDoc("single"), p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg struct {
+				Apps struct {
+					TLS struct {
+						Automation struct {
+							Policies []struct {
+								Issuers []struct {
+									Module string `json:"module"`
+									CA     string `json:"ca"`
+								} `json:"issuers"`
+							} `json:"policies"`
+						} `json:"automation"`
+					} `json:"tls"`
+				} `json:"apps"`
+			}
+			if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			pols := cfg.Apps.TLS.Automation.Policies
+			if len(pols) != 2 {
+				t.Fatalf("policies = %d", len(pols))
+			}
+			got := pols[1].Issuers[0]
+			if got.Module != tc.module || got.CA != tc.ca {
+				t.Fatalf("issuer = %+v, want module=%s ca=%s", got, tc.module, tc.ca)
+			}
+		})
+	}
+	p := fixtureParams()
+	p.Issuer = "letsencrypt-prod-please"
+	if _, err := Generate(fixtureDoc("single"), p); err == nil {
+		t.Fatal("unknown issuer accepted")
+	}
+}
+
+// TestGenerateRequiresAsk: a document with served hostnames may NEVER become
+// an ungated on-demand policy; the deny-all shape needs no ask.
+func TestGenerateRequiresAsk(t *testing.T) {
+	p := fixtureParams()
+	p.AskURL = ""
+	if _, err := Generate(fixtureDoc("single"), p); err == nil {
+		t.Fatal("on-demand policy emitted without the local ask gate")
+	}
+	if _, err := Generate(nil, CaddyParams{}); err != nil {
+		t.Fatalf("deny-all shape: %v", err)
 	}
 }
 
@@ -193,7 +387,7 @@ func TestCaddyValidateGenerated(t *testing.T) {
 		t.Skipf("no caddy binary (%s): %v", caddyBin(), err)
 	}
 	for _, name := range []string{"deny", "single", "multi", "hostile"} {
-		cfgBytes, err := Generate(fixtureDoc(name), CaddyParams{EgressPorts: fixturePorts()})
+		cfgBytes, err := Generate(fixtureDoc(name), fixtureParams())
 		if err != nil {
 			t.Fatalf("generate %s: %v", name, err)
 		}

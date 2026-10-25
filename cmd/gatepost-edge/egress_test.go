@@ -81,6 +81,12 @@ func TestEgressGuardDialsOnlyAllowedIPs(t *testing.T) {
 			true, []string{"[::1]:443"}},
 		{"all forbidden → dialer never fires", []string{"169.254.169.254", "10.0.0.5"},
 			false, nil},
+		// IPv4-mapped IPv6 forms (::ffff:a.b.c.d) must be judged by their
+		// embedded IPv4 address, not waved through because the literal is v6.
+		{"v4-mapped loopback refused", []string{"::ffff:127.0.0.1"}, false, nil},
+		{"v4-mapped metadata refused", []string{"::ffff:169.254.169.254"}, false, nil},
+		{"v4-mapped private refused", []string{"::ffff:10.0.0.5"}, false, nil},
+		{"v4-mapped public dials as v4", []string{"::ffff:8.8.8.8"}, false, []string{"8.8.8.8:443"}},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -136,19 +142,22 @@ func TestEgressGuardDialsOnlyAllowedIPs(t *testing.T) {
 				}
 				wantDialedHosts[host] = true
 			}
+			// Compare everything in the canonical form net.IP.String()
+			// prints — v4-mapped literals (::ffff:8.8.8.8) canonicalize to
+			// plain v4, in wantDial and in the logs alike.
 			stop := len(tc.ips)
 			for idx, ip := range tc.ips {
-				if wantDialedHosts[ip] {
+				if wantDialedHosts[net.ParseIP(ip).String()] {
 					stop = idx
 					break
 				}
 			}
 			refusals := hook.all()
 			for _, ip := range tc.ips[:stop] {
-				if wantDialedHosts[ip] {
+				if wantDialedHosts[net.ParseIP(ip).String()] {
 					continue // dialed by design: no refusal line
 				}
-				if !strings.Contains(refusals, ip) {
+				if !strings.Contains(refusals, net.ParseIP(ip).String()) {
 					t.Fatalf("refusal of %s not logged:\n%s", ip, refusals)
 				}
 			}

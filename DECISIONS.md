@@ -115,3 +115,62 @@ Caddy's own validator is the only implementation that can be trusted to
 accept what it will actually run. And a dial-time IP check is the only
 check that holds when DNS changes after build time.
 
+## 2026-10-25 — On-demand TLS: issuance is gated by the poller's ask, subjects are the snapshot's hostnames, and staging is the default issuer (B3b item 4)
+
+**Rule.** The edge mints a certificate only when Caddy's on-demand
+permission check — the poller's loopback ask — answers 200 for a hostname
+inside the last-good APPLIED snapshot. The generated config scopes the
+on-demand automation policy to the snapshot's hostnames (invalid names
+skipped, fail closed to the fallback cert) and REFUSES to emit any
+on-demand policy without the ask endpoint: `Generate` errors when the
+document has hostnames but `AskURL` is empty. The issuer is explicit:
+`GP_EDGE_ISSUER` = `staging` (the default — a missing setting must never
+burn production Let's Encrypt rate limits), `internal`, or `production`
+(opt-in only, and refused at boot together with the loopback test hook).
+`GP_EDGE_CERT_HOURLY_CAP` (default 50) caps certificate approvals per node
+per hour-window; over-cap asks answer 429, which Caddy treats as a denial.
+Certificates live in Caddy's data dir — `XDG_DATA_HOME` on the `caddy_data`
+volume — so they survive restarts.
+
+**Mechanics.** `apps.tls.automation.on_demand.permission` is Caddy's `http`
+module pointed at the poller's `/check`. Subject-scoping is load-bearing: a
+default (subject-less) on-demand policy matches every SNI, so an unknown
+host would reach the ask and a denial aborts its handshake before the
+fallback certificate can answer — probed against 2.11.7: an ask denial for
+a subject SNI aborts the handshake (`remote error: tls: internal error`),
+while an SNI outside the subjects completes on the `edge.invalid` fallback
+cert and gets the catch-all 421. So known hosts gate through the ask and
+unknown hosts keep the 421 path. The ask normalization is deliberately
+strict — surrounding whitespace, trailing dots, colons (ports, IPv6
+literals), IP literals and non-hostnames are 421; **case is NOT refused
+(flagged deviation from an early sketch that wanted 421 there): DNS
+hostnames are case-insensitive and rejecting a differently-cased SNI would
+break legitimate handshakes.** The hourly cap window is fixed from the
+first approval (`shortcut: fixed hour window, upgrade to a sliding log if
+exact-per-hour enforcement ever matters`); denials cost nothing. The
+internal CA is kept out of the host trust store
+(`pki.certificate_authorities.local.install_trust=false`) — nothing outside
+this node trusts the edge's internal certs. Origin (upstream) TLS is a
+different path from edge (client-facing) TLS: the generated transport pins
+`server_name` to the origin's configured address, never emits
+`insecure_skip_verify`, and refuses `tls_verify=false` origins outright;
+extra roots for origin verification are the platform's standard mechanism
+(`SSL_CERT_FILE` on Linux), which the real-caddy e2e exercises with a
+CA-signed origin and proves refusal with a wrong-name certificate (502,
+origin handler never runs).
+
+**HTTP-01 across nodes — documented, deliberately not built.** With the
+ACME issuers (staging/production), Caddy solves HTTP-01 by serving the
+challenge on port 80 of the node that initiated issuance. On-demand
+issuance is per node, so a hostname behind several edge nodes needs the
+challenge request to reach the SAME node that asked for the certificate:
+either DNS/balancing routes per node, or the nodes share one certificate
+store. Neither is built at this stage — today's shape is correct for
+one edge node per hostname (and for the internal issuer, which needs no
+challenge). Revisit when multi-node HA lands.
+
+**Why.** The ask must be answered from the last-good applied snapshot
+(lessons.md: a live API call fails cold-start TLS during an API outage), a
+node must never mint certificates for names its signed config does not
+carry, and no default may touch production Let's Encrypt.
+

@@ -16,7 +16,19 @@ import (
 	"strconv"
 	"strings"
 
+	"gatepost/internal/domains"
 	"gatepost/internal/snapshot"
+)
+
+// Issuer names accepted by GP_EDGE_ISSUER. Staging is the DEFAULT: a missing
+// or empty setting must never burn production Let's Encrypt rate limits.
+const (
+	issuerStaging    = "staging"
+	issuerInternal   = "internal"
+	issuerProduction = "production"
+
+	stagingDirectory    = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	productionDirectory = "https://acme-v02.api.letsencrypt.org/directory"
 )
 
 // fallbackSubject is the hostname the edge keeps one managed internal
@@ -49,6 +61,16 @@ type CaddyParams struct {
 	HTTPSAddr   string         // listen addr for HTTPS ("" → ":443")
 	AdminAddr   string         // host:port of the admin API ("" → "127.0.0.1:2019")
 	EgressPorts map[string]int // originKey → local forwarder port for /load dials
+
+	// AskURL is the poller's loopback on-demand permission endpoint. Caddy
+	// calls it before issuing a certificate; anything but 200 denies. It is
+	// REQUIRED once the document has at least one valid site hostname: an
+	// on-demand policy without the local ask would be an open certificate
+	// mint.
+	AskURL string
+	// Issuer is staging (default), internal, or production. Only an explicit
+	// GP_EDGE_ISSUER=production opts into production Let's Encrypt.
+	Issuer string
 }
 
 type caddyConfig struct {
@@ -63,6 +85,7 @@ type caddyAdmin struct {
 type caddyApps struct {
 	HTTP caddyHTTPApp `json:"http"`
 	TLS  *caddyTLSApp `json:"tls,omitempty"`
+	PKI  *caddyPKIApp `json:"pki,omitempty"`
 }
 
 type caddyHTTPApp struct {
@@ -126,8 +149,7 @@ type caddyTransport struct {
 }
 
 type caddyTransTLS struct {
-	ServerName         string `json:"server_name,omitempty"`
-	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
+	ServerName string `json:"server_name,omitempty"`
 }
 
 type caddyRPHeaders struct {
@@ -143,8 +165,8 @@ type staticResponseHandler struct {
 }
 
 type caddyTLSApp struct {
-	Certificates *caddyAutomate  `json:"certificates,omitempty"`
-	Automation   caddyAutomation `json:"automation,omitempty"`
+	Certificates *caddyAutomate    `json:"certificates,omitempty"`
+	Automation   *caddyAutomation  `json:"automation,omitempty"`
 }
 
 type caddyAutomate struct {
@@ -152,17 +174,48 @@ type caddyAutomate struct {
 }
 
 type caddyAutomation struct {
-	Policies []caddyAutomationPolicy `json:"policies"`
+	OnDemand *caddyOnDemand          `json:"on_demand,omitempty"`
+	Policies []caddyAutomationPolicy `json:"policies,omitempty"`
 }
 
-// Issuers module "internal": the edge signs every site certificate (and the
-// fallback) itself; there is no ACME phase in this project.
+// caddyOnDemand: the permission module Caddy asks before minting a
+// certificate. Module "http" GETs endpoint?domain=<sni>; 200 allows, every
+// other status (or no answer) denies.
+type caddyOnDemand struct {
+	Permission caddyPermission `json:"permission"`
+}
+
+type caddyPermission struct {
+	Module   string `json:"module"` // "http"
+	Endpoint string `json:"endpoint"`
+}
+
+// caddyAutomationPolicy: explicit subjects are load-bearing. A default
+// (subject-less) on-demand policy matches EVERY SNI, and when the ask denies
+// Caddy aborts the handshake before the fallback certificate can answer 421
+// (probed against 2.11.7). Scoping the policy to the snapshot's hostnames
+// keeps unknown SNI on the fallback cert while still gating the known ones
+// through the ask.
 type caddyAutomationPolicy struct {
-	Issuers []caddyIssuer `json:"issuers"`
+	Subjects []string      `json:"subjects,omitempty"`
+	Issuers  []caddyIssuer `json:"issuers"`
+	OnDemand bool          `json:"on_demand,omitempty"`
 }
 
 type caddyIssuer struct {
 	Module string `json:"module"`
+	CA     string `json:"ca,omitempty"` // ACME directory; empty for internal
+}
+
+// caddyPKIApp keeps Caddy's internal CA out of the host trust store. Nothing
+// outside this node trusts the edge's internal certs, and dev/test runs must
+// not mutate the machine they run on.
+type caddyPKIApp struct {
+	CertificateAuthorities map[string]caddyCA `json:"certificate_authorities"`
+}
+
+type caddyCA struct {
+	InstallTrust *bool `json:"install_trust,omitempty"`
 }
 
 // originKey identifies one tunnelled origin: scheme, canonical address and
@@ -191,14 +244,14 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		TLSConnPolicies: []caddyConnPolicy{{FallbackSNI: fallbackSubject}},
 	}
 
-	domains := []snapshot.Domain(nil)
+	doms := []snapshot.Domain(nil)
 	if d != nil {
-		domains = append(domains, d.Domains...) // copy: never sort the caller's slice
+		doms = append(doms, d.Domains...) // copy: never sort the caller's slice
 	}
-	sort.Slice(domains, func(i, j int) bool { return domains[i].Hostname < domains[j].Hostname })
+	sort.Slice(doms, func(i, j int) bool { return doms[i].Hostname < doms[j].Hostname })
 
-	routes := make([]caddyRoute, 0, len(domains)+1)
-	for _, dm := range domains {
+	routes := make([]caddyRoute, 0, len(doms)+1)
+	for _, dm := range doms {
 		port, ok := p.EgressPorts[originKey(dm.Origin)]
 		if !ok {
 			return nil, fmt.Errorf("caddygen: no egress port for %s (host %s)", originKey(dm.Origin), dm.Hostname)
@@ -213,13 +266,19 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		case "http":
 			rp.Transport = &caddyTransport{Protocol: "http", DialTimeout: originDialTimeout}
 		case "https":
+			// The edge ALWAYS verifies the origin certificate against the
+			// origin's real name (SNI = the configured address). A snapshot
+			// that asks for tls_verify=false is refused, not downgraded:
+			// silently skipping verification would let anyone on the path
+			// impersonate the origin. TLSVerify remains an API-side health
+			// check convenience only.
+			if !dm.Origin.TLSVerify {
+				return nil, fmt.Errorf("caddygen: https origin %s of %s has tls_verify=false — the edge never skips origin certificate verification", originKey(dm.Origin), dm.Hostname)
+			}
 			rp.Transport = &caddyTransport{
 				Protocol:    "http",
 				DialTimeout: originDialTimeout,
-				TLS: &caddyTransTLS{
-					ServerName:         strings.ToLower(dm.Origin.Address), // SNI = the origin's name
-					InsecureSkipVerify: !dm.Origin.TLSVerify,
-				},
+				TLS:         &caddyTransTLS{ServerName: strings.ToLower(dm.Origin.Address)},
 			}
 		default:
 			return nil, fmt.Errorf("caddygen: origin scheme %q of %s is not http(s)", dm.Origin.Scheme, dm.Hostname)
@@ -259,6 +318,37 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	siteIssuer, err := issuerConfig(p.Issuer)
+	if err != nil {
+		return nil, err
+	}
+	// Unknown-SNI TLS still terminates on the fallback cert (item 3's 421),
+	// so the fallback is always issued internally and kept out of the host
+	// trust store.
+	installTrust := false
+	tlsApp := &caddyTLSApp{
+		Certificates: &caddyAutomate{Automate: []string{fallbackSubject}},
+		Automation: &caddyAutomation{
+			Policies: []caddyAutomationPolicy{{
+				Subjects: []string{fallbackSubject},
+				Issuers:  []caddyIssuer{{Module: "internal"}},
+			}},
+		},
+	}
+	if subjects := onDemandSubjects(doms); len(subjects) > 0 {
+		if p.AskURL == "" {
+			return nil, fmt.Errorf("caddygen: %d site hostname(s) but no AskURL — refusing an on-demand policy without the local ask gate", len(subjects))
+		}
+		tlsApp.Automation.OnDemand = &caddyOnDemand{Permission: caddyPermission{
+			Module:   "http",
+			Endpoint: p.AskURL,
+		}}
+		tlsApp.Automation.Policies = append(tlsApp.Automation.Policies, caddyAutomationPolicy{
+			Subjects: subjects,
+			Issuers:  []caddyIssuer{siteIssuer},
+			OnDemand: true,
+		})
+	}
 	cfg := caddyConfig{
 		Admin: caddyAdmin{Listen: admin},
 		Apps: caddyApps{
@@ -269,12 +359,10 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 				HTTPSPort: httpsPort,
 				Servers:   map[string]caddyServer{"edge": srv},
 			},
-			TLS: &caddyTLSApp{
-				Certificates: &caddyAutomate{Automate: []string{fallbackSubject}},
-				Automation: caddyAutomation{
-					Policies: []caddyAutomationPolicy{{Issuers: []caddyIssuer{{Module: "internal"}}}},
-				},
-			},
+			TLS: tlsApp,
+			PKI: &caddyPKIApp{CertificateAuthorities: map[string]caddyCA{
+				"local": {InstallTrust: &installTrust},
+			}},
 		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
@@ -282,6 +370,43 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// onDemandSubjects: the served hostnames Caddy may request a certificate
+// for. Invalid names are skipped (and therefore fail closed to the fallback
+// cert): the API normalizes hostnames before signing, so this only matters
+// if a bad document is ever signed, and the generator must not turn it into
+// unvalidated Caddy subjects. Sorted + de-duplicated for deterministic JSON.
+func onDemandSubjects(doms []snapshot.Domain) []string {
+	seen := map[string]struct{}{}
+	for _, dm := range doms {
+		h, err := domains.NormalizeHostname(dm.Hostname, nil)
+		if err != nil {
+			continue
+		}
+		seen[h] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for h := range seen {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// issuerConfig maps GP_EDGE_ISSUER to Caddy's issuer shape. The empty value
+// takes staging: production must be an explicit choice.
+func issuerConfig(name string) (caddyIssuer, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", issuerStaging:
+		return caddyIssuer{Module: "acme", CA: stagingDirectory}, nil
+	case issuerInternal:
+		return caddyIssuer{Module: "internal"}, nil
+	case issuerProduction:
+		return caddyIssuer{Module: "acme", CA: productionDirectory}, nil
+	default:
+		return caddyIssuer{}, fmt.Errorf("caddygen: unknown issuer %q (want staging, internal or production)", name)
+	}
 }
 
 // portsOf extracts the numeric ports for http_port/https_port; 80/443 are

@@ -50,6 +50,9 @@
       "automation": {
         "policies": [
           {
+            "subjects": [
+              "edge.invalid"
+            ],
             "issuers": [
               {
                 "module": "internal"
@@ -57,6 +60,13 @@
             ]
           }
         ]
+      }
+    },
+    "pki": {
+      "certificate_authorities": {
+        "local": {
+          "install_trust": false
+        }
       }
     }
   }

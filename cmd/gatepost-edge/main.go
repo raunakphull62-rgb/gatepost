@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,8 +30,8 @@ func main() {
 	if cfg.AllowLoopback {
 		loopback = " [GP_EDGE_ALLOW_LOOPBACK — TEST/DEMO ONLY]"
 	}
-	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s admin=%s%s",
-		cfg.APIBase, cfg.StateDir, cfg.AskAddr, cfg.CaddyAdmin, loopback)
+	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s admin=%s issuer=%s cert_cap=%d/h%s",
+		cfg.APIBase, cfg.StateDir, cfg.AskAddr, cfg.CaddyAdmin, cfg.Issuer, cfg.CertHourlyCap, loopback)
 	if err := p.Run(ctx); err != nil {
 		log.Fatalf("gatepost-edge: %v", err)
 	}
@@ -51,21 +52,38 @@ func loadConfig() Config {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir %s: %v", stateDir, err)
 	}
+	askAddr := firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099")
+
+	// Issuer: an explicit setting whose DEFAULT is staging — a missing value
+	// must never reach production Let's Encrypt. production is opt-in only,
+	// and never together with the loopback test hook.
+	issuer := strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("GP_EDGE_ISSUER")), issuerStaging))
+	if _, err := issuerConfig(issuer); err != nil {
+		log.Fatalf("%v", err)
+	}
+	allowLoopback := os.Getenv("GP_EDGE_ALLOW_LOOPBACK") == "true"
+	if issuer == issuerProduction && allowLoopback {
+		log.Fatalf("GP_EDGE_ISSUER=production is refused with GP_EDGE_ALLOW_LOOPBACK (production certs never come from a test/demo node)")
+	}
+
 	return Config{
 		APIBase:  base,
 		Token:    token,
 		Key:      []byte(keyStr),
 		StateDir: stateDir,
-		AskAddr:  firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099"),
+		AskAddr:  askAddr,
 
 		CaddyAdmin: caddyAdminEnv(),
 		CaddyHTTP:  firstNonEmpty(os.Getenv("GP_EDGE_HTTP_ADDR"), ":80"),
 		CaddyHTTPS: firstNonEmpty(os.Getenv("GP_EDGE_HTTPS_ADDR"), ":443"),
 
 		ReloadCooldown: durEnv("GP_EDGE_RELOAD_COOLDOWN", 60*time.Second),
-		AllowLoopback:  os.Getenv("GP_EDGE_ALLOW_LOOPBACK") == "true",
+		AllowLoopback:  allowLoopback,
 		Interval:       durEnv("GP_EDGE_POLL_INTERVAL", 5*time.Second),
 		BackoffCap:     durEnv("GP_EDGE_BACKOFF_CAP", 60*time.Second),
+
+		Issuer:        issuer,
+		CertHourlyCap: intEnv("GP_EDGE_CERT_HOURLY_CAP", 50),
 	}
 }
 
@@ -124,4 +142,17 @@ func durEnv(name string, def time.Duration) time.Duration {
 		log.Fatalf("%s must be a positive duration (e.g. 5s), got %q", name, v)
 	}
 	return d
+}
+
+// intEnv parses a positive integer knob; unset → default, garbage → fatal.
+func intEnv(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Fatalf("%s must be a positive integer, got %q", name, v)
+	}
+	return n
 }

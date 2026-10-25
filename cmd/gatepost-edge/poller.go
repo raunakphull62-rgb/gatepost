@@ -53,6 +53,7 @@ import (
 	"sync"
 	"time"
 
+	"gatepost/internal/domains"
 	"gatepost/internal/snapshot"
 )
 
@@ -66,6 +67,7 @@ type Config struct {
 	Key        []byte        // snapshot signing key (must match the API's)
 	StateDir   string        // the mounted volume; snapshot.json lives here
 	AskAddr    string        // ask check listener; "" disables it
+	AskURL     string        // Caddy's permission endpoint ("" → derived from AskAddr/AskLn)
 	AskLn      net.Listener  // test hook; used instead of AskAddr when set
 	Interval   time.Duration // poll cadence on success (default 5s)
 	BackoffCap time.Duration // exponential ladder cap (default 60s)
@@ -78,6 +80,10 @@ type Config struct {
 	CaddyHTTPS     string        // listen addr for HTTPS ("" → ":443")
 	ReloadCooldown time.Duration // min spacing between caddy /loads (default 60s)
 	AllowLoopback  bool          // TEST/DEMO hook: egress may dial loopback origins
+
+	Issuer        string // staging (default) | internal | production
+	CertHourlyCap int    // on-demand cert approvals per fixed hour window (default 50)
+	Now           func() time.Time // clock for the cap window (tests)
 }
 
 type Poller struct {
@@ -95,6 +101,10 @@ type Poller struct {
 	pendingHash string             // content hash of pending
 	appliedHash string             // content hash of what caddy is running
 	lastLoad    time.Time          // last /load attempt (success or failure)
+
+	certWindow    time.Time // start of the current on-demand cap window
+	certCount     int       // approvals in certWindow
+	certCapWarned bool      // the cap-reached warning was already logged this window
 }
 
 // pollOutcome classifies one config poll, so the loop can decide between
@@ -128,6 +138,23 @@ func NewPoller(cfg Config) *Poller {
 	}
 	if cfg.ReloadCooldown <= 0 {
 		cfg.ReloadCooldown = 60 * time.Second
+	}
+	if cfg.Issuer == "" {
+		cfg.Issuer = issuerStaging // the default that cannot burn prod rate limits
+	}
+	if cfg.CertHourlyCap <= 0 {
+		cfg.CertHourlyCap = 50 // on-demand cert approvals per hour per node
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.AskURL == "" { // Caddy must reach the ask listener; derive its URL
+		switch {
+		case cfg.AskAddr != "":
+			cfg.AskURL = "http://" + cfg.AskAddr + "/check"
+		case cfg.AskLn != nil:
+			cfg.AskURL = "http://" + cfg.AskLn.Addr().String() + "/check"
+		}
 	}
 	if cfg.Rand01 == nil {
 		cfg.Rand01 = rand.Float64
@@ -402,22 +429,82 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 	return srv
 }
 
-// serveAsk: the domain may arrive with a port (Caddy subs {http.request.host}
-// verbatim), so strip host:port before comparing.
+// serveAsk: the on-demand permission gate. Answers 200 only for a hostname
+// present in the verified snapshot last accepted into memory, and only while
+// this node has certificate budget left in the current hour. Everything else
+// — bad syntax, an IP literal, a trailing dot, host:port, a hostname not in
+// the snapshot, no snapshot, a corrupt saved snapshot (current == nil) — is
+// 421. A bare port in a TLS SNI can never be an enabled hostname, so values
+// carrying one are refused rather than "repaired". Case is NOT refused: DNS
+// hostnames are case-insensitive, and rejecting a differently-cased SNI
+// would break legitimate handshakes.
 func (p *Poller) serveAsk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	domain := strings.ToLower(firstNonEmpty(r.URL.Query().Get("domain"), r.URL.Query().Get("hostname")))
-	if host, _, err := net.SplitHostPort(domain); err == nil {
-		domain = host
-	}
-	if p.hostAllowed(domain) {
-		fmt.Fprint(w, "enabled")
+	domain, ok := askHostname(firstNonEmpty(r.URL.Query().Get("domain"), r.URL.Query().Get("hostname")))
+	if !ok || !p.hostAllowed(domain) {
+		http.Error(w, "hostname not in the applied snapshot", http.StatusMisdirectedRequest)
 		return
 	}
-	http.Error(w, "hostname not in the applied snapshot", http.StatusMisdirectedRequest)
+	if !p.certRoom(p.cfg.Now()) {
+		http.Error(w, "on-demand certificate request cap reached", http.StatusTooManyRequests)
+		return
+	}
+	fmt.Fprint(w, "enabled")
+}
+
+// askHostname takes the raw query value and returns the comparable lowercase
+// hostname. It is deliberately strict: no surrounding space, no trailing dot
+// (fully-qualified form is not an SNI), no colon (ports, IPv6 literals), no
+// IP literals, and the full hostname rules the API applies at claim time.
+func askHostname(raw string) (string, bool) {
+	if raw == "" || strings.TrimSpace(raw) != raw {
+		return "", false
+	}
+	if strings.HasSuffix(raw, ".") || strings.Contains(raw, ":") {
+		return "", false
+	}
+	if net.ParseIP(raw) != nil {
+		return "", false
+	}
+	h, err := domains.NormalizeHostname(raw, nil)
+	if err != nil {
+		return "", false
+	}
+	return h, true
+}
+
+// certRoom reserves one of this node's on-demand certificate approvals. The
+// window is fixed (starts at the first approval, resets an hour later), so a
+// burst straddling the boundary can briefly approve twice the cap — an abuse
+// ceiling, not a billing meter.
+// shortcut: fixed hour window, upgrade to a sliding log if exact-per-hour
+// enforcement ever matters.
+func (p *Poller) certRoom(now time.Time) bool {
+	p.mu.Lock()
+	if p.cfg.CertHourlyCap <= 0 { // defensive: NewPoller always sets a cap
+		p.mu.Unlock()
+		return true
+	}
+	if p.certWindow.IsZero() || !now.Before(p.certWindow.Add(time.Hour)) {
+		p.certWindow = now
+		p.certCount = 0
+		p.certCapWarned = false
+	}
+	if p.certCount >= p.cfg.CertHourlyCap {
+		warn := !p.certCapWarned
+		p.certCapWarned = true
+		p.mu.Unlock()
+		if warn {
+			p.log("warn", "on-demand certificate cap reached (%d/hour) — refusing new certificates until the window resets", p.cfg.CertHourlyCap)
+		}
+		return false
+	}
+	p.certCount++
+	p.mu.Unlock()
+	return true
 }
 
 // hostAllowed: exact match against the snapshot's allowed-list, or the

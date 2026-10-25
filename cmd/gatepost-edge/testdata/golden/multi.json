@@ -52,8 +52,7 @@
                     "protocol": "http",
                     "dial_timeout": "10s",
                     "tls": {
-                      "server_name": "api-origin.internal",
-                      "insecure_skip_verify": true
+                      "server_name": "api-origin.internal"
                     }
                   },
                   "headers": {
@@ -166,15 +165,45 @@
         ]
       },
       "automation": {
+        "on_demand": {
+          "permission": {
+            "module": "http",
+            "endpoint": "http://127.0.0.1:8099/check"
+          }
+        },
         "policies": [
           {
+            "subjects": [
+              "edge.invalid"
+            ],
             "issuers": [
               {
                 "module": "internal"
               }
             ]
+          },
+          {
+            "subjects": [
+              "api.customer-three.test",
+              "blog.customer-two.test",
+              "shop.customer-two.test"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://acme-staging-v02.api.letsencrypt.org/directory"
+              }
+            ],
+            "on_demand": true
           }
         ]
+      }
+    },
+    "pki": {
+      "certificate_authorities": {
+        "local": {
+          "install_trust": false
+        }
       }
     }
   }

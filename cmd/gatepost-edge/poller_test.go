@@ -347,6 +347,15 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.StateDir != "data/snapshots" {
 		t.Fatalf("default state dir = %q", cfg.StateDir)
 	}
+	if cfg.Issuer != issuerStaging {
+		t.Fatalf("default issuer = %q, want staging", cfg.Issuer)
+	}
+	if cfg.CertHourlyCap != 50 {
+		t.Fatalf("default cert cap = %d, want 50", cfg.CertHourlyCap)
+	}
+	if cfg.AllowLoopback {
+		t.Fatal("loopback allowed by default")
+	}
 }
 
 // Poll on the interval with Bearer auth; once a generation is applied the
@@ -880,12 +889,15 @@ func TestHeartbeatReportsAppliedGeneration(t *testing.T) {
 	})
 }
 
-// The ask check normalizes host:port and case; either anchor name works.
-func TestAskHostMatches(t *testing.T) {
+// The ask gate's full matrix (item 4): only a valid hostname present in the
+// applied snapshot gets 200. Case is deliberately NOT denied — DNS names are
+// case-insensitive and a legitimate ClientHello may carry any case. Ports,
+// IP literals (v4/v6), trailing dots and non-hostnames are 421.
+func TestAskHostMatrix(t *testing.T) {
 	key := makeKey(t)
 	token := "node-token-ask"
 	fake := newFakeAPI(t, key, token)
-	fake.publish(1, "One.Example.com")
+	fake.publish(1, "one.example.com")
 	base := fake.serve().URL
 
 	hook := &logHook{}
@@ -893,19 +905,79 @@ func TestAskHostMatches(t *testing.T) {
 	until(t, 3*time.Second, "apply for the ask test", func() bool { return hook.count("applied snapshot") >= 1 })
 
 	for _, path := range []string{
-		"/check?domain=One.Example.com",
-		"/check?domain=one.example.com:443",    // Caddy substitutes the host WITH port
-		"/ask?domain=one.example.com:80",       // either anchor
-		"/check?hostname=one.example.com:8443", // hostname variant
+		"/check?domain=one.example.com",
+		"/check?domain=One.Example.com",   // DNS is case-insensitive; we return 200
+		"/check?domain=ONE.EXAMPLE.COM",   // same
+		"/ask?domain=one.example.com",     // either anchor
+		"/check?hostname=one.example.com", // hostname variant
 	} {
 		if code := askGet(t, ask, path); code != http.StatusOK {
 			t.Fatalf("ask %q = %d, want 200", path, code)
 		}
 	}
-	for _, path := range []string{"/check?domain=star.example.com", "/check", "/check?domain=one.example.com.evil.test"} {
+	for _, path := range []string{
+		"/check?domain=star.example.com",        // not in the snapshot
+		"/check",                                // missing
+		"/check?domain=",                        // empty
+		"/check?domain=one.example.com.",        // trailing dot is not an SNI
+		"/check?domain=one.example.com:443",     // ports never belong to SNI
+		"/check?domain=one.example.com:80",      // same
+		"/check?hostname=one.example.com:8443",  // port via the other anchor
+		"/check?domain=127.0.0.1",               // IP literal
+		"/check?domain=169.254.169.254",         // metadata, just in case
+		"/check?domain=[::1]",                   // IPv6 literal
+		"/check?domain=::1",                     // bare IPv6 literal
+		"/check?domain=one.example.com.evil.test", // suffix trick
+		"/check?domain=*.example.com",            // wildcard
+	} {
 		if code := askGet(t, ask, path); code != http.StatusMisdirectedRequest {
 			t.Fatalf("ask %q = %d, want 421", path, code)
 		}
+	}
+}
+
+// The hourly cap is per node and applies only to APPROVED hostnames: denied
+// requests cost nothing. Once exhausted, new certificates are refused with
+// 429 until the window rolls over.
+func TestAskCertCapPerHour(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-cap"
+	fake := newFakeAPI(t, key, token)
+	fake.publish(1, "cap.example.com", "other.example.com")
+	base := fake.serve().URL
+
+	now := time.Unix(1_800_000_000, 0)
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, t.TempDir(), base, token, key)
+	cfg.CertHourlyCap = 2
+	cfg.Now = func() time.Time { return now }
+	ask := startPoller(t, cfg)
+	until(t, 3*time.Second, "apply for the cap test", func() bool { return hook.count("applied snapshot") >= 1 })
+
+	// Denials do not consume budget.
+	for i := 0; i < 5; i++ {
+		if code := askGet(t, ask, "/check?domain=denied.example.com"); code != http.StatusMisdirectedRequest {
+			t.Fatalf("denied ask = %d, want 421 (and no cap consumed)", code)
+		}
+	}
+	// Two approvals, then 429.
+	for i := 0; i < 2; i++ {
+		if code := askGet(t, ask, "/check?domain=cap.example.com"); code != http.StatusOK {
+			t.Fatalf("approval %d = %d, want 200", i+1, code)
+		}
+	}
+	if code := askGet(t, ask, "/check?domain=other.example.com"); code != http.StatusTooManyRequests {
+		t.Fatalf("over-cap ask = %d, want 429", code)
+	}
+	if hook.count("certificate cap reached") != 1 {
+		t.Fatalf("cap warning count = %d, want exactly 1 (no log spam):\n%s",
+			hook.count("certificate cap reached"), hook.all())
+	}
+
+	// An hour later the window resets and approvals flow again.
+	now = now.Add(time.Hour)
+	if code := askGet(t, ask, "/check?domain=other.example.com"); code != http.StatusOK {
+		t.Fatalf("post-window ask = %d, want 200", code)
 	}
 }
 

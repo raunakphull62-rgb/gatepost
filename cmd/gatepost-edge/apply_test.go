@@ -263,6 +263,40 @@ func TestApplyBootLoadsGeneratedConfig(t *testing.T) {
 	}
 }
 
+// Boot with a saved snapshot must load on the FIRST tick even when the
+// configured cooldown is the production 60s. A zero lastLoad opens the gate;
+// a cooldown applied at boot would leave a restarted edge serving deny-all
+// for a minute.
+func TestApplyBootNotDelayedByCooldown(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-bootcooldown"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(newAdminDoc(1, "bootfast.a.test"))
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "bootfast.a.test"))
+
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 60 * time.Second // production cooldown
+	start := time.Now()
+	startPollerRaw(t, cfg)
+
+	until(t, 5*time.Second, "first /load after restart", func() bool { return al.count() == 1 })
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("first /load took %v with a saved snapshot and 60s cooldown — boot waited out the cooldown", elapsed)
+	}
+	if body := al.lastBody(); !strings.Contains(body, "bootfast.a.test") {
+		t.Fatalf("boot load missing the saved hostname:\n%s", body)
+	}
+}
+
 // A→B→A plus B, all inside one cooldown: arrivals collapse into the newest
 // pending document; content whose fingerprint equals the RUNNING config
 // never reconciles — burst does not touch caddy a second time.

@@ -131,6 +131,8 @@ func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document) error {
 		HTTPSAddr:   p.cfg.CaddyHTTPS,
 		AdminAddr:   p.cfg.CaddyAdmin,
 		EgressPorts: ports,
+		AskURL:      p.cfg.AskURL,
+		Issuer:      p.cfg.Issuer,
 	})
 	if err != nil {
 		return err

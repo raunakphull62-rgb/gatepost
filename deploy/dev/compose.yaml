@@ -46,6 +46,9 @@ services:
       GP_EDGE_HTTP_ADDR: ":80"
       GP_EDGE_HTTPS_ADDR: ":443"
       GP_EDGE_ASK_ADDR: 127.0.0.1:8099
+      # Issuer for on-demand certs: staging (default) | internal | production
+      # (explicit opt-in only; refused with GP_EDGE_ALLOW_LOOPBACK).
+      GP_EDGE_ISSUER: ${GP_EDGE_ISSUER:-staging}
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state

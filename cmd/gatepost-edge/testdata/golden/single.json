@@ -84,15 +84,43 @@
         ]
       },
       "automation": {
+        "on_demand": {
+          "permission": {
+            "module": "http",
+            "endpoint": "http://127.0.0.1:8099/check"
+          }
+        },
         "policies": [
           {
+            "subjects": [
+              "edge.invalid"
+            ],
             "issuers": [
               {
                 "module": "internal"
               }
             ]
+          },
+          {
+            "subjects": [
+              "www.customer-one.test"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://acme-staging-v02.api.letsencrypt.org/directory"
+              }
+            ],
+            "on_demand": true
           }
         ]
+      }
+    },
+    "pki": {
+      "certificate_authorities": {
+        "local": {
+          "install_trust": false
+        }
       }
     }
   }
