@@ -5,21 +5,31 @@
 //     means no change); each envelope is verified with internal/snapshot
 //     before it is applied — signature, key ID, strictly newer generation
 //     and the size cap; an invalid envelope is never applied
+//
 //   - persists the last good envelope atomically (temp file, fsync, rename,
 //     mode 0600) in the state dir and re-verifies it at boot; a corrupt or
 //     tampered file means "no snapshot", never a crash
+//
 //   - cold start with the API unreachable applies the saved snapshot; with
 //     no saved snapshot the ask check serves nothing (421 for every host)
 //     while the loop keeps retrying
+//
 //   - poll errors back off exponentially (interval → 2^n) capped at
 //     GP_EDGE_BACKOFF_CAP, with jitter on every poll so two nodes never
 //     poll in lockstep
+//
 //   - a 401 (revoked/invalid node token) is logged loudly and the last good
 //     config keeps serving
+//
 //   - an envelope with an unknown key ID is skipped with a warning — not
 //     applied, and never treated as tampering
+//
 //   - heartbeats report the generation actually applied, never merely
 //     fetched — and only when the API has not acknowledged it yet
+//
+//   - the apply loop (caddy wiring in apply.go) turns every content change
+//     into an egress Swap + generated config pushed to Caddy's admin /load,
+//     gated by a content hash and a reload cooldown
 //
 // The node token and signing key come from env or a mounted *_FILE
 // (docker secrets); neither is ever logged. The ask check answers Caddy's
@@ -62,6 +72,12 @@ type Config struct {
 	Client     *http.Client
 	Rand01     func() float64                         // jitter source, [0,1)
 	Log        func(kind, format string, args ...any) // kind: info|warn|error
+
+	CaddyAdmin     string        // host:port of the edge's admin API; "" = no caddy wiring
+	CaddyHTTP      string        // listen addr for HTTP ("" → ":80")
+	CaddyHTTPS     string        // listen addr for HTTPS ("" → ":443")
+	ReloadCooldown time.Duration // min spacing between caddy /loads (default 60s)
+	AllowLoopback  bool          // TEST/DEMO hook: egress may dial loopback origins
 }
 
 type Poller struct {
@@ -72,6 +88,13 @@ type Poller struct {
 	generation int64              // generation of the artifact in current
 	acked      int64              // last generation the API acknowledged
 	streak     int                // consecutive failed polls
+
+	fwd         *forwarder         // nil until startApply runs (caddy wiring)
+	applyKick   chan struct{}      // buffered 1: "the pending set changed"
+	pending     *snapshot.Document // newest verified doc not loaded into caddy yet
+	pendingHash string             // content hash of pending
+	appliedHash string             // content hash of what caddy is running
+	lastLoad    time.Time          // last /load attempt (success or failure)
 }
 
 // pollOutcome classifies one config poll, so the loop can decide between
@@ -103,6 +126,9 @@ func NewPoller(cfg Config) *Poller {
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{Timeout: 10 * time.Second}
 	}
+	if cfg.ReloadCooldown <= 0 {
+		cfg.ReloadCooldown = 60 * time.Second
+	}
 	if cfg.Rand01 == nil {
 		cfg.Rand01 = rand.Float64
 	}
@@ -118,14 +144,17 @@ func NewPoller(cfg Config) *Poller {
 			}
 		}
 	}
-	return &Poller{cfg: cfg}
+	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1)}
 }
 
-// Run loads the saved artifact (if any, re-verified), starts the ask check
-// listener and loops until ctx is done. It never exits early: poll failures
-// keep retrying on the ladder, a corrupt file is "no snapshot", nothing
-// panics out of a tick.
+// Run starts the apply loop (caddy wiring) BEFORE the boot snapshot load so
+// the saved artifact can be queued while the loop is live, then loads the
+// saved artifact (if any, re-verified), starts the ask check listener and
+// loops until ctx is done. It never exits early: poll failures keep
+// retrying on the ladder, a corrupt file is "no snapshot", nothing panics
+// out of a tick.
 func (p *Poller) Run(ctx context.Context) error {
+	p.startApply(ctx)
 	p.loadSavedSnapshot(ctx)
 
 	askSrv := p.startAskServer(ctx)
@@ -227,6 +256,7 @@ func (p *Poller) accept(ctx context.Context, d snapshot.Document, env snapshot.E
 	p.mu.Unlock()
 	p.log("info", "applied snapshot generation %d: %d domain(s), %d allowed hostname(s)",
 		d.Generation, len(d.Domains), len(d.AllowedHostnames))
+	p.enqueueApply(d)
 	p.heartbeat(ctx)
 }
 

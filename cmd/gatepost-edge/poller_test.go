@@ -103,6 +103,17 @@ func (f *fakeAPI) envCopy() snapshot.Envelope {
 	return *f.env
 }
 
+// publishDoc signs and serves doc verbatim (e2e: origins behind the edge).
+func (f *fakeAPI) publishDoc(doc snapshot.Document) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	env, err := snapshot.Sign(f.key, doc)
+	if err != nil {
+		f.t.Fatalf("sign: %v", err)
+	}
+	f.doc, f.env, f.gen = doc, &env, doc.Generation
+}
+
 // override serves a raw envelope as-is (tampered / foreign-key cases) with
 // the given generation as the ETag anchor.
 func (f *fakeAPI) override(env snapshot.Envelope, gen int64) {
@@ -185,6 +196,8 @@ func (h *logHook) all() string {
 }
 
 func (h *logHook) count(substr string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	n := 0
 	for _, l := range h.lines {
 		if strings.Contains(l, substr) {

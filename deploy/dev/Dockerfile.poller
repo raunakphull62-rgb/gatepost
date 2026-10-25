@@ -1,0 +1,19 @@
+# Gatepost edge poller image (B3b item 3): the node-side process that polls,
+# verifies and applies the signed snapshot, then pushes the generated config
+# into the edge's admin API. Built from the REPO ROOT (compose sets
+# context: ../..) because it compiles from source. The runtime stage shares
+# the edge container's network namespace, so no port is published from here.
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/gatepost-edge ./cmd/gatepost-edge
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates \
+    && adduser -S -h /state edge \
+    && mkdir -p /state && chown edge /state
+COPY --from=build /out/gatepost-edge /usr/bin/gatepost-edge
+USER edge
+ENTRYPOINT ["/usr/bin/gatepost-edge"]

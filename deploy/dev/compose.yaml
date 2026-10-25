@@ -18,6 +18,39 @@ services:
       - caddy_data:/data      # certificates (item 4) survive restarts
       - caddy_config:/config  # Caddy's own persisted state
 
+  # Edge poller (B3b item 3). Off by default — `docker compose --profile
+  # poller up -d` starts it. It SHARES the edge container's network
+  # namespace, so its loopback admin call (GP_EDGE_ADMIN_ADDR, default
+  # 127.0.0.1:2019) reaches the edge's admin API and nothing new is
+  # published. Needs two files in deploy/dev/secrets/ (untracked, never
+  # committed): `token` (a node token minted by the API) and `snapshot_key`
+  # (the API's GP_SNAPSHOT_KEY). The API base must be reachable from the
+  # container — bind the API beyond loopback or set GP_EDGE_API_BASE.
+  poller:
+    profiles: [poller]
+    build:
+      context: ../..
+      dockerfile: deploy/dev/Dockerfile.poller
+    image: gatepost-poller:dev
+    restart: unless-stopped
+    depends_on: [edge]
+    network_mode: "service:edge"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GP_EDGE_API_BASE: ${GP_EDGE_API_BASE:-http://host.docker.internal:8080}
+      GP_EDGE_TOKEN_FILE: /run/secrets/token
+      GP_SNAPSHOT_KEY_FILE: /run/secrets/snapshot_key
+      GP_EDGE_STATE_DIR: /state
+      GP_EDGE_ADMIN_ADDR: 127.0.0.1:2019
+      GP_EDGE_HTTP_ADDR: ":80"
+      GP_EDGE_HTTPS_ADDR: ":443"
+      GP_EDGE_ASK_ADDR: 127.0.0.1:8099
+    volumes:
+      - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
+      - poller_state:/state
+
 volumes:
   caddy_data:
   caddy_config:
+  poller_state:

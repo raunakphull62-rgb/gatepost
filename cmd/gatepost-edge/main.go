@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,7 +25,12 @@ func main() {
 
 	cfg := loadConfig()
 	p := NewPoller(cfg)
-	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s", cfg.APIBase, cfg.StateDir, cfg.AskAddr)
+	loopback := ""
+	if cfg.AllowLoopback {
+		loopback = " [GP_EDGE_ALLOW_LOOPBACK — TEST/DEMO ONLY]"
+	}
+	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s admin=%s%s",
+		cfg.APIBase, cfg.StateDir, cfg.AskAddr, cfg.CaddyAdmin, loopback)
 	if err := p.Run(ctx); err != nil {
 		log.Fatalf("gatepost-edge: %v", err)
 	}
@@ -46,14 +52,35 @@ func loadConfig() Config {
 		log.Fatalf("state dir %s: %v", stateDir, err)
 	}
 	return Config{
-		APIBase:    base,
-		Token:      token,
-		Key:        []byte(keyStr),
-		StateDir:   stateDir,
-		AskAddr:    firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099"),
-		Interval:   durEnv("GP_EDGE_POLL_INTERVAL", 5*time.Second),
-		BackoffCap: durEnv("GP_EDGE_BACKOFF_CAP", 60*time.Second),
+		APIBase:  base,
+		Token:    token,
+		Key:      []byte(keyStr),
+		StateDir: stateDir,
+		AskAddr:  firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099"),
+
+		CaddyAdmin: caddyAdminEnv(),
+		CaddyHTTP:  firstNonEmpty(os.Getenv("GP_EDGE_HTTP_ADDR"), ":80"),
+		CaddyHTTPS: firstNonEmpty(os.Getenv("GP_EDGE_HTTPS_ADDR"), ":443"),
+
+		ReloadCooldown: durEnv("GP_EDGE_RELOAD_COOLDOWN", 60*time.Second),
+		AllowLoopback:  os.Getenv("GP_EDGE_ALLOW_LOOPBACK") == "true",
+		Interval:       durEnv("GP_EDGE_POLL_INTERVAL", 5*time.Second),
+		BackoffCap:     durEnv("GP_EDGE_BACKOFF_CAP", 60*time.Second),
 	}
+}
+
+// caddyAdminEnv: the edge's admin API address, host:port (no scheme). The
+// default is loopback 2019 — inside the shared network namespace the poller
+// runs in, which is compose-internal and never a published host port.
+func caddyAdminEnv() string {
+	v := firstNonEmpty(os.Getenv("GP_EDGE_ADMIN_ADDR"), "127.0.0.1:2019")
+	if strings.Contains(v, "://") {
+		log.Fatalf("GP_EDGE_ADMIN_ADDR is a host:port address, got %q (scheme is added by the poller)", v)
+	}
+	if _, _, err := net.SplitHostPort(v); err != nil {
+		log.Fatalf("GP_EDGE_ADMIN_ADDR must be host:port, got %q", v)
+	}
+	return v
 }
 
 // envRequired: an unset required knob is a boot-time fatal, not a silent guess.
