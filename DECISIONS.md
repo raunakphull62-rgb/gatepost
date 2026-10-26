@@ -217,3 +217,20 @@ DOCKER-USER is docker's reserved hook for exactly this; and a firewall whose
 rules silently drift with DHCP-assigned pool subnets is not a firewall —
 hence the pins.
 
+## 2026-10-26 — The unit must never run `remove` on its own stop (reconcile after the box rebooted)
+
+**Rule.** `gatepost-edge-egress.service` has no ExecStop. The unit installed
+on 2026-10-25 survived until the box powered off (02:24, boot back 03:08 —
+the poweroff was not one of our sudo commands). systemd stops every active
+unit at shutdown, so our own `ExecStop=…edge-egress.sh remove` ran as the
+unit's stop: `remove` calls `systemctl disable --now` on the unit from
+inside its own stop — deadlock, 90s timeout, unit left DISABLED — and at
+boot the firewall never re-applied. Fixed by removing ExecStop entirely:
+stopping the unit must not un-install protection; rules live in kernel
+state and die with a power cut anyway, and the next boot re-applies via
+ExecStart. Removal stays an explicit operator action (`edge-egress.sh
+remove`), safe now that nothing hands it the unit's own lifecycle.
+
+**Why.** A firewall whose persistence mechanism disables itself during a
+clean shutdown looks enabled in the repo while the box boots unprotected.
+

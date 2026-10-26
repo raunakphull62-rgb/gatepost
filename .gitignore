@@ -8,3 +8,4 @@ deploy/dev/secrets/
 # binaries
 /gatepost
 /gatepost-edge
+.kilo

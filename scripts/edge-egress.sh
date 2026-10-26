@@ -226,7 +226,6 @@ Environment=EDGE_EGRESS_API=$API
 Environment=EDGE_EGRESS_SUBNET=$SUBNET
 Environment=EDGE_EGRESS_BRIDGE=$BRIDGE
 ExecStart=$SCRIPT apply
-ExecStop=$SCRIPT remove
 RemainAfterExit=yes
 
 [Install]
@@ -246,7 +245,6 @@ Environment=EDGE_EGRESS_API=$API
 Environment=EDGE_EGRESS_SUBNET=$SUBNET
 Environment=EDGE_EGRESS_BRIDGE=$BRIDGE
 ExecStart=$SCRIPT apply
-ExecStop=$SCRIPT remove
 RemainAfterExit=yes
 
 [Install]

@@ -98,6 +98,18 @@ welcome message text.
   - Modes: `dry-run` prints the exact commands; `apply` is remove-then-install (idempotent — full v4+v6 dump identical across double apply, 83 lines); `remove` reverses completely (chain, jumps, unit); `persist` installs a systemd oneshot (`After=docker.service`, settings baked in) — enabled and active. Reboot itself not performed (would drop the session); the enabled unit + After=docker is the mechanism.
   - In-container probe evidence (before → after): metadata 169.254.169.254 answered HTTP 401 → instant "Connection refused"; 10.x/192.168.x/172.16.x timeouts → instant refusals; host IPs (172.17.0.1, 172.31.25.3, 172.28.0.1) served a listener → refused; allowlisted API 172.17.0.1:8080 kept answering (HTTP 404 = the gatepost API); public 1.1.1.1 kept working. Direct edge→auth-pg (172.17.0.2:5432) is dropped by DOCKER's own cross-network isolation before and after — the firewall neither helps nor harms that path, and the API↔DB flow (127.0.0.1:54330, host OUTPUT) is proven alive by the full regress run WITH the firewall applied (6/6).
   - NOTE (box state): a parallel opencode session had attempted item 5 against the pre-pin network (chain `GP-EDGE-EGRESS`, old subnet 172.18.0.0/16, API allowlist :8090, its own systemd unit under the same name). Those iptables rules are still on the box (inert — source-scoped to a subnet that no longer exists); my `remove` run also disabled+removed their same-named unit. The worktree copy survives at `~/.local/share/opencode/worktree/f54053/witty-mountain/`. Left for the user to reconcile.
+## 2026-10-26 — item 5 reconcile
+
+The box rebooted overnight (02:24 poweroff → 03:08 boot). My ExecStop=
+remove design ran at shutdown, disabled its own unit (self-deadlock, 90s
+timeout), so the firewall did not come back at boot. Root fix: no ExecStop
+on the unit; remove stays an explicit operator action. DECISIONS.md entry
+has the full timeline. Firewall re-applied and re-persisted after the fix;
+docker-restart persistence exercised with `systemctl restart docker` (not
+a reboot). Also found: witty-mountain worktree left at commit `c3570bb`
+(detached) — read-only inspection only, per user instruction. `.kilo/`
+(a skills dir some other agent tool dropped) gitignored; no other agent
+session is running (`ps` shows only this harness's server).
 - Next: item 6 awaits the user's go.
 
 ## Dev DB on this server
