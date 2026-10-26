@@ -71,11 +71,17 @@ type CaddyParams struct {
 	// Issuer is staging (default), internal, or production. Only an explicit
 	// GP_EDGE_ISSUER=production opts into production Let's Encrypt.
 	Issuer string
+
+	// AccessLogPath is where the edge writes its JSON access logs ("" =
+	// access logging off). The path lives on the edge's own data volume;
+	// the poller only names it in every generated config.
+	AccessLogPath string
 }
 
 type caddyConfig struct {
-	Admin caddyAdmin `json:"admin"`
-	Apps  caddyApps  `json:"apps"`
+	Admin   caddyAdmin    `json:"admin"`
+	Apps    caddyApps     `json:"apps"`
+	Logging *caddyLogging `json:"logging,omitempty"`
 }
 
 type caddyAdmin struct {
@@ -103,6 +109,7 @@ type caddyServer struct {
 	WriteTimeout    string            `json:"write_timeout,omitempty"`
 	IdleTimeout     string            `json:"idle_timeout,omitempty"`
 	MaxHeaderBytes  int               `json:"max_header_bytes,omitempty"`
+	Logs            *caddyServerLogs  `json:"logs,omitempty"` // {} = request access logs on
 	TLSConnPolicies []caddyConnPolicy `json:"tls_connection_policies,omitempty"`
 	Routes          []caddyRoute      `json:"routes"`
 }
@@ -224,6 +231,100 @@ func originKey(o snapshot.Origin) string {
 	return fmt.Sprintf("%s://%s:%d", o.Scheme, strings.ToLower(o.Address), o.Port)
 }
 
+// ---- access logging (B3b item 6) --------------------------------------------
+//
+// One JSON line per request to LogPath, via caddy's own pieces — no code on
+// the edge beyond config: the file writer rolls so the disk cannot fill, the
+// `filter` encoder deletes the credential headers BY NAME (an unattended
+// marker would leak nothing, but "never log" is stricter than "never leak"),
+// and per-route `log_append` middlewares add the fields caddy's default log
+// lacks: request_id (caddy's per-request uuid — generated lazily and cached
+// per request), path (the URI path sans query; the hostile part of the URL
+// stayed a single JSON string value in item 3, and it stays one here — zap's
+// JSON encoder escapes it, so a newline in a path cannot forge a new line)
+// and origin (the vars handler stamps each site's origin identity; log_append
+// reads it back on the way up). Authorization bodies are never in access
+// logs; nothing asks for {http.request.body}.
+
+type caddyServerLogs struct{} // {} = log to the default logger via server.Logs
+
+type caddyLogging struct {
+	Logs map[string]caddyCustomLog `json:"logs,omitempty"`
+}
+
+type caddyCustomLog struct {
+	// Include pins WHICH logger feeds this custom log by name prefix: the
+	// server access logger is "http.log.access" (the http app's logger, a
+	// Named("log.access")). Without it the custom core would accept every
+	// entry caddy produces — runtime lines (admin.api, tls) would flood the
+	// access file. The key must not be "default": that is caddy's GLOBAL
+	// runtime logger, and defining it redirects stderr into the access file.
+	Include []string               `json:"include,omitempty"`
+	Writer  *caddyLogWriter        `json:"writer,omitempty"`
+	Encoder *caddyLogFilterEncoder `json:"encoder,omitempty"`
+}
+
+// caddyLogWriter: caddy's file writer. Rolling is on by default; size + keep
+// are pinned so the file can never grow unbounded.
+type caddyLogWriter struct {
+	Output     string `json:"output"` // "file"
+	Filename   string `json:"filename"`
+	RollSizeMB int    `json:"roll_size_mb,omitempty"`
+	RollKeep   int    `json:"roll_keep,omitempty"`
+}
+
+// caddyLogFilterEncoder wraps the json encoder and deletes whole fields.
+// Nested fields use `>` paths (caddy docs: for {"a":{"b":0}}, "a>b").
+type caddyLogFilterEncoder struct {
+	Format string                         `json:"format"` // "filter"
+	Wrap   *caddyLogJSONEncoder           `json:"wrap,omitempty"`
+	Fields map[string]caddyLogFieldDelete `json:"fields,omitempty"`
+}
+
+type caddyLogJSONEncoder struct {
+	Format string `json:"format"` // "json"
+}
+
+// caddyLogFieldDelete: the only filter this config uses — remove the field.
+type caddyLogFieldDelete struct {
+	Filter string `json:"filter"` // "delete"
+}
+
+// logAppendHandler: caddy's "log_append" middleware — one access-log field
+// per instance. Value may be a placeholder (resolved when the log is written,
+// so late values still work) or, without braces, a NAME IN the request's vars
+// map — which is how the origin identity stamped by the vars handler lands.
+type logAppendHandler struct {
+	Handler string `json:"handler"` // "log_append"
+	Key     string `json:"key"`
+	Value   string `json:"value,omitempty"`
+}
+
+const originVar = "gatepost_origin"
+
+// accessLogPaths: every path the filter encoder deletes, and why. Proxy-
+// Authorization rides along: caddy already treats it as a credential.
+func accessLogDeletes() map[string]caddyLogFieldDelete {
+	return map[string]caddyLogFieldDelete{
+		"uuid":                                {Filter: "delete"}, // caddy auto-adds `uuid` when the placeholder is referenced; request_id is the named duplicate
+		"request>headers>Authorization":       {Filter: "delete"},
+		"request>headers>Proxy-Authorization": {Filter: "delete"},
+		"request>headers>Cookie":              {Filter: "delete"},
+		"resp_headers>Set-Cookie":             {Filter: "delete"},
+		"resp_headers>Proxy-Authorization":    {Filter: "delete"},
+	}
+}
+
+// logAppendsOnce: the log_append middlewares common to every route when
+// access logging is enabled.
+func logAppendsOnce(originValue string) []any {
+	return []any{
+		logAppendHandler{Handler: "log_append", Key: "request_id", Value: "{http.request.uuid}"},
+		logAppendHandler{Handler: "log_append", Key: "path", Value: "{http.request.uri.path}"},
+		logAppendHandler{Handler: "log_append", Key: "origin", Value: originValue},
+	}
+}
+
 // Generate is the single source of truth of every site config the edge
 // serves. A nil (or domain-less) document produces the deny-all shape: both
 // listeners and only the catch-all 421 route.
@@ -251,10 +352,26 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 	sort.Slice(doms, func(i, j int) bool { return doms[i].Hostname < doms[j].Hostname })
 
 	routes := make([]caddyRoute, 0, len(doms)+1)
+	logged := p.AccessLogPath != ""
 	for _, dm := range doms {
 		port, ok := p.EgressPorts[originKey(dm.Origin)]
 		if !ok {
 			return nil, fmt.Errorf("caddygen: no egress port for %s (host %s)", originKey(dm.Origin), dm.Hostname)
+		}
+		// handle: request_body first (bounds the body before anything else
+		// sees it), then — when logging is on — the vars stamp for the
+		// origin identity and the extra log fields. Each log_append runs on
+		// the way back up after the proxy, exactly where its values exist.
+		handle := make([]any, 0, 6)
+		if logged {
+			handle = append(handle, map[string]any{
+				"handler": "vars",
+				originVar: originKey(dm.Origin), // the vars handler is a plain map spread
+			})
+		}
+		handle = append(handle, requestBodyHandler{Handler: "request_body", MaxSize: maxBodyBytes})
+		if logged {
+			handle = append(handle, logAppendsOnce(originVar)...)
 		}
 		rp := reverseProxyHandler{
 			Handler: "reverse_proxy",
@@ -295,24 +412,29 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 			rp.Headers = &caddyRPHeaders{}
 			rp.Headers.Request.Set = map[string][]string{"Host": {dm.Hostname}}
 		}
+		handle = append(handle, rp)
 		routes = append(routes, caddyRoute{
-			Match: []caddyHostMatch{{Host: []string{dm.Hostname}}},
-			Handle: []any{
-				requestBodyHandler{Handler: "request_body", MaxSize: maxBodyBytes},
-				rp,
-			},
+			Match:  []caddyHostMatch{{Host: []string{dm.Hostname}}},
+			Handle: handle,
 		})
 	}
 	// Catch-all LAST: every Host the routes above do not claim — and every
-	// TLS handshake completed via the fallback cert — answers 421.
-	routes = append(routes, caddyRoute{
-		Handle: []any{staticResponseHandler{
-			Handler:    "static_response",
-			StatusCode: "421",
-			Body:       "Misdirected Request",
-		}},
+	// TLS handshake completed via the fallback cert — answers 421. With
+	// logging on, its lines carry origin "-" (no origin is reached).
+	catch := make([]any, 0, 4)
+	if logged {
+		catch = append(catch, logAppendsOnce("-")...)
+	}
+	catch = append(catch, staticResponseHandler{
+		Handler:    "static_response",
+		StatusCode: "421",
+		Body:       "Misdirected Request",
 	})
+	routes = append(routes, caddyRoute{Handle: catch})
 	srv.Routes = routes
+	if logged {
+		srv.Logs = &caddyServerLogs{}
+	}
 
 	httpPort, httpsPort, err := portsOf(httpAddr, httpsAddr)
 	if err != nil {
@@ -364,12 +486,38 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 				"local": {InstallTrust: &installTrust},
 			}},
 		},
+		Logging: accessLogging(p.AccessLogPath),
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	return b, nil
+}
+
+// accessLogging: the logging app the /load config carries — nil when the
+// path is empty (access logging off). One log, "default": rolled file writer
+// + the filter-wrapped json encoder that strips credentials by name.
+func accessLogging(path string) *caddyLogging {
+	if path == "" {
+		return nil
+	}
+	return &caddyLogging{Logs: map[string]caddyCustomLog{
+		"http.log.access": {
+			Include: []string{"http.log.access"}, // nothing but access lines
+			Writer: &caddyLogWriter{
+				Output:     "file",
+				Filename:   path,
+				RollSizeMB: 10,
+				RollKeep:   5,
+			},
+			Encoder: &caddyLogFilterEncoder{
+				Format: "filter",
+				Wrap:   &caddyLogJSONEncoder{Format: "json"},
+				Fields: accessLogDeletes(),
+			},
+		},
+	}}
 }
 
 // onDemandSubjects: the served hostnames Caddy may request a certificate

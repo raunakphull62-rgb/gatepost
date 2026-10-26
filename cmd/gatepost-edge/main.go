@@ -31,8 +31,8 @@ func main() {
 	if cfg.AllowLoopback {
 		loopback = " [GP_EDGE_ALLOW_LOOPBACK — TEST/DEMO ONLY]"
 	}
-	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s admin=%s issuer=%s cert_cap=%d/h%s",
-		cfg.APIBase, cfg.StateDir, cfg.AskAddr, cfg.CaddyAdmin, cfg.Issuer, cfg.CertHourlyCap, loopback)
+	log.Printf("gatepost-edge starting: api=%s state=%s ask=%s admin=%s issuer=%s cert_cap=%d/h access_log=%s%s",
+		cfg.APIBase, cfg.StateDir, cfg.AskAddr, cfg.CaddyAdmin, cfg.Issuer, cfg.CertHourlyCap, cfg.CaddyAccessLog, loopback)
 	if err := p.Run(ctx); err != nil {
 		log.Fatalf("gatepost-edge: %v", err)
 	}
@@ -54,6 +54,7 @@ func loadConfig() Config {
 		log.Fatalf("state dir %s: %v", stateDir, err)
 	}
 	askAddr := firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099")
+	accessLog := firstNonEmpty(os.Getenv("GP_EDGE_ACCESS_LOG"), "data/logs/access.json")
 
 	// Issuer: an explicit setting whose DEFAULT is staging — a missing value
 	// must never reach production Let's Encrypt. production is opt-in only,
@@ -85,6 +86,9 @@ func loadConfig() Config {
 
 		Issuer:        issuer,
 		CertHourlyCap: intEnv("GP_EDGE_CERT_HOURLY_CAP", 50),
+
+		CaddyAccessLog: accessLog,
+		ErrorLogGap:    durEnv("GP_EDGE_ERROR_LOG_GAP", 30*time.Second),
 	}
 }
 

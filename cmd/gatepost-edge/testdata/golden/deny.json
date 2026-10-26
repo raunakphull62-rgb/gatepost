@@ -22,6 +22,7 @@
           "write_timeout": "60s",
           "idle_timeout": "2m",
           "max_header_bytes": 16384,
+          "logs": {},
           "tls_connection_policies": [
             {
               "fallback_sni": "edge.invalid"
@@ -30,6 +31,21 @@
           "routes": [
             {
               "handle": [
+                {
+                  "handler": "log_append",
+                  "key": "request_id",
+                  "value": "{http.request.uuid}"
+                },
+                {
+                  "handler": "log_append",
+                  "key": "path",
+                  "value": "{http.request.uri.path}"
+                },
+                {
+                  "handler": "log_append",
+                  "key": "origin",
+                  "value": "-"
+                },
                 {
                   "handler": "static_response",
                   "status_code": "421",
@@ -66,6 +82,47 @@
       "certificate_authorities": {
         "local": {
           "install_trust": false
+        }
+      }
+    }
+  },
+  "logging": {
+    "logs": {
+      "http.log.access": {
+        "include": [
+          "http.log.access"
+        ],
+        "writer": {
+          "output": "file",
+          "filename": "data/logs/access.json",
+          "roll_size_mb": 10,
+          "roll_keep": 5
+        },
+        "encoder": {
+          "format": "filter",
+          "wrap": {
+            "format": "json"
+          },
+          "fields": {
+            "request\u003eheaders\u003eAuthorization": {
+              "filter": "delete"
+            },
+            "request\u003eheaders\u003eCookie": {
+              "filter": "delete"
+            },
+            "request\u003eheaders\u003eProxy-Authorization": {
+              "filter": "delete"
+            },
+            "resp_headers\u003eProxy-Authorization": {
+              "filter": "delete"
+            },
+            "resp_headers\u003eSet-Cookie": {
+              "filter": "delete"
+            },
+            "uuid": {
+              "filter": "delete"
+            }
+          }
         }
       }
     }

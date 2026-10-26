@@ -96,10 +96,13 @@ func fixturePorts() map[string]int {
 }
 
 // fixtureParams: issuer left empty so the golden pins the DEFAULT (staging).
+// AccessLogPath is on: the goldens pin the whole logging block (writer,
+// credential-deleting encoder chain) exactly as /load receives it.
 func fixtureParams() CaddyParams {
 	return CaddyParams{
-		EgressPorts: fixturePorts(),
-		AskURL:      "http://127.0.0.1:8099/check",
+		EgressPorts:   fixturePorts(),
+		AskURL:        "http://127.0.0.1:8099/check",
+		AccessLogPath: "data/logs/access.json",
 	}
 }
 
@@ -170,10 +173,20 @@ func TestGenerateHostileIsOneHostString(t *testing.T) {
 	if len(hosts) != 1 || hosts[0] != evilHost {
 		t.Fatalf("host matcher = %#v, want exactly [%q] as ONE JSON string value", hosts, evilHost)
 	}
-	// The catch-all must still be a plain static_response 421, untouched.
+	// The catch-all must still END in a plain static_response 421, and the
+	// handlers before it (when access logging is on) are only log_appends —
+	// none of them may echo the hostile hostname either.
 	ha := srv.Routes[1].Handle
-	if len(ha) != 1 || ha[0]["handler"] != "static_response" || ha[0]["status_code"] != "421" {
-		t.Fatalf("catch-all = %#v, want a single static_response 421", ha)
+	if n := len(ha); n < 1 || ha[n-1]["handler"] != "static_response" || ha[n-1]["status_code"] != "421" {
+		t.Fatalf("catch-all tail = %#v, want the last handler to be static_response 421", ha)
+	}
+	for _, h := range ha[:len(ha)-1] {
+		if h["handler"] != "log_append" {
+			t.Fatalf("catch-all front = %#v, want only log_append handlers before the 421", h)
+		}
+		if v, _ := h["value"].(string); v == evilHost {
+			t.Fatalf("hostile hostname leaked into a log_append value: %#v", h)
+		}
 	}
 }
 
@@ -395,7 +408,12 @@ func TestCaddyValidateGenerated(t *testing.T) {
 		if err := os.WriteFile(path, cfgBytes, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(caddy, "validate", "--config", path).CombinedOutput()
+		// The validate run gets a throwaway cwd: a golden's file writer
+		// (the access log path) would otherwise open its file IN the
+		// package dir on every run.
+		cmd := exec.Command(caddy, "validate", "--config", path)
+		cmd.Dir = t.TempDir()
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Errorf("caddy validate %s failed: %v\n%s", name, err, out)
 		} else if !strings.Contains(string(out), "Valid configuration") {

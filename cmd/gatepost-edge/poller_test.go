@@ -776,7 +776,13 @@ func TestBackoffLadderWithJitter(t *testing.T) {
 
 	// Walk the ladder: factor = interval·2^streak capped at 150ms →
 	// waits 8,16,32,64,128 | 150,150,150…
-	until(t, 5*time.Second, "enough failed polls to walk the ladder", func() bool { return hook.count("poll:") >= 9 })
+	// The CADENCE is measured on the server's own timestamps, not on log
+	// lines: repeated failure lines are throttled to one per gap on purpose.
+	until(t, 5*time.Second, "enough failed polls to walk the ladder", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(at) >= 9
+	})
 
 	mu.Lock()
 	timestamps := append([]time.Time(nil), at...)
@@ -811,7 +817,7 @@ func twoNodeSpread(t *testing.T) {
 	lo, hi := time.Duration(1<<62), time.Duration(0)
 	xlo, xhi := time.Duration(1<<62), time.Duration(0)
 	for i := 0; i < 200; i++ {
-		d := nextDelay(3, interval, cap, rand.Float64)
+		d := time.Duration(float64(baseDelay(3, interval, cap)) * (0.9 + 0.2*rand.Float64()))
 		if d < lo {
 			lo = d
 		}
@@ -819,7 +825,7 @@ func twoNodeSpread(t *testing.T) {
 			hi = d
 		}
 		// At the cap: factor 60s, jitter keeps it out of lockstep too.
-		e := nextDelay(30, interval, cap, rand.Float64)
+		e := time.Duration(float64(baseDelay(30, interval, cap)) * (0.9 + 0.2*rand.Float64()))
 		if e < xlo {
 			xlo = e
 		}

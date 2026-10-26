@@ -17,15 +17,26 @@ services:
       - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # certificates (item 4) survive restarts
       - caddy_config:/config  # Caddy's own persisted state
+    # Container stdout/stderr logs: capped rotation (item 6). The edge's
+    # structured ACCESS logs go to files on caddy_data (the poller's
+    # GP_EDGE_ACCESS_LOG, wrapped by caddy's own roll settings); this caps
+    # only the docker json-file stream every container still produces.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Edge poller (B3b item 3). Off by default — `docker compose --profile
   # poller up -d` starts it. It SHARES the edge container's network
   # namespace, so its loopback admin call (GP_EDGE_ADMIN_ADDR, default
   # 127.0.0.1:2019) reaches the edge's admin API and nothing new is
-  # published. Needs two files in deploy/dev/secrets/ (untracked, never
-  # committed): `token` (a node token minted by the API) and `snapshot_key`
-  # (the API's GP_SNAPSHOT_KEY). The API base must be reachable from the
-  # container — bind the API beyond loopback or set GP_EDGE_API_BASE.
+  # published. (No extra_hosts here: a custom host-to-IP mapping conflicts
+  # with network_mode service:edge — and the old host.docker.internal
+  # default resolved to 172.17.0.1 anyway, the same host address the egress
+  # allowlist pins.) Needs two files in deploy/dev/secrets/ (untracked,
+  # never committed): `token` (a node token minted by the API) and
+  # `snapshot_key` (the API's GP_SNAPSHOT_KEY).
   poller:
     profiles: [poller]
     build:
@@ -35,10 +46,8 @@ services:
     restart: unless-stopped
     depends_on: [edge]
     network_mode: "service:edge"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
-      GP_EDGE_API_BASE: ${GP_EDGE_API_BASE:-http://host.docker.internal:8080}
+      GP_EDGE_API_BASE: ${GP_EDGE_API_BASE:-http://172.17.0.1:8080}
       GP_EDGE_TOKEN_FILE: /run/secrets/token
       GP_SNAPSHOT_KEY_FILE: /run/secrets/snapshot_key
       GP_EDGE_STATE_DIR: /state
@@ -49,9 +58,18 @@ services:
       # Issuer for on-demand certs: staging (default) | internal | production
       # (explicit opt-in only; refused with GP_EDGE_ALLOW_LOOPBACK).
       GP_EDGE_ISSUER: ${GP_EDGE_ISSUER:-staging}
+      # Structured access logs (item 6): the poller names this path in every
+      # generated caddy config; caddy's file writer on the edge volume
+      # (caddy_data) creates the dir and rolls at 10MB x5. Empty = logging off.
+      GP_EDGE_ACCESS_LOG: /data/logs/access.json
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   caddy_data:

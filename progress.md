@@ -112,6 +112,76 @@ a reboot). Also found: witty-mountain worktree left at commit `c3570bb`
 session is running (`ps` shows only this harness's server).
 - Next: item 6 awaits the user's go.
 
+## 2026-10-26 — item 6: structured edge access logs, poller log hygiene, rotation, disk warn
+
+- **Access logs (generator)**: pure caddy 2.11.7 config, image untouched.
+  `CaddyParams.AccessLogPath` (poller env `GP_EDGE_ACCESS_LOG`, default
+  `data/logs/access.json`, empty = off) flows into every generated config:
+  `logs {}` on the server, one custom log keyed `http.log.access` with
+  `include` guard (naming it `default` redirects caddy's GLOBAL runtime
+  logger into the file — caught by the real-caddy e2e), file writer
+  rolled 10 MB × 5 (MkdirAll's its dir), a filter-wrapped json encoder
+  that DELETES credential headers by name (Authorization,
+  Proxy-Authorization, Cookie, resp Set-Cookie/Proxy-Authorization, and
+  the auto-added `uuid` dup of `{http.request.uuid}`), and per-route
+  `vars` + `log_append` fields: `request_id` (per-request uuid),
+  `path` (no query; query stays in caddy's native `uri`), `origin`
+  (vars-stamped identity; `-` on the 421 catch-all). Goldens pin the
+  whole logging block; every fixture still passes real `caddy validate`,
+  now run with a throwaway cwd so the golden's file writer never opens a
+  file inside the package dir.
+- **E2E (`TestEdgeAccessLogs`, real caddy)**: a proxied request carrying
+  Authorization+Cookie with the origin also setting Set-Cookie writes
+  exactly one json line; neither the secret VALUES nor the header NAMES
+  appear anywhere in the file; a percent-encoded `\n +
+  {"level":"critical"}` path stays one line inside one JSON string
+  (line count = 3, no forged line, injected level never appears); fields
+  asserted: ts, status/size/duration, request>remote_ip, request_id
+  (uuid, distinct per request), path without query, origin
+  (`http://…` served / `-` refused).
+- **Poller**: repeate identical failure lines (poll network errors,
+  refusals, 401, heartbeats, key/tampered/backwards) are throttled per
+  brand via `logThrottle` (`GP_EDGE_ERROR_LOG_GAP`, default 30s; first
+  line always passes); the backoff-cap crossing is announced EXACTLY
+  ONCE per outage (`baseDelay` refactor made the crossing a clean
+  threshold); recovery lines are never throttled. Tests:
+  `TestLogThrottleBrands` (gap window, brand isolation),
+  `TestRepeatedFailureLinesThrottled` (25 refused polls = 1 failure line
+  + exactly 1 cap announcement), `TestUnauthorized401OnePerGap`; the
+  jitter-ladder test now measures cadence on the server's timestamps
+  instead of throttled log lines. Race suite green.
+- **Compose**: json-file rotation 10m × 3 on edge AND poller; poller env
+  `GP_EDGE_ACCESS_LOG=/data/logs/access.json` (lands on caddy_data).
+  Also unblocked the poller service for real: `extra_hosts` conflicts
+  with `network_mode: service:edge`, and its `host.docker.internal`
+  default resolved to 172.17.0.1 anyway — replaced with the pinned
+  allowlisted API base; secrets files opened for the mount (uid inside
+  the container differs; dir stays private).
+- **`scripts/disk-warn.sh`**: one stderr line at/over
+  `DISK_WARN_THRESHOLD` (default 80%) on `DISK_WARN_PATH` (default /),
+  silent otherwise, always exit 0 (cron-friendly: quiet disk = no
+  output, full disk = never a failed monitor). Demonstrated: threshold 1
+  warns (disk at 32%), 99 and the default are silent.
+- **Live-box evidence**: node minted fresh (old ones all revoked),
+  poller image rebuilt, `docker compose --profile poller up` against the
+  real API — boot summary shows `access_log=/data/logs/access.json`,
+  applied generation 17 (16 domains). Through host 8081: verified host +
+  Authorization/Cookie headers → real origin response logged with
+  `origin`, `path` `/docs` (query only in `uri`), NO credential names or
+  values in the file; hostile `__EL__`-shaped path stays one line
+  (grep: exactly 1 escaped occurrence, 0 raw); unknown host → 421 with
+  `origin: "-"` and full shape. Line sweep: 0× SUPERSECRET/TOPSECRET /
+  header names.
+- **Found + fixed (same session, separate commit `ab2ff85`)**: the egress
+  chain killed reply legs of host-initiated flows — every host-published
+  edge port hung while the firewall was applied. First rule is now
+  `conntrack ESTABLISHED,RELATED → RETURN` (v4+v6); probes unchanged;
+  docker-restart persistence re-proven; nodes-demo's `grep -c "$NTOK"`
+  ate a leading-dash token as an option (-e added). Regress 6/6 with the
+  firewall applied and the poller running.
+- Next: item 7 (edge WAF — coraza) or as asked; awaiting the user's go
+  before touching item 7.
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:

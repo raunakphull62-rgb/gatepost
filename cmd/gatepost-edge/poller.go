@@ -81,9 +81,11 @@ type Config struct {
 	ReloadCooldown time.Duration // min spacing between caddy /loads (default 60s)
 	AllowLoopback  bool          // TEST/DEMO hook: egress may dial loopback origins
 
-	Issuer        string           // staging (default) | internal | production
-	CertHourlyCap int              // on-demand cert approvals per fixed hour window (default 50)
-	Now           func() time.Time // clock for the cap window (tests)
+	Issuer         string           // staging (default) | internal | production
+	CertHourlyCap  int              // on-demand cert approvals per fixed hour window (default 50)
+	CaddyAccessLog string           // path of the edge's JSON access log; "" = logging off
+	ErrorLogGap    time.Duration    // min spacing of repeated failure lines (default 30s)
+	Now            func() time.Time // clock for the cap window (tests)
 }
 
 type Poller struct {
@@ -102,9 +104,10 @@ type Poller struct {
 	appliedHash string             // content hash of what caddy is running
 	lastLoad    time.Time          // last /load attempt (success or failure)
 
-	certWindow    time.Time // start of the current on-demand cap window
-	certCount     int       // approvals in certWindow
-	certCapWarned bool      // the cap-reached warning was already logged this window
+	throttle      *logThrottle // repeated identical failure lines resolve here
+	certWindow    time.Time    // start of the current on-demand cap window
+	certCount     int          // approvals in certWindow
+	certCapWarned bool         // the cap-reached warning was already logged this window
 }
 
 // pollOutcome classifies one config poll, so the loop can decide between
@@ -148,6 +151,9 @@ func NewPoller(cfg Config) *Poller {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.ErrorLogGap <= 0 {
+		cfg.ErrorLogGap = 30 * time.Second // one failure line per gap is the flood cap
+	}
 	if cfg.AskURL == "" { // Caddy must reach the ask listener; derive its URL
 		switch {
 		case cfg.AskAddr != "":
@@ -171,7 +177,7 @@ func NewPoller(cfg Config) *Poller {
 			}
 		}
 	}
-	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1)}
+	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1), throttle: newLogThrottle()}
 }
 
 // Run starts the apply loop (caddy wiring) BEFORE the boot snapshot load so
@@ -247,20 +253,22 @@ func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, e
 	case err == nil:
 		return d, nil
 	case errors.Is(err, snapshot.ErrUnknownKey):
-		p.log("warn", "snapshot skipped: signed with unknown key id %s (rotation window?)", env.KeyID)
+		// Refusals REROLL every interval (the ladder resets on a sane reply),
+		// so they are throttled like any repeated failure line.
+		p.logThrottled("warn", "key", "snapshot skipped: signed with unknown key id %s (rotation window?)", env.KeyID)
 		return snapshot.Document{}, err
 	case errors.Is(err, snapshot.ErrTampered):
-		p.log("error", "snapshot refused: signature verification failed (tampering?)")
+		p.logThrottled("error", "tampered", "snapshot refused: signature verification failed (tampering?)")
 		return snapshot.Document{}, err
 	case errors.Is(err, snapshot.ErrTooLarge):
-		p.log("warn", "snapshot refused: payload over the %d cap", snapshot.MaxBytes)
+		p.logThrottled("warn", "size", "snapshot refused: payload over the %d cap", snapshot.MaxBytes)
 		return snapshot.Document{}, err
 	case errors.Is(err, snapshot.ErrBackwards):
 		// HISTORIC: generation refuses any generation <= last applied.
-		p.log("warn", "snapshot skipped: generation %d not strictly newer than applied %d", genOf(env.Payload), prev)
+		p.logThrottled("warn", "backwards", "snapshot skipped: generation %d not strictly newer than applied %d", genOf(env.Payload), prev)
 		return snapshot.Document{}, err
 	default:
-		p.log("error", "snapshot refused: %v", err)
+		p.logThrottled("error", "refused", "snapshot refused: %v", err)
 		return snapshot.Document{}, err
 	}
 }
@@ -323,7 +331,7 @@ func (p *Poller) loadSavedSnapshot(ctx context.Context) {
 func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.cfg.APIBase+"/node/v1/config", nil)
 	if err != nil {
-		p.log("error", "poll request build: %v", err)
+		p.logThrottled("error", "poll", "poll request build: %v", err)
 		return nil, pollNetwork
 	}
 	req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
@@ -334,7 +342,7 @@ func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil { // bodies of transport errors name the URL, never headers
-		p.log("error", "poll failed (streak %d): %v", p.streakValue()+1, err)
+		p.logThrottled("error", "poll", "poll failed (streak %d): %v", p.streakValue()+1, err)
 		return nil, pollNetwork
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -345,25 +353,26 @@ func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 	case http.StatusOK:
 		b, err := io.ReadAll(io.LimitReader(resp.Body, snapshot.MaxBytes+1))
 		if err != nil {
-			p.log("error", "poll body read: %v", err)
+			p.logThrottled("error", "poll", "poll body read: %v", err)
 			return nil, pollNetwork
 		}
 		if len(b) > snapshot.MaxBytes {
-			p.log("warn", "poll body over the %d cap — refusing", snapshot.MaxBytes)
+			p.logThrottled("warn", "size", "poll body over the %d cap — refusing", snapshot.MaxBytes)
 			return nil, pollTooLarge
 		}
 		var env snapshot.Envelope
 		if err := json.Unmarshal(b, &env); err != nil {
-			p.log("error", "poll response is not an envelope — refusing")
+			p.logThrottled("error", "poll", "poll response is not an envelope — refusing")
 			return nil, pollMalformed
 		}
 		return &env, pollOK
 	case http.StatusUnauthorized:
 		// LOUD by design: an edge polling a dead token is an operator problem.
-		p.log("error", "401 from API — node token revoked or invalid; keeping the last good config (streak %d)", p.streakValue()+1)
+		// One line per gap, not one per tick — loud ≠ a flood of identical lines.
+		p.logThrottled("error", "401", "401 from API — node token revoked or invalid; keeping the last good config (streak %d)", p.streakValue()+1)
 		return nil, pollUnauthorized
 	default:
-		p.log("warn", "poll: unexpected status %d (streak %d)", resp.StatusCode, p.streakValue()+1)
+		p.logThrottled("warn", "status", "poll: unexpected status %d (streak %d)", resp.StatusCode, p.streakValue()+1)
 		return nil, pollHTTPError
 	}
 }
@@ -390,12 +399,12 @@ func (p *Poller) heartbeat(ctx context.Context) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil {
-		p.log("warn", "heartbeat (gen %d) failed: %v", gen, err)
+		p.logThrottled("warn", "heartbeat", "heartbeat (gen %d) failed: %v", gen, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		p.log("warn", "heartbeat (gen %d) not accepted: %d", gen, resp.StatusCode)
+		p.logThrottled("warn", "heartbeat", "heartbeat (gen %d) not accepted: %d", gen, resp.StatusCode)
 		return
 	}
 	p.mu.Lock()
@@ -536,10 +545,12 @@ func (p *Poller) hostAllowed(domain string) bool {
 // [0.9, 1.1) so two nodes starting together drift apart immediately and
 // never fall back into lockstep at the cap.
 func (p *Poller) nextDelay() time.Duration {
-	return nextDelay(p.streakValue(), p.cfg.Interval, p.cfg.BackoffCap, p.cfg.Rand01)
+	return time.Duration(float64(baseDelay(p.streakValue(), p.cfg.Interval, p.cfg.BackoffCap)) * (0.9 + 0.2*p.cfg.Rand01()))
 }
 
-func nextDelay(streak int, interval, cap time.Duration, rand01 func() float64) time.Duration {
+// baseDelay is nextDelay without the jitter: the ladder's actual branch.
+// It exists so the CAP CROSSING below is a clean threshold, not a jitter roll.
+func baseDelay(streak int, interval, cap time.Duration) time.Duration {
 	factor := interval
 	for i := 0; i < streak && factor < cap; i++ {
 		factor *= 2
@@ -547,7 +558,7 @@ func nextDelay(streak int, interval, cap time.Duration, rand01 func() float64) t
 	if factor > cap {
 		factor = cap
 	}
-	return time.Duration(float64(factor) * (0.9 + 0.2*rand01()))
+	return factor
 }
 
 func (p *Poller) appliedGeneration() int64 {
@@ -565,7 +576,15 @@ func (p *Poller) streakValue() int {
 func (p *Poller) bumpStreak() {
 	p.mu.Lock()
 	p.streak++
+	n, interval, cap := p.streak, p.cfg.Interval, p.cfg.BackoffCap
 	p.mu.Unlock()
+	// Exactly ONE line when the ladder reaches the cap: the event an operator
+	// should know about is "we are now stuck at the max retry pace", not
+	// every step of the climb. Fires once per outage (the condition is a
+	// threshold crossing, no state needed).
+	if baseDelay(n, interval, cap) == cap && baseDelay(n-1, interval, cap) < cap {
+		p.log("warn", "poll failure streak %d — backoff ladder capped at %s; the last good config keeps serving", n, cap)
+	}
 }
 
 func (p *Poller) resetStreak() {
@@ -582,6 +601,17 @@ func (p *Poller) heartbeats() (gen, acked int64) {
 
 func (p *Poller) log(kind, format string, args ...any) {
 	p.cfg.Log(kind, format, args...)
+}
+
+// logThrottled drops repeats of the same failure brand inside ErrorLogGap —
+// a down API would otherwise emit one identical line per tick. The FIRST
+// line always gets through; the first noticed after every gap also does.
+// Recovery messages ("applied snapshot …") are never throttled.
+func (p *Poller) logThrottled(kind, brand, format string, args ...any) {
+	if !p.throttle.allow(brand, p.cfg.ErrorLogGap, p.cfg.Now()) {
+		return
+	}
+	p.log(kind, format, args...)
 }
 
 // atomicWrite: temp file in the same dir (so rename is atomic on one fs),

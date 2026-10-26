@@ -40,6 +40,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -628,5 +629,226 @@ func TestEdgeOnDemandTLS(t *testing.T) {
 	}
 	if got := ec.storedCertPaths("late.example.test"); len(got) > 0 {
 		ec.fail(fmt.Sprintf("a certificate was issued while the ask was unreachable: %v", got))
+	}
+}
+
+// secret values a request may carry; the access log must contain NONE of
+// them (values AND header names are deleted, not just masked).
+const (
+	secretAuth      = "Bearer tr0ub4dor-SUPERSECRET-AUTH"
+	secretCookie    = "session=TOPSECRET-COOKIE-VALUE"
+	secretSetCookie = "dough=CLASSIFIED-SET-COOKIE"
+	forgedPayload   = `{"level":"critical","msg":"forged-line"}` // log-injection attempt
+)
+
+// TestEdgeAccessLogs — item 6's evidence with a REAL caddy: the applied
+// config's logging app writes ONE json line per request to
+// cfg.CaddyAccessLog (the file writer even creates its nested directory),
+// and the filter encoder drops the credential headers by name. Proven here:
+//
+//   - neither the secret VALUES (Authorization, Cookie, Set-Cookie) nor their
+//     header NAMES appear anywhere in the file;
+//   - a path percent-encoding a newline plus a whole forged `{"level":...}`
+//     payload stays ONE JSON string inside ONE physical line (zap escapes it;
+//     no line can be forged, the line count does not grow);
+//   - every appended field is present and shaped: request_id (caddy's uuid,
+//     distinct per request), path WITHOUT the query (the query lands only in
+//     caddy's native uri field), origin (the vars-stamped identity, "-" on
+//     the 421 catch-all), and the native status/size/duration/remote_ip.
+func TestEdgeAccessLogs(t *testing.T) {
+	caddyPath := caddyBin()
+	if _, err := exec.LookPath(caddyPath); err != nil {
+		t.Skipf("no caddy binary at %q (set GP_TEST_CADDY): %v", caddyPath, err)
+	}
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", secretSetCookie) // the response side the filter must also delete
+		_, _ = w.Write([]byte("origin-ok"))
+	}))
+	t.Cleanup(origin.Close)
+	originAddr := strings.TrimPrefix(origin.URL, "http://")
+	host := "www.accesstest.test"
+
+	ec := startEdgeCaddy(t)
+	key := makeKey(t)
+	token := "node-token-accesslogs"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(snapshot.Document{
+		SchemaVersion: snapshot.SchemaVersion,
+		Generation:    1,
+		BuiltAt:       time.Now().UTC(),
+		Domains: []snapshot.Domain{{
+			Hostname: host,
+			Origin:   snapshot.Origin{Scheme: "http", Address: hostOf(originAddr), Port: portOf(t, originAddr)},
+		}},
+		AllowedHostnames: []string{host},
+	})
+
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, t.TempDir(), fake.serve().URL, token, key)
+	cfg.CaddyAdmin = ec.admin
+	cfg.CaddyHTTP = net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpPort))
+	cfg.CaddyHTTPS = net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpsPort))
+	cfg.CaddyAccessLog = filepath.Join(t.TempDir(), "logs", "nested", "access.json") // writer must MkdirAll
+	cfg.Issuer = issuerInternal
+	cfg.AllowLoopback = true // TEST ONLY: the origin of this test is loopback
+	startPoller(t, cfg)
+	// Caddy's /load swap is atomic but ASYNC relative to the poller's
+	// success line (TestEdgeOnDemandTLS hits the same race). The right wait
+	// is caddy's own live config: the logged route must be there before any
+	// request — every request from here on is logged, and the line-count
+	// assertion below depends on there being exactly one per request.
+	until(t, 15*time.Second, "caddy live config carries the logged route", func() bool {
+		live, err := http.Get("http://" + ec.admin + "/config/")
+		if err != nil {
+			return false
+		}
+		lb, err := io.ReadAll(io.LimitReader(live.Body, 1<<20))
+		_ = live.Body.Close()
+		return err == nil &&
+			strings.Contains(string(lb), host) &&
+			strings.Contains(string(lb), filepath.Base(cfg.CaddyAccessLog))
+	})
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	proxy := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpPort))
+
+	// 1) A well-behaved request carrying BOTH credential headers, plus a
+	//    query (the `path` field must come out without it).
+	req, err := http.NewRequest(http.MethodGet, proxy+"/docs?page=QUERYMARK-9", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	req.Header.Set("Authorization", secretAuth)
+	req.Header.Set("Cookie", secretCookie)
+	resp, err := client.Do(req)
+	if err != nil {
+		ec.fail("proxied request: " + err.Error())
+	}
+	if resp.StatusCode != http.StatusOK {
+		ec.fail(fmt.Sprintf("proxied request = %d, want 200", resp.StatusCode))
+	}
+	_ = resp.Body.Close()
+
+	// 2) The injection attempt: a newline plus a complete forged log line,
+	//    percent-encoded so the request line itself stays legal. Caddy
+	//    decodes it into the path it logs; the JSON encoder must keep it
+	//    trapped inside that one string value on one physical line.
+	evil, err := http.NewRequest(http.MethodGet,
+		proxy+"/p/%0A%7B%22level%22%3A%22critical%22%2C%22msg%22%3A%22forged-line%22%7D?q=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil.Host = host
+	resp, err = client.Do(evil)
+	if err != nil {
+		ec.fail("hostile path request: " + err.Error())
+	}
+	_ = resp.Body.Close()
+
+	// 3) An unknown Host: the catch-all 421, logged with origin "-".
+	if code, _ := edgeDo(t, client, ec.httpPort, false, "stranger.example.test", ""); code != http.StatusMisdirectedRequest {
+		ec.fail(fmt.Sprintf("unknown host = %d, want 421", code))
+	}
+
+	b, err := os.ReadFile(cfg.CaddyAccessLog)
+	if err != nil {
+		ec.fail("read access log: " + err.Error())
+	}
+	raw := string(b)
+	rows := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	if len(rows) != 3 {
+		ec.fail(fmt.Sprintf("access log has %d lines, want exactly 3 (a forged line would add to this):\n%s", len(rows), raw))
+	}
+	// The secrets are gone — values AND header names, the injected payload's
+	// level too ("info" is the only level these requests produce).
+	for _, poison := range []string{
+		secretAuth, secretCookie, secretSetCookie,
+		"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+		`"level":"critical"`,
+	} {
+		if strings.Contains(raw, poison) {
+			ec.fail(fmt.Sprintf("access log leaks %q:\n%s", poison, raw))
+		}
+	}
+
+	var lines []map[string]any
+	for i, row := range rows {
+		m := map[string]any{}
+		if err := json.Unmarshal([]byte(row), &m); err != nil {
+			ec.fail(fmt.Sprintf("access-log line %d is not ONE valid json object: %v\n%s", i+1, err, row))
+		}
+		lines = append(lines, m)
+	}
+	serving, injected, refused := lines[0], lines[1], lines[2]
+
+	get := func(m map[string]any, key string) any {
+		v, ok := m[key]
+		if !ok {
+			ec.fail(fmt.Sprintf("access line lacks %q: %v", key, m))
+		}
+		return v
+	}
+	str := func(m map[string]any, key, why string) string {
+		s, ok := get(m, key).(string)
+		if !ok || s == "" {
+			ec.fail(fmt.Sprintf("access line %s is absent/empty: %v (%s)", key, m, why))
+		}
+		return s
+	}
+	// The fields item 6 promises, on the served line: time (caddy ts),
+	// status/size/duration/remote_ip native, and the three appended ones.
+	_ = get(serving, "ts").(float64)
+	if v, _ := get(serving, "status").(float64); v != 200 {
+		ec.fail(fmt.Sprintf("served line status = %v, want 200", serving["status"]))
+	}
+	if _, ok := serving["size"].(float64); !ok {
+		ec.fail("served line has no size")
+	}
+	if _, ok := serving["duration"].(float64); !ok {
+		ec.fail("served line has no duration")
+	}
+	if ip, _ := get(serving, "request").(map[string]any); ip["remote_ip"] != "127.0.0.1" {
+		ec.fail(fmt.Sprintf("served line client ip = %v, want 127.0.0.1", ip["remote_ip"]))
+	}
+	if m := str(serving, "request_id", "appended"); !strings.Contains(m, "-") {
+		ec.fail("request_id is not a uuid-shaped string: " + m)
+	}
+	wantOrigin := "http://" + originAddr // originKey of the snapshot's origin
+	if got := str(serving, "origin", "appended"); got != wantOrigin {
+		ec.fail(fmt.Sprintf("served line origin = %q, want %q", got, wantOrigin))
+	}
+	// path: no query — the QUERYMARK from the request only rides caddy's
+	// native uri field, never the appended path.
+	if p := serving["path"]; p != "/docs" {
+		ec.fail(fmt.Sprintf("served line path = %v, want /docs (no query)", p))
+	}
+	if u, _ := serving["request"].(map[string]any); !strings.Contains(u["uri"].(string), "QUERYMARK-9") {
+		ec.fail("the native uri field lost the query — the debug path regressed")
+	}
+
+	// The injected path: still exactly one line, its newline escaped; status
+	// is the proxied 200 and the request_id differs from the first request
+	// (caddy's per-request uuid really is per-request).
+	if v, _ := get(injected, "status").(float64); v != 200 {
+		ec.fail(fmt.Sprintf("injected line status = %v, want 200", injected["status"]))
+	}
+	if p, _ := injected["path"].(string); !strings.HasPrefix(p, "/p/\n") {
+		ec.fail(fmt.Sprintf("injected line path = %q, want the decoded newline kept INSIDE the string", p))
+	}
+	if str(injected, "request_id", "appended") == str(serving, "request_id", "appended") {
+		ec.fail("request_id collided between two requests")
+	}
+
+	// Catch-all: 421, origin "-" (no origin reached), and the same shape.
+	if v, _ := get(refused, "status").(float64); v != 421 {
+		ec.fail(fmt.Sprintf("catch-all line status = %v, want 421", refused["status"]))
+	}
+	if got := refused["origin"]; got != "-" {
+		ec.fail(fmt.Sprintf("catch-all origin = %v, want \"-\"", got))
+	}
+	if h, _ := refused["request"].(map[string]any); h["host"] != "stranger.example.test" {
+		ec.fail(fmt.Sprintf("catch-all line host = %v, want stranger.example.test", h["host"]))
 	}
 }

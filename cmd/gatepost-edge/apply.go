@@ -127,12 +127,13 @@ func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document) error {
 		return fmt.Errorf("egress forwarder swap: %w", err)
 	}
 	cfgBytes, err := Generate(d, CaddyParams{
-		HTTPAddr:    p.cfg.CaddyHTTP,
-		HTTPSAddr:   p.cfg.CaddyHTTPS,
-		AdminAddr:   p.cfg.CaddyAdmin,
-		EgressPorts: ports,
-		AskURL:      p.cfg.AskURL,
-		Issuer:      p.cfg.Issuer,
+		HTTPAddr:      p.cfg.CaddyHTTP,
+		HTTPSAddr:     p.cfg.CaddyHTTPS,
+		AdminAddr:     p.cfg.CaddyAdmin,
+		EgressPorts:   ports,
+		AskURL:        p.cfg.AskURL,
+		Issuer:        p.cfg.Issuer,
+		AccessLogPath: p.cfg.CaddyAccessLog,
 	})
 	if err != nil {
 		return err

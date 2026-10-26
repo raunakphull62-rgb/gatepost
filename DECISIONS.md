@@ -234,3 +234,56 @@ remove`), safe now that nothing hands it the unit's own lifecycle.
 **Why.** A firewall whose persistence mechanism disables itself during a
 clean shutdown looks enabled in the repo while the box boots unprotected.
 
+## 2026-10-26 — The egress chain never filters reply traffic, and access logs are caddy config, not edge code (B3b item 6)
+
+**Reply rule.** The FIRST rule of `GATEPOST-EGRESS` (v4 and v6) is
+`conntrack ESTABLISHED,RELATED → RETURN`. The original chain filtered
+every packet from the edge subnet, including the reply legs of
+connections the HOST initiated — with the firewall applied, every
+host-published edge port (8081/8445) hung: the docker-proxy/DNAT return
+packet (`src 172.28.0.2 → dst 172.28.0.1`) matched the host-IP pin
+`REJECT` and died. Kernel-tracked reply state is not an address the edge
+mints; NEW connections it initiates stay filtered. Found by hitting the
+published port from the host while the demo'd access logging was live
+(from inside the container everything looked fine).
+
+**Access logging.** Structured edge access logs are CADDY CONFIG, not
+edge code — zero changes to the caddy image, no new process:
+
+  - one `logging.logs.http.log.access` custom log, file writer rolled at
+    10 MB × 5 (caddy MkdirAll's the dir), and the key can never be
+    `default` — that is caddy's GLOBAL runtime logger, and defining it
+    redirects all runtime logs into the access file (the real-caddy e2e
+    caught this). The `include: ["http.log.access"]` guard keeps runtime
+    lines (admin.api, tls) out.
+  - a `filter` encoder wrapping `json` DELETES the credential headers by
+    name — `request>headers>Authorization`,
+    `request>headers>Proxy-Authorization`, `request>headers>Cookie`,
+    `resp_headers>Set-Cookie`, `resp_headers>Proxy-Authorization`, and
+    the auto-added top-level `uuid` duplicate of the referenced
+    `{http.request.uuid}`. Deletion, not caddy's default `REDACTED`
+    mask: "never log" is stricter than "never leak", and no name or
+    shape of the credential survives in the line.
+  - per-route `http.handlers.vars` stamps the origin identity
+    (`gatepost_origin`); `http.handlers.log_append` (late-evaluated on
+    the way back up) appends `request_id` (caddy's per-request uuid),
+    `path` (`{http.request.uri.path}` — no query; the query stays in
+    caddy's native `uri` field) and `origin` (the vars value; the
+    catch-all logs the constant `-`). A path percent-encoding a newline
+    + a whole forged `{"level":"critical"}` payload stays ONE JSON
+    string in ONE physical line (zap escapes it; proven in the e2e and
+    live on the box).
+  - the poller names the destination (`GP_EDGE_ACCESS_LOG`, default
+    `data/logs/access.json`; empty = logging off — the knob flows into
+    every generated config); docker stdout/stderr rotations live in
+    compose (`json-file` 10m × 3 on edge and poller).
+  - repeated IDENTICAL failure lines are throttled per brand
+    (`GP_EDGE_ERROR_LOG_GAP`, default 30s): a down API would otherwise
+    write one line per poll tick forever. First line always passes; the
+    backoff-cap crossing is announced exactly once per outage; recovery
+    lines (`applied snapshot …`) are never throttled.
+
+**Why.** A log that leaks credentials or can be forged by the thing it
+observes is worse than no log; a poller that logs 86,400 identical lines
+a day hides the one line that matters.
+
