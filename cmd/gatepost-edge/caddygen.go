@@ -234,17 +234,27 @@ func originKey(o snapshot.Origin) string {
 // ---- access logging (B3b item 6) --------------------------------------------
 //
 // One JSON line per request to LogPath, via caddy's own pieces — no code on
-// the edge beyond config: the file writer rolls so the disk cannot fill, the
-// `filter` encoder deletes the credential headers BY NAME (an unattended
-// marker would leak nothing, but "never log" is stricter than "never leak"),
-// and per-route `log_append` middlewares add the fields caddy's default log
-// lacks: request_id (caddy's per-request uuid — generated lazily and cached
-// per request), path (the URI path sans query; the hostile part of the URL
-// stayed a single JSON string value in item 3, and it stays one here — zap's
-// JSON encoder escapes it, so a newline in a path cannot forge a new line)
-// and origin (the vars handler stamps each site's origin identity; log_append
-// reads it back on the way up). Authorization bodies are never in access
-// logs; nothing asks for {http.request.body}.
+// the edge beyond config. Policy (source-verified against caddy 2.11.7):
+//
+//   - NO request or response headers are logged at all: the filter encoder
+//     deletes the whole request>headers and resp_headers objects (AddObject
+//     matches the nested path and drops the object itself — safer than a
+//     credential deny-list, which drifts the first time a new
+//     credential-bearing header name appears). Cookie, Authorization and
+//     Referer therefore never reach the file, under any name.
+//   - NO query strings anywhere: caddy's native request>uri is deleted; the
+//     appended `path` field is {http.request.uri.path}, the query-free form.
+//   - the file writer rolls so the disk cannot fill.
+//   - per-route `log_append` middlewares add the fields caddy's default log
+//     lacks: request_id (caddy's per-request uuid — generated lazily and
+//     cached per request), path (the URI path sans query; the hostile part
+//     of the URL stayed a single JSON string value in item 3, and it stays
+//     one here — zap's JSON encoder escapes it, so a newline in a path
+//     cannot forge a new line), user_agent (the ONE header value the item
+//     keeps, read from the request) and origin (the vars handler stamps each
+//     site's origin identity; log_append reads it back on the way up).
+//     Authorization bodies are never in access logs; nothing asks for
+//     {http.request.body}.
 
 type caddyServerLogs struct{} // {} = log to the default logger via server.Logs
 
@@ -257,9 +267,12 @@ type caddyCustomLog struct {
 	// server access logger is "http.log.access" (the http app's logger, a
 	// Named("log.access")). Without it the custom core would accept every
 	// entry caddy produces — runtime lines (admin.api, tls) would flood the
-	// access file. The key must not be "default": that is caddy's GLOBAL
-	// runtime logger, and defining it redirects stderr into the access file.
-	Include []string               `json:"include,omitempty"`
+	// access file.
+	Include []string `json:"include,omitempty"`
+	// Exclude refuses logger-name prefixes (see the "default" entry in
+	// accessLogging). The access log itself never needs one: its Include
+	// is already exclusive.
+	Exclude []string               `json:"exclude,omitempty"`
 	Writer  *caddyLogWriter        `json:"writer,omitempty"`
 	Encoder *caddyLogFilterEncoder `json:"encoder,omitempty"`
 }
@@ -302,16 +315,15 @@ type logAppendHandler struct {
 
 const originVar = "gatepost_origin"
 
-// accessLogPaths: every path the filter encoder deletes, and why. Proxy-
-// Authorization rides along: caddy already treats it as a credential.
+// accessLogDeletes: every path the filter encoder deletes, and why. The two
+// header objects go WHOLE — no request or response header is ever logged,
+// so no deny-list can drift behind a new credential-bearing name.
 func accessLogDeletes() map[string]caddyLogFieldDelete {
 	return map[string]caddyLogFieldDelete{
-		"uuid":                                {Filter: "delete"}, // caddy auto-adds `uuid` when the placeholder is referenced; request_id is the named duplicate
-		"request>headers>Authorization":       {Filter: "delete"},
-		"request>headers>Proxy-Authorization": {Filter: "delete"},
-		"request>headers>Cookie":              {Filter: "delete"},
-		"resp_headers>Set-Cookie":             {Filter: "delete"},
-		"resp_headers>Proxy-Authorization":    {Filter: "delete"},
+		"uuid":            {Filter: "delete"}, // caddy auto-adds `uuid` when the placeholder is referenced; request_id is the named duplicate
+		"request>uri":     {Filter: "delete"}, // the full URI carries the query string; `path` below is the query-free form
+		"request>headers": {Filter: "delete"}, // no request headers at all (Authorization, Cookie, Referer, …)
+		"resp_headers":    {Filter: "delete"}, // no response headers at all (Set-Cookie, …)
 	}
 }
 
@@ -321,6 +333,7 @@ func logAppendsOnce(originValue string) []any {
 	return []any{
 		logAppendHandler{Handler: "log_append", Key: "request_id", Value: "{http.request.uuid}"},
 		logAppendHandler{Handler: "log_append", Key: "path", Value: "{http.request.uri.path}"},
+		logAppendHandler{Handler: "log_append", Key: "user_agent", Value: "{http.request.header.User-Agent}"},
 		logAppendHandler{Handler: "log_append", Key: "origin", Value: originValue},
 	}
 }
@@ -362,7 +375,7 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		// sees it), then — when logging is on — the vars stamp for the
 		// origin identity and the extra log fields. Each log_append runs on
 		// the way back up after the proxy, exactly where its values exist.
-		handle := make([]any, 0, 6)
+		handle := make([]any, 0, 8)
 		if logged {
 			handle = append(handle, map[string]any{
 				"handler": "vars",
@@ -421,7 +434,7 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 	// Catch-all LAST: every Host the routes above do not claim — and every
 	// TLS handshake completed via the fallback cert — answers 421. With
 	// logging on, its lines carry origin "-" (no origin is reached).
-	catch := make([]any, 0, 4)
+	catch := make([]any, 0, 5)
 	if logged {
 		catch = append(catch, logAppendsOnce("-")...)
 	}
@@ -496,8 +509,8 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 }
 
 // accessLogging: the logging app the /load config carries — nil when the
-// path is empty (access logging off). One log, "default": rolled file writer
-// + the filter-wrapped json encoder that strips credentials by name.
+// path is empty (access logging off). One log: rolled file writer + the
+// filter-wrapped json encoder that deletes the URI and both header objects.
 func accessLogging(path string) *caddyLogging {
 	if path == "" {
 		return nil
@@ -516,6 +529,20 @@ func accessLogging(path string) *caddyLogging {
 				Wrap:   &caddyLogJSONEncoder{Format: "json"},
 				Fields: accessLogDeletes(),
 			},
+		},
+		// The default logger is caddy's GLOBAL runtime log (stderr — the
+		// container log). Its include/exclude-less shape matches EVERY
+		// module, so caddy tees each access entry to it TOO, unfiltered:
+		// the file is clean while stderr still carries every query string
+		// and header (probed against 2.11.7). Redefining "default" with
+		// ONLY an exclude keeps its vanilla shape — a nil writer, encoder
+		// and level all provision to exactly stderr + production JSON +
+		// Info — minus the access twins. Runtime lines (admin, tls, http
+		// errors) are unaffected: only the http.log.access* prefix is
+		// refused. Never point this entry at the access file: that
+		// redirects ALL of caddy's stderr there.
+		"default": {
+			Exclude: []string{"http.log.access"},
 		},
 	}}
 }

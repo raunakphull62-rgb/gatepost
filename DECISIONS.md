@@ -287,3 +287,42 @@ edge code — zero changes to the caddy image, no new process:
 observes is worse than no log; a poller that logs 86,400 identical lines
 a day hides the one line that matters.
 
+## 2026-10-26 — Access logs log no headers and no URI at all, and the default logger is redefined to keep them off stderr (item 6 correction)
+
+**What.** The generated logging config deletes three things whole:
+`request>headers`, `resp_headers` and `request>uri` (plus the auto-added
+`uuid` duplicate). The only header value that survives is `user_agent`,
+appended deliberately via `log_append`. Separately, the config now
+defines a `default` log with exactly one key — `exclude:
+["http.log.access"]`.
+
+**Why.** The first half is the correction's rule made structural: a
+credential deny-list only holds until the next credential-bearing header
+name appears, and caddy's native `uri` is the only field a query string
+can ride. Deleting the objects (not masking names) makes "never logged"
+a property of the shape, not of a list. Source-verified against caddy
+2.11.7: the filter encoder's `AddObject` matches the nested path and
+drops the object itself.
+
+The second half closes a leak the deny-list era could never see: caddy
+tees every log entry to every custom log whose include/exclude matches —
+and the DEFAULT log, shapeless, matches everything. The access FILE was
+filtered; caddy's stderr — the edge container's docker json-file log —
+received an unfiltered twin of every access entry, query strings and
+headers included (standalone probe against 2.11.7: file filtered, stderr
+carrying `?token=SECRET123&code=abc` and `X-Api-Key`). Redefining
+`default` with only an exclude keeps provision's vanilla fallbacks
+(nil writer → stderr, nil encoder → production JSON, Info level) so
+runtime lines (admin, tls, http errors) still flow, while the per-entry
+`filteringCore` refuses the `http.log.access*` prefix. Defining `default`
+is safe exactly because it names no writer: the earlier trap — naming it
+`default` with the FILE writer — redirected all of caddy's stderr into
+the access file.
+
+**Evidence.** E2E with real caddy: the correction's query request and
+four credential headers leave no value or name in the file; every line
+structurally lacks `uri`/`headers`/`resp_headers`; `user_agent` present;
+and the harness's captured caddy stderr contains zero access entries
+while runtime lines persist. `scripts/edge-accept.sh` (item 7) sweeps
+the production file and the production container log the same way.
+

@@ -179,6 +179,28 @@ session is running (`ps` shows only this harness's server).
   docker-restart persistence re-proven; nodes-demo's `grep -c "$NTOK"`
   ate a leading-dash token as an option (-e added). Regress 6/6 with the
   firewall applied and the poller running.
+- **Correction set (separate commit `09ec972`)**: no query strings
+  anywhere and NO header logging at all. The filter encoder now deletes
+  the whole `request>headers` and `resp_headers` objects (caddy's
+  `AddObject` matches the nested path and drops the object itself —
+  verified against 2.11.7's filter.go; the old per-name deny-list could
+  drift behind any new credential-bearing header) plus caddy's native
+  `request>uri` (the query's only carrier); `user_agent`
+  (`{http.request.header.User-Agent}`) is the one header value kept, via
+  `log_append`. Probing 2.11.7 also exposed that caddy tees EVERY access
+  entry to the DEFAULT logger unfiltered — the file was clean while the
+  edge container's stderr (docker's json-file log) still carried every
+  query string and header; the generated config now redefines `default`
+  with only `exclude: ["http.log.access"]` (vanilla stderr shape minus
+  the twins — runtime lines unaffected; standalone probe: 0 access
+  lines on stderr, 18 runtime lines intact). E2E sweeps
+  `?token=SECRET123&code=abc` (values, `token=`, `code=`, and the short
+  `abc` after scrubbing caddy's random uuids — the only
+  non-deterministic field), X-Api-Key/Cookie/Authorization/Referer
+  names+values, asserts `uri`/`headers`/`resp_headers` are structurally
+  ABSENT from every line, user_agent present, and — via the captured
+  caddy stderr — that no access entry reaches stderr at all. Goldens
+  regenerated; race suite green.
 - Next: item 7 (edge WAF — coraza) or as asked; awaiting the user's go
   before touching item 7.
 

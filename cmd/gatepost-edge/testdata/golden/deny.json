@@ -43,6 +43,11 @@
                 },
                 {
                   "handler": "log_append",
+                  "key": "user_agent",
+                  "value": "{http.request.header.User-Agent}"
+                },
+                {
+                  "handler": "log_append",
                   "key": "origin",
                   "value": "-"
                 },
@@ -88,6 +93,11 @@
   },
   "logging": {
     "logs": {
+      "default": {
+        "exclude": [
+          "http.log.access"
+        ]
+      },
       "http.log.access": {
         "include": [
           "http.log.access"
@@ -104,19 +114,13 @@
             "format": "json"
           },
           "fields": {
-            "request\u003eheaders\u003eAuthorization": {
+            "request\u003eheaders": {
               "filter": "delete"
             },
-            "request\u003eheaders\u003eCookie": {
+            "request\u003euri": {
               "filter": "delete"
             },
-            "request\u003eheaders\u003eProxy-Authorization": {
-              "filter": "delete"
-            },
-            "resp_headers\u003eProxy-Authorization": {
-              "filter": "delete"
-            },
-            "resp_headers\u003eSet-Cookie": {
+            "resp_headers": {
               "filter": "delete"
             },
             "uuid": {

@@ -428,6 +428,7 @@ type edgeCaddy struct {
 	httpPort  int
 	httpsPort int
 	dataDir   string // XDG_DATA_HOME: caddy's local CA and issued certs
+	logPath   string // caddy's captured stderr (runtime +, unguarded, access twins)
 	fail      func(what string)
 }
 
@@ -454,6 +455,7 @@ func startEdgeCaddy(t *testing.T, extraEnv ...string) edgeCaddy {
 		t.Fatal(err)
 	}
 	caddyLog := filepath.Join(tmp, "caddy.log")
+	ec.logPath = caddyLog
 	logf, err := os.Create(caddyLog)
 	if err != nil {
 		t.Fatal(err)
@@ -633,28 +635,40 @@ func TestEdgeOnDemandTLS(t *testing.T) {
 }
 
 // secret values a request may carry; the access log must contain NONE of
-// them (values AND header names are deleted, not just masked).
+// them (values AND header names, under ANY name — headers are not logged at
+// all, and no query string survives anywhere).
 const (
 	secretAuth      = "Bearer tr0ub4dor-SUPERSECRET-AUTH"
 	secretCookie    = "session=TOPSECRET-COOKIE-VALUE"
 	secretSetCookie = "dough=CLASSIFIED-SET-COOKIE"
+	secretAPIKey    = "KEY-CLASSIFIED-API-9999"
+	secretReferer   = "http://tracker.example.test/r?sid=REFSECRET-42"
 	forgedPayload   = `{"level":"critical","msg":"forged-line"}` // log-injection attempt
+	testUA          = "gatepost-e2e-ua/1.0"
+	// the query the user's item-6 correction pins: neither value may appear.
+	queryToken = "SECRET123"
+	queryCode  = "abc"
 )
 
 // TestEdgeAccessLogs — item 6's evidence with a REAL caddy: the applied
 // config's logging app writes ONE json line per request to
 // cfg.CaddyAccessLog (the file writer even creates its nested directory),
-// and the filter encoder drops the credential headers by name. Proven here:
+// and NO header or query ever reaches the file. Proven here:
 //
-//   - neither the secret VALUES (Authorization, Cookie, Set-Cookie) nor their
-//     header NAMES appear anywhere in the file;
+//   - neither the secret VALUES (Authorization, Cookie, X-Api-Key, Referer,
+//     Set-Cookie, the ?token=SECRET123&code=abc query) nor their header NAMES
+//     appear anywhere in the file, under any field name;
+//   - the request>uri field (caddy's native query carrier) and the whole
+//     request>headers / resp_headers objects are ABSENT from every line —
+//     structurally gone, not masked;
 //   - a path percent-encoding a newline plus a whole forged `{"level":...}`
 //     payload stays ONE JSON string inside ONE physical line (zap escapes it;
 //     no line can be forged, the line count does not grow);
-//   - every appended field is present and shaped: request_id (caddy's uuid,
-//     distinct per request), path WITHOUT the query (the query lands only in
-//     caddy's native uri field), origin (the vars-stamped identity, "-" on
-//     the 421 catch-all), and the native status/size/duration/remote_ip.
+//   - every kept field is present and shaped: request_id (caddy's uuid,
+//     distinct per request), path WITHOUT the query, user_agent (the one
+//     header item 6 keeps), origin (the vars-stamped identity, "-" on the
+//     421 catch-all), and the native ts/status/size/duration/host/method/
+//     remote_ip.
 func TestEdgeAccessLogs(t *testing.T) {
 	caddyPath := caddyBin()
 	if _, err := exec.LookPath(caddyPath); err != nil {
@@ -713,15 +727,21 @@ func TestEdgeAccessLogs(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	proxy := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(ec.httpPort))
 
-	// 1) A well-behaved request carrying BOTH credential headers, plus a
-	//    query (the `path` field must come out without it).
-	req, err := http.NewRequest(http.MethodGet, proxy+"/docs?page=QUERYMARK-9", nil)
+	// 1) A well-behaved request carrying every hostile input at once: the
+	//    correction's query (?token=SECRET123&code=abc), all four
+	//    credential-bearing headers, and a Referer — none of which may
+	//    reach the log. The fixed User-Agent is the one header value that
+	//    MUST appear (as the appended user_agent field).
+	req, err := http.NewRequest(http.MethodGet, proxy+"/docs?token="+queryToken+"&code="+queryCode, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Host = host
+	req.Header.Set("User-Agent", testUA)
 	req.Header.Set("Authorization", secretAuth)
 	req.Header.Set("Cookie", secretCookie)
+	req.Header.Set("X-Api-Key", secretAPIKey)
+	req.Header.Set("Referer", secretReferer)
 	resp, err := client.Do(req)
 	if err != nil {
 		ec.fail("proxied request: " + err.Error())
@@ -761,11 +781,13 @@ func TestEdgeAccessLogs(t *testing.T) {
 	if len(rows) != 3 {
 		ec.fail(fmt.Sprintf("access log has %d lines, want exactly 3 (a forged line would add to this):\n%s", len(rows), raw))
 	}
-	// The secrets are gone — values AND header names, the injected payload's
-	// level too ("info" is the only level these requests produce).
+	// The secrets are gone — values AND header names, the correction's two
+	// query values, the injected payload's level too ("info" is the only
+	// level these requests produce).
 	for _, poison := range []string{
-		secretAuth, secretCookie, secretSetCookie,
-		"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+		secretAuth, secretCookie, secretSetCookie, secretAPIKey, secretReferer,
+		queryToken, "code=" + queryCode, "token=", "q=1",
+		"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "X-Api-Key", "Referer",
 		`"level":"critical"`,
 	} {
 		if strings.Contains(raw, poison) {
@@ -812,6 +834,9 @@ func TestEdgeAccessLogs(t *testing.T) {
 	if ip, _ := get(serving, "request").(map[string]any); ip["remote_ip"] != "127.0.0.1" {
 		ec.fail(fmt.Sprintf("served line client ip = %v, want 127.0.0.1", ip["remote_ip"]))
 	}
+	if ip, _ := serving["request"].(map[string]any); ip["method"] != "GET" || ip["host"] != host {
+		ec.fail(fmt.Sprintf("served line method/host = %v/%v, want GET/%s", ip["method"], ip["host"], host))
+	}
 	if m := str(serving, "request_id", "appended"); !strings.Contains(m, "-") {
 		ec.fail("request_id is not a uuid-shaped string: " + m)
 	}
@@ -819,13 +844,14 @@ func TestEdgeAccessLogs(t *testing.T) {
 	if got := str(serving, "origin", "appended"); got != wantOrigin {
 		ec.fail(fmt.Sprintf("served line origin = %q, want %q", got, wantOrigin))
 	}
-	// path: no query — the QUERYMARK from the request only rides caddy's
-	// native uri field, never the appended path.
+	// path: no query — neither query value may ride ANY field; caddy's
+	// native request>uri (the query's only carrier) is deleted by the
+	// filter, and the appended path is the query-free form.
 	if p := serving["path"]; p != "/docs" {
 		ec.fail(fmt.Sprintf("served line path = %v, want /docs (no query)", p))
 	}
-	if u, _ := serving["request"].(map[string]any); !strings.Contains(u["uri"].(string), "QUERYMARK-9") {
-		ec.fail("the native uri field lost the query — the debug path regressed")
+	if got := str(serving, "user_agent", "the one header value item 6 keeps"); got != testUA {
+		ec.fail(fmt.Sprintf("served line user_agent = %q, want %q", got, testUA))
 	}
 
 	// The injected path: still exactly one line, its newline escaped; status
@@ -841,6 +867,47 @@ func TestEdgeAccessLogs(t *testing.T) {
 		ec.fail("request_id collided between two requests")
 	}
 
+	// No header logging AT ALL and no query carrier, under any name: every
+	// line's request object lacks `headers` and `uri`, and no line carries
+	// resp_headers — deleted whole by the filter, not masked.
+	for i, m := range lines {
+		reqm, _ := m["request"].(map[string]any)
+		for _, gone := range []string{"headers", "uri"} {
+			if _, ok := reqm[gone]; ok {
+				ec.fail(fmt.Sprintf("access line %d still carries request>%s — it must be deleted whole:\n%v", i+1, gone, m))
+			}
+		}
+		if _, ok := m["resp_headers"]; ok {
+			ec.fail(fmt.Sprintf("access line %d still carries resp_headers:\n%v", i+1, m))
+		}
+	}
+
+	// The short query value gets the strictest sweep: everything logged here
+	// is deterministic EXCEPT caddy's random uuids, so scrub the
+	// request_ids first — "abc" anywhere else would be a real leak.
+	scrubbed := raw
+	for _, m := range lines {
+		if id, ok := m["request_id"].(string); ok {
+			scrubbed = strings.ReplaceAll(scrubbed, id, "")
+		}
+	}
+	if strings.Contains(scrubbed, queryCode) {
+		ec.fail(fmt.Sprintf("access log leaks the query value %q:\n%s", queryCode, raw))
+	}
+
+	// The stderr twin must be DEAD: caddy tees every access entry to the
+	// default (stderr) logger as well — the file was clean while the
+	// container log still carried every query string and header (probed
+	// against 2.11.7). The generated config redefines "default" with an
+	// exclude, so not one access entry may appear on stderr.
+	stderr, err := os.ReadFile(ec.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stderr), `"msg":"handled request"`) {
+		ec.fail(fmt.Sprintf("access entries leaked to caddy's stderr (the container log):\n%s", stderr))
+	}
+
 	// Catch-all: 421, origin "-" (no origin reached), and the same shape.
 	if v, _ := get(refused, "status").(float64); v != 421 {
 		ec.fail(fmt.Sprintf("catch-all line status = %v, want 421", refused["status"]))
@@ -848,6 +915,9 @@ func TestEdgeAccessLogs(t *testing.T) {
 	if got := refused["origin"]; got != "-" {
 		ec.fail(fmt.Sprintf("catch-all origin = %v, want \"-\"", got))
 	}
+	// edgeDo's client sends Go's default User-Agent, so presence — not the
+	// value — is what the catch-all chain proves here.
+	_ = str(refused, "user_agent", "appended on the catch-all chain too")
 	if h, _ := refused["request"].(map[string]any); h["host"] != "stranger.example.test" {
 		ec.fail(fmt.Sprintf("catch-all line host = %v, want stranger.example.test", h["host"]))
 	}
