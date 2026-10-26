@@ -154,9 +154,15 @@ remove_rules() {
 
 install_rules() {
   local addr
-  # The API allowlist FIRST: it is private (dev server), so it must precede
-  # the 172.16/12 block below it.
   run iptables -N "$CHAIN"
+  # REPLY TRAFFIC FIRST: the edge's responses to connections the host (its
+  # docker-proxy, DNAT) or the network initiated are kernel-tracked state and
+  # must never be filtered — without this the published host ports (8081/8445)
+  # hang, because every reply packet with dst on the host matches the host-IP
+  # pin rules below. NEW connections the edge initiates stay filtered.
+  run iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  # The API allowlist NEXT: it is private (dev server), so it must precede
+  # the 172.16/12 block below it.
   run iptables -A "$CHAIN" -p tcp -d "$API_IP" --dport "$API_PORT" -j ACCEPT
   for range in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 \
                100.64.0.0/10 127.0.0.0/8; do
@@ -175,6 +181,7 @@ install_rules() {
   # means these are inert there today — they hold the line if v6 ever lands.
   if command -v ip6tables >/dev/null 2>&1; then
     run ip6tables -N "$CHAIN"
+    run ip6tables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
     run ip6tables -A "$CHAIN" -d ::ffff:0:0/96 -j REJECT  # v4-mapped, as in egress.go
     run ip6tables -A "$CHAIN" -d fc00::/7 -j REJECT
     run ip6tables -A "$CHAIN" -d fe80::/10 -j REJECT

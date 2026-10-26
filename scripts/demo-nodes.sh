@@ -105,7 +105,7 @@ check "node minted (201)" "$(codeof "$OUT")" "201"
 NODE_BODY=$(bodyof "$OUT")
 NTOK=$(printf '%s' "$NODE_BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 NID=$(printf '%s' "$NODE_BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["id"])')
-check "the mint reply carries the token exactly once" "$(printf '%s' "$NODE_BODY" | grep -c "$NTOK")" "1"
+check "the mint reply carries the token exactly once" "$(printf '%s' "$NODE_BODY" | grep -ce "$NTOK")" "1"
 check "re-mint of the same name refused (409)" "$(codeof "$(cb -X POST "$BASE/v1/nodes" -H 'Content-Type: application/json' -d "{\"name\":\"demo-edge-$TS\",\"role\":\"edge\"}")")" "409"
 
 # --- isolation: the two principal families do not cross (mutual 401s) ---
@@ -184,7 +184,7 @@ check "If-None-Match on the current generation → 304" "$(codeof "$(cbn -H "If-
 # --- heartbeat: only a generation that exists is stamped, on the roster too ---
 check "heartbeat generation $GEN2 → 200" "$(codeof "$(cbn -X POST "$BASE/node/v1/heartbeat" -H 'Content-Type: application/json' -d "{\"generation\":$GEN2}")")" "200"
 check "the roster stamps applied_version $GEN2" "$(bodyof "$(cb "$BASE/v1/nodes")" | grep -c "\"applied_version\":$GEN2")" "1"
-check "the roster carries no token material" "$(bodyof "$(cb "$BASE/v1/nodes")" | grep -c "$NTOK")" "0"
+check "the roster carries no token material" "$(bodyof "$(cb "$BASE/v1/nodes")" | grep -ce "$NTOK")" "0"
 check "heartbeat of an unknown generation refused (400)" "$(codeof "$(cbn -X POST "$BASE/node/v1/heartbeat" -H 'Content-Type: application/json' -d "{\"generation\":$((GEN2 + 999999))}")")" "400"
 check "heartbeat of a zero generation refused (400)" "$(codeof "$(cbn -X POST "$BASE/node/v1/heartbeat" -H 'Content-Type: application/json' -d '{"generation":0}')")" "400"
 
