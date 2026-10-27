@@ -17,6 +17,16 @@ services:
       - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # certificates (item 4) survive restarts
       - caddy_config:/config  # Caddy's own persisted state
+    # BOTH networks: the default (pinned 172.28.0.0/24) carries the
+    # published ports, and `origin` hosts the item-7 test origin. The
+    # origin network squats 192.88.99.0/24 — the deprecated 6to4 relay
+    # anycast range (RFC 3068, returned to IANA by RFC 7526): public to
+    # the API's SSRF rules (outside domains.forbidV4Nets, so a customer
+    # origin may point at it) while its traffic never leaves the host.
+    # Edge -> origin-test is same-bridge L2: it never traverses FORWARD,
+    # so DOCKER-USER/the egress firewall is not even consulted (and the
+    # range is public, so the firewall would pass it anyway).
+    networks: [default, origin]
     # Container stdout/stderr logs: capped rotation (item 6). The edge's
     # structured ACCESS logs go to files on caddy_data (the poller's
     # GP_EDGE_ACCESS_LOG, wrapped by caddy's own roll settings); this caps
@@ -71,6 +81,23 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Realistic test origin (item 7). Static IP so the API's origin records
+  # stay literal and deterministic across recreations.
+  origin-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.origin-test
+    image: gatepost-origin-test:dev
+    restart: unless-stopped
+    networks:
+      origin:
+        ipv4_address: 192.88.99.10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   caddy_data:
   caddy_config:
@@ -88,3 +115,13 @@ networks:
       config:
         - subnet: 172.28.0.0/24
           gateway: 172.28.0.1
+  # The item-7 origin network: 192.88.99.0/24 is outside forbidV4Nets (see
+  # the edge service comment for why this range), pinned name + subnet for
+  # the same reasons as the default network.
+  origin:
+    driver_opts:
+      com.docker.network.bridge.name: br-gporigin
+    ipam:
+      config:
+        - subnet: 192.88.99.0/24
+          gateway: 192.88.99.1

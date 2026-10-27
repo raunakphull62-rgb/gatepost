@@ -202,6 +202,47 @@ session is running (`ps` shows only this harness's server).
   caddy stderr — that no access entry reaches stderr at all. Goldens
   regenerated; race suite green.
 - Next: item 7 (edge WAF — coraza) or as asked; awaiting the user's go
+
+## 2026-10-26 — item 7 correction context, then item 7 acceptance as ordered
+(user's order: acceptance first, coraza WAF AFTER the edge is accepted
+and tagged)
+
+- **Item 6 correction applied first** (`2e00962`, above): no query
+  strings anywhere (native `request>uri` deleted), NO header logging at
+  all (whole `request>headers`/`resp_headers` objects deleted),
+  `user_agent` the one kept header, and the stderr access twin found and
+  killed (redefine `default` with `exclude`).
+- **Boot shapes the acceptance exposed** (same commit as item 7):
+  `ensureDenyAll` — a tick that ends with nothing applied enqueues the
+  zero document so a no-snapshot cold start answers 421 on both
+  listeners instead of the bootstrap's localhost responder; and the
+  apply retry split — a `/load` transport failure (admin not up: the
+  joint cold-start race) opens NO cooldown window and retries every 2s,
+  a caddy REJECTION keeps the 60s pace. New tests:
+  `TestApplyColdStartNoSnapshotServesDenyAll`,
+  `TestApplyAdminNotUpRetriesFast` (both with the production cooldown).
+- **Origin fixture**: `deploy/dev/origin_test.py` + `Dockerfile.origin-test`
+  — python stdlib only, two listeners (9001/9002 so an origin change is
+  visible in every body), endpoints /ok /slow (2s) /big (5 MiB
+  streamed) /redirect (302 — the edge passes it through) /cookie
+  (Set-Cookie) /echo-headers (Host/XFF/method/UA/proto) /status/N and a
+  hand-framed /chunked. Runs on the pinned `origin` network
+  `192.88.99.0/24` (deprecated 6to4 anycast — public to CheckIP,
+  nothing real there; see DECISIONS.md) with the edge attached to both
+  networks; traffic is same-bridge L2.
+- **`scripts/edge-accept.sh`**: the a–j acceptance run against the real
+  compose stack, the real API (taken over on 172.17.0.1:8080 for the
+  run) and a node minted for the run; internal issuer for determinism
+  (GP_EDGE_ISSUER=internal via every compose call); fresh volumes at
+  setup so every access-log byte and cert belongs to the run. Findings
+  from the first run fixed in the same commit: the fixture's /cookie
+  sent the status line twice (double send_response), several check
+  curls quoted `'Host: $HOST'` literally (the requests hit the 421
+  catch-all as host "$HOST" — visible in the access log), busybox wget
+  prints the status line twice (-S dump + error line), the internal
+  fallback cert is SAN-only (empty subject), and `head -100` SIGPIPE'd
+  the script mid-sweep — the runner now tees untruncated.
+
   before touching item 7.
 
 ## Dev DB on this server

@@ -1,0 +1,7 @@
+# Realistic test origin (item 7 acceptance): stdlib-only python fixture
+# serving /ok /slow /big /redirect /cookie /echo-headers /status/N and a
+# chunked response on ports 9001 + 9002. See origin_test.py.
+FROM python:3.12-alpine
+COPY origin_test.py /origin_test.py
+EXPOSE 9001 9002
+ENTRYPOINT ["python3", "/origin_test.py"]

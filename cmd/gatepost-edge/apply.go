@@ -14,7 +14,9 @@
 //     fingerprint the server's versioning uses) — and at most once per
 //     ReloadCooldown (default 60s), with every later arrival collapsing into
 //     the newest pending document. A→B→A within one cooldown therefore
-//     reconciles without touching Caddy at all.
+//     reconciles without touching Caddy at all. A transport failure (the
+//     admin not answering yet — the joint cold-start race) retries after
+//     adminRetryDelay; a config caddy REJECTED retries at the cooldown pace.
 package main
 
 import (
@@ -23,10 +25,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"gatepost/internal/snapshot"
 )
+
+// adminRetryDelay: the retry pace when the caddy admin API is not answering
+// (a transport error) — short because the one real cause is the joint
+// cold-start race: the poller boots before caddy's admin listens, and the
+// edge must converge as soon as caddy is ready, not one cooldown later.
+const adminRetryDelay = 2 * time.Second
 
 // startApply builds the forwarder and the apply loop. Without CaddyAdmin
 // wired (tests / optional deployments), nothing here runs.
@@ -80,8 +89,13 @@ func (p *Poller) applyLoop(ctx context.Context) {
 }
 
 // stepApply performs at most one /load attempt (false = no pending work).
-// The cooldown gates EVERY attempt — success or failure — so a failing
-// edge retries at the same "once per 60s" pace it reloads with.
+// The cooldown gates every attempt caddy ANSWERED — success or rejection —
+// so a failing edge retries at the same "once per 60s" pace it reloads
+// with. A TRANSPORT error (caddy's admin not answering — the joint
+// cold-start race, the poller boots faster than caddy listens) opens no
+// cooldown window and retries after adminRetryDelay instead: an edge that
+// would otherwise sit denied for a cooldown must converge the moment its
+// caddy comes up.
 func (p *Poller) stepApply(ctx context.Context) bool {
 	p.mu.Lock()
 	pend, hash := p.pending, p.pendingHash
@@ -103,18 +117,30 @@ func (p *Poller) stepApply(ctx context.Context) bool {
 	}
 	err := p.applyCaddy(ctx, pend)
 	p.mu.Lock()
-	p.lastLoad = time.Now()
 	if err == nil {
 		p.pending = nil
 		p.appliedHash = hash
 	}
+	if err == nil || strings.HasPrefix(err.Error(), "caddy /load:") {
+		// The cooldown window opens only when caddy ANSWERED (accepted or
+		// rejected): a transport failure never reached caddy, so it opens
+		// no window — otherwise the head's cooldown check below would turn
+		// the fast admin-retry into a full cooldown wait.
+		p.lastLoad = time.Now()
+	}
 	p.mu.Unlock()
 	if err != nil {
 		p.log("error", "caddy apply FAILED — keeping the last-good config: %v", err)
+		// caddyLoad wraps every caddy ANSWER (a rejected config) in a
+		// "caddy /load:" error; anything else is a transport failure.
+		retryAfter := adminRetryDelay
+		if strings.HasPrefix(err.Error(), "caddy /load:") {
+			retryAfter = p.cfg.ReloadCooldown
+		}
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(p.cfg.ReloadCooldown): // retry at cooldown pace
+		case <-time.After(retryAfter):
 		}
 	}
 	return true

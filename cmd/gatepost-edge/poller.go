@@ -11,8 +11,8 @@
 //     tampered file means "no snapshot", never a crash
 //
 //   - cold start with the API unreachable applies the saved snapshot; with
-//     no saved snapshot the ask check serves nothing (421 for every host)
-//     while the loop keeps retrying
+//     no saved snapshot the deny-all shape is pushed to the edge (421 for
+//     every host, both listeners) while the loop keeps retrying
 //
 //   - poll errors back off exponentially (interval → 2^n) capped at
 //     GP_EDGE_BACKOFF_CAP, with jitter on every poll so two nodes never
@@ -232,6 +232,20 @@ func (p *Poller) tick(ctx context.Context) {
 		p.resetStreak()
 	case pollMalformed, pollUnauthorized, pollHTTPError, pollNetwork:
 		p.bumpStreak()
+	}
+	p.ensureDenyAll()
+}
+
+// ensureDenyAll pushes the deny-all shape once when nothing has been
+// applied: a cold start with no snapshot (API unreachable, empty, or the
+// token revoked) must still answer 421 for every host instead of serving
+// whatever the bootstrap Caddyfile happens to answer. The zero document IS
+// that shape (Generate: a nil or domain-less document = the catch-all 421),
+// and enqueueApply's content-hash gate makes repeats no-ops — a node that
+// has, or then gets, a real snapshot never re-queues it.
+func (p *Poller) ensureDenyAll() {
+	if p.appliedGeneration() == 0 {
+		p.enqueueApply(snapshot.Document{})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,26 +32,36 @@ type adminLoad struct {
 }
 
 func (a *adminLoad) serve() *httptest.Server {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/load" || r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		a.mu.Lock()
-		a.reqs = append(a.reqs, r.Header.Get("Content-Type")+"|"+string(b))
-		st := a.nextStatus
-		if st == 0 {
-			st = http.StatusOK
-		}
-		a.nextStatus = 0 // one-shot reject
-		a.mu.Unlock()
-		w.WriteHeader(st)
-		if st != http.StatusOK {
-			_, _ = w.Write([]byte("caddy rejected this configuration (fake)"))
-		}
-	}))
+	return httptest.NewServer(http.HandlerFunc(a.ServeHTTP))
+}
+
+// serveOn binds a caller-owned listener — the late-admin cold-start test
+// needs the port known (and refused) before the server exists.
+func (a *adminLoad) serveOn(ln net.Listener) *httptest.Server {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(a.ServeHTTP))
+	srv.Listener = ln
+	srv.Start()
 	return srv
+}
+
+func (a *adminLoad) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/load" || r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	a.mu.Lock()
+	a.reqs = append(a.reqs, r.Header.Get("Content-Type")+"|"+string(b))
+	st := a.nextStatus
+	if st == 0 {
+		st = http.StatusOK
+	}
+	a.nextStatus = 0 // one-shot reject
+	a.mu.Unlock()
+	w.WriteHeader(st)
+	if st != http.StatusOK {
+		_, _ = w.Write([]byte("caddy rejected this configuration (fake)"))
+	}
 }
 
 func (a *adminLoad) count() int {
@@ -293,6 +304,98 @@ func TestApplyBootNotDelayedByCooldown(t *testing.T) {
 		t.Fatalf("first /load took %v with a saved snapshot and 60s cooldown — boot waited out the cooldown", elapsed)
 	}
 	if body := al.lastBody(); !strings.Contains(body, "bootfast.a.test") {
+		t.Fatalf("boot load missing the saved hostname:\n%s", body)
+	}
+}
+
+// A cold start with NO snapshot must take the edge to the deny-all posture
+// (421 for every host on both listeners) even while the API is down/empty —
+// not sit on whatever the bootstrap Caddyfile happens to serve. The push is
+// content-hash gated: failed tick after failed tick loads it exactly once,
+// and the first real config replaces it.
+func TestApplyColdStartNoSnapshotServesDenyAll(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-cold-no-snapshot"
+	fake := newFakeAPI(t, key, token) // env == nil: every poll answers 503
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 1 * time.Second
+	startPollerRaw(t, cfg)
+
+	// Exactly one deny-all /load, however many ticks fail.
+	until(t, 5*time.Second, "first /load (deny-all)", func() bool { return al.count() == 1 })
+	body := al.lastBody()
+	if !strings.Contains(body, "Misdirected Request") || !strings.Contains(body, "edge.invalid") {
+		t.Fatalf("cold-start config is not the deny-all shape:\n%s", body)
+	}
+	time.Sleep(100 * time.Millisecond) // a few more failing ticks
+	if n := al.count(); n != 1 {
+		t.Fatalf("/load requests = %d after more failed ticks, want 1 — the deny-all push must be content-hash gated", n)
+	}
+
+	// The API comes up with a real config: it replaces the placeholder.
+	fake.publishDoc(newAdminDoc(1, "recovered.a.test"))
+	until(t, 5*time.Second, "second /load after the API recovers", func() bool { return al.count() == 2 })
+	if body := al.lastBody(); !strings.Contains(body, "recovered.a.test") {
+		t.Fatalf("recovered config missing its hostname:\n%s", body)
+	}
+	if strings.Count(al.lastBody(), "Misdirected Request") != 1 {
+		t.Fatalf("recovered config lost the catch-all:\n%s", al.lastBody())
+	}
+}
+
+// The joint cold-start race: the poller boots before caddy's admin API is
+// listening (depends_on orders container starts, not readiness), so the
+// first /load can fail on connection. The retry must converge in SECONDS —
+// not wait out the 60s cooldown — or every edge+poller restart leaves the
+// edge blind for a minute.
+func TestApplyAdminNotUpRetriesFast(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-admin-late"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(newAdminDoc(1, "bootfast.b.test"))
+	base := fake.serve().URL
+
+	// Reserve, then free, the admin port — nothing else binds it in-process.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve admin port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "bootfast.b.test"))
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg.CaddyAdmin = addr
+	cfg.ReloadCooldown = 60 * time.Second // production: a slow retry would take a minute
+	startPollerRaw(t, cfg)
+
+	// The boot /load fails (connection refused) while the "caddy" is down.
+	time.Sleep(1500 * time.Millisecond)
+	// The admin comes up — 1.5s after the poller booted.
+	al := &adminLoad{}
+	lateLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("late admin listen: %v", err)
+	}
+	srv := al.serveOn(lateLn)
+	t.Cleanup(srv.Close)
+	start := time.Now()
+	until(t, 10*time.Second, "first /load once the admin is up", func() bool { return al.count() == 1 })
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("first /load took %v after the admin came up — the transport-retry pace did not kick in (want ~2s, not the cooldown)", elapsed)
+	}
+	if body := al.lastBody(); !strings.Contains(body, "bootfast.b.test") {
 		t.Fatalf("boot load missing the saved hostname:\n%s", body)
 	}
 }

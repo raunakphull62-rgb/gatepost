@@ -326,3 +326,56 @@ and the harness's captured caddy stderr contains zero access entries
 while runtime lines persist. `scripts/edge-accept.sh` (item 7) sweeps
 the production file and the production container log the same way.
 
+## 2026-10-26 — A cold start with no snapshot pushes the deny-all shape, and an unreachable admin retries in seconds (B3b items 3+7)
+
+**What.** Two poller boot behaviors. (1) At the end of every tick with
+nothing applied (`appliedGeneration() == 0`), the poller enqueues the
+zero document — `Generate`'s deny-all shape: both listeners, only the
+421 catch-all. (2) A `/load` that fails on TRANSPORT (caddy's admin not
+answering) opens no cooldown window and retries every 2s; a config
+caddy REJECTED (an HTTP answer) still stamps the window and retries at
+the 60s cooldown pace.
+
+**Why.** (1) The poller's own header claimed "cold start with no
+snapshot: 421 for every host", but nothing ever pushed that shape — a
+no-snapshot edge sat on its bootstrap Caddyfile (which serves a
+localhost responder and empty 200s, not 421). Acceptance point (b) is
+the wire claim; the push makes it true. The content-hash gate makes the
+push once-only and invisible to any node that has (or then gets) a real
+snapshot. (2) `depends_on` orders container starts, not readiness: a
+joint edge+poller restart is a race the poller usually loses — its first
+`/load` gets connection-refused, and the old bookkeeping stamped
+`lastLoad` on the failed attempt, turning the retry into a full 60s
+cooldown. Every joint cold start risked a minute of blindness
+(acceptance point (a) hit exactly this). A failed-to-reach-caddy
+attempt never touched caddy, so it opens no window; the first attempt
+caddy answers — accepted or rejected — opens it.
+
+**Evidence.** `TestApplyColdStartNoSnapshotServesDenyAll` (exactly one
+deny-all /load across many failed ticks; the first real config replaces
+it) and `TestApplyAdminNotUpRetriesFast` (admin up 1.5s after the
+poller; first /load within seconds, not the 60s cooldown), both with the
+production cooldown. `scripts/edge-accept.sh` proves both on the real
+stack: (a) restarts edge+poller with the API down, (b) boots with a
+wiped state volume.
+
+## 2026-10-26 — The item-7 origin fixture lives on 192.88.99.0/24, the deprecated 6to4 relay anycast range
+
+**What.** The dev compose stack carries a realistic test origin
+(stdlib-only python, ports 9001/9002 for blue/green visibility, all the
+acceptance endpoints) on its own pinned bridge `br-gporigin`, subnet
+`192.88.99.0/24`, static IP `192.88.99.10`, with the edge attached to
+both networks.
+
+**Why.** The origin must pass the API's SSRF rules as a PUBLIC address —
+`domains.forbidV4Nets` covers every private, CGNAT, link-local,
+metadata, multicast, reserved AND RFC 5737/198.18 documentation range,
+so none of the "safe to squat" ranges can host it. 192.88.99.0/24 is
+the 6to4 relay anycast prefix (RFC 3068), formally deprecated and
+returned to IANA (RFC 7526): unannounced on the real internet, public
+to CheckIP, and its traffic never leaves the host. Edge→origin is
+same-bridge L2 (br_netfilter off: no FORWARD traversal), so the egress
+firewall is not even consulted — and would pass it as public anyway.
+The API stores the literal IP; no DNS is involved. A preflight in the
+acceptance script refuses to run if the host already routes that range.
+
