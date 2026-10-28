@@ -306,15 +306,25 @@ and tagged)
   restart-manager, not the supervisor (policy `unless-stopped`). **12 of 200
   probes failed, spanning 0.29s.** So crashes self-heal in <1s; only manual
   kills depend on the supervisor (bounded by its 15s cadence).
-- **One-off observed, not fully explained**: during acceptance run 2's
-  container churn the poller logged `snapshot refused: signature
-  verification failed (tampering?)` once at boot, treated the saved snapshot
-  as none (fail-closed), and re-applied generation 130 from the API 15ms
-  later. The envelope roundtrip is byte-preserving (`Payload` is a plain
-  string, atomic rename on save) and a key mismatch logs `unknown key`, not
-  `tampered` — so at that moment the on-disk payload genuinely didn't match
-  its HMAC. Root cause not pinned; the refusal path worked as designed.
-  Flagged for a follow-up look.
+- **The `tampering?` line — pinned, was never a mystery**: the one-off
+  refusal at 14:55:20 during run 2 was section (c) ITSELF. The script
+  tampers the snapshot with `sed -i 's/9001/9003/'` (edge-accept.sh line
+  267) and restarts the poller; the boot re-verifies and the key ID still
+  matches (else it would log `unknown key`) while the payload bytes no
+  longer do → `ErrTampered`, exactly the designed fail-closed path. The
+  earlier confusion ("API down during c") was wrong: the script brings the
+  API back up at the START of section (c) (line 264), which is why the
+  refusal is followed 15ms later by `applied snapshot generation 130` from
+  the wire. The file IS restored: the refetch the section waits for
+  re-persists the good envelope (`accept` → atomic write), so no later boot
+  can see the tampered bytes. Verified with five further acceptance runs
+  (2026-10-28 15:21–15:42, every output line timestamped, all 80/80 —
+  `/tmp/opencode/accept5-timed-{1..5}.txt` + poller logs): each run logged
+  exactly ONE tamper refusal, timestamped inside section (c)'s bracket
+  (run 1: bracket 15:22:26→15:23:27, refusal 15:23:27.358; run 5: bracket
+  15:39:02→15:40:03, refusal 15:40:03.715) — 10 refusal-family lines across
+  5 runs, all in (c), ZERO outside. Nothing to fix in the write, sign or
+  load path.
 - **Acceptance (item 3)**: `scripts/edge-accept.sh` twice, both **80 passed /
   0 failed** (raw output `/tmp/opencode/edge-accept-run2.txt`, host
   `accept-a-1793199201-26690.example.test`); d) took 60s (5s poll + 60s
