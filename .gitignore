@@ -10,3 +10,4 @@ deploy/dev/secrets/
 /gatepost-edge
 .kilo
 __pycache__
+deploy/dev/.supervise-off

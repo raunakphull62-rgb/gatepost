@@ -34,7 +34,11 @@ ORIGIN_IP=192.88.99.10
 STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"
 JAR="$(mktemp)"
 API_PID=""; STUB_PID=""
-trap 'kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$JAR"' EXIT
+# The compose supervisor (scripts/edge-supervise.sh) must stay out of the
+# run: it reconciles the stack every ~15s and would fight the teardown and
+# fresh-volume setup below. Off for the run, restored by the EXIT trap.
+SUPERVISE_OFF=deploy/dev/.supervise-off
+trap 'kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$JAR" "$SUPERVISE_OFF"' EXIT
 
 [ -f .env ] || { echo "no .env at repo root (create it yourself; never paste it here)" >&2; exit 2; }
 mkdir -p outbox "$SECRETS" && chmod 755 "$SECRETS"
@@ -102,6 +106,7 @@ start_api() {
 
 # --- 0. preflight: binary, ports, the API address is ours ------------------
 section "setup"
+touch "$SUPERVISE_OFF"   # supervisor out of the run (restored by the trap)
 go build -o gatepost ./cmd/gatepost || exit 2
 
 # Tear down any leftover stack FIRST — dc down removes the docker networks
