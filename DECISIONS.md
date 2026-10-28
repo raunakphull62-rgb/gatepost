@@ -391,15 +391,18 @@ the same policy restart it into the edge's fresh namespace.
 namespace on restart, but the poller keeps running inside the ORPHANED old
 one: loopback 2019 (the admin API) can never answer again, and no docker
 mechanism notices (restart policies fire on process exit; healthchecks only
-report). So the poller's apply loop now keeps a deadline: transport failures
-reaching the admin are tolerated for `GP_EDGE_ADMIN_GRACE` (default 15s —
-the joint cold start's caddy answers in ~2s, an orphaned namespace never
-answers), then `stepApply` returns `errAdminGone`, `Run` returns it, main
-`log.Fatalf`s (exit 1), and docker's `restart: unless-stopped` starts the
-container again — this time joining the edge's CURRENT namespace, where the
-boot load re-applies the saved snapshot. Only dial failures count
-(`adminTransport`: not a `caddy /load:` rejection, not a forwarder/caddygen
-local error); any caddy answer resets the window. The same grace covers
+report). So the poller watches the admin on two paths: every apply attempt
+classifies its failure (`adminTransport` — dial errors only; a `caddy
+/load:` rejection or a local forwarder/caddygen error says nothing about
+reachability), and — because a fully-applied poller has NO pending work and
+would never dial at all — an idle watchdog probes the admin every
+min(5s, AdminGrace/3) (`adminProbe`: any HTTP answer = alive). Both feed one
+window: transport failures are tolerated for `GP_EDGE_ADMIN_GRACE` (default
+15s — the joint cold start's caddy answers in ~2s, an orphaned namespace
+never answers), any answer resets it, and the breach returns `errAdminGone`
+→ `Run` → main `log.Fatalf` (exit 1) → docker's `restart: unless-stopped`
+starts the container again — this time joining the edge's CURRENT namespace,
+where the boot load re-applies the saved snapshot. The same grace covers
 `docker restart edge`, which orphans the poller identically.
 
 **Mechanics, compose.** Both services carry healthchecks (edge: caddy admin

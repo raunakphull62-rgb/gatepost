@@ -259,9 +259,18 @@ and tagged)
   Dial failures only; any caddy answer resets the window. Compose: edge
   healthcheck (admin `/config`), poller healthcheck (new ask `/health`
   route), `depends_on: edge: {condition: service_healthy, restart: true}`.
+- **The idle gap, found while preparing the live kill run**: with nothing
+  pending, nothing in the apply path ever dials the admin — the exact state
+  after a successful apply, i.e. the actual docker-kill shape — so the grace
+  could never arm. Fix: the apply loop probes the admin every
+  min(5s, AdminGrace/3) when idle (`adminProbe`: any HTTP answer = alive)
+  and feeds the same `adminTouch` accounting; the grace now arms from either
+  the apply path or the probe. Success also resets the window.
 - Tests: `TestAdminGraceBailsOutOfDeadNamespace` (bail at a 200ms grace +
-  the 60s grace holds through the joint cold start's ~2s of failures).
-  Race suite green. Live evidence: item-8 kill runs below.
+  the 60s grace holds through the joint cold start's ~2s of failures),
+  `TestAdminGraceBailsWhenIdle` (the admin answers once, then dies — the
+  idle watchdog bails). Race suite green. Live evidence: item-8 kill runs
+  below.
 - **ensureDenyAll guard pinned by a test** (`TestEnsureDenyAllDoesNotOvertakePendingConfig`):
   a queued-but-not-yet-loaded config (appliedGeneration still 0) survives a
   failing tick — without the `&& p.pending == nil` guard the zero document

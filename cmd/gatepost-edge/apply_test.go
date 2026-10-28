@@ -597,6 +597,47 @@ func TestEnsureDenyAllDoesNotOvertakePendingConfig(t *testing.T) {
 	}
 }
 
+// The IDLE case — the actual docker-kill shape: everything is applied (no
+// pending work), so nothing in the apply path ever dials the admin. The
+// watchdog must notice the dead namespace on its own cadence and bail.
+// The admin answers exactly once (the boot apply), then "dies".
+func TestAdminGraceBailsWhenIdle(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-admin-grace-idle"
+	fake := newFakeAPI(t, key, token)
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	adminSrv := al.serve()
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "idle.a.test"))
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.AdminGrace = 300 * time.Millisecond
+	cfg.ReloadCooldown = 10 * time.Millisecond
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { done <- NewPoller(cfg).Run(ctx) }()
+
+	until(t, 5*time.Second, "boot apply (the one admin answer)", func() bool { return al.count() == 1 })
+	adminSrv.Close() // the edge — and this container's namespace — "dies"
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errAdminGone) {
+			t.Fatalf("Run returned %v, want errAdminGone", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("idle poller did not notice the dead namespace within 10s")
+	}
+	if n := hook.count("exiting so docker"); n != 1 {
+		t.Fatalf("bail-out log lines = %d, want 1:\n%s", n, hook.all())
+	}
+}
+
 // Without caddy wiring there is no /load and no forwarder, ever.
 func TestNoCaddyNoApply(t *testing.T) {
 	key := makeKey(t)

@@ -62,6 +62,11 @@ func adminTransport(err error) bool {
 		!strings.HasPrefix(s, "caddygen:")
 }
 
+// adminProbeEvery caps how often the idle poller dials the admin; the real
+// cadence is min(this, AdminGrace/3) so the probe clock always outruns the
+// grace window.
+const adminProbeEvery = 5 * time.Second
+
 // startApply builds the forwarder and the apply loop. Without CaddyAdmin
 // wired (tests / optional deployments), nothing here runs.
 func (p *Poller) startApply(ctx context.Context) {
@@ -99,11 +104,28 @@ func (p *Poller) enqueueApply(d snapshot.Document) {
 }
 
 func (p *Poller) applyLoop(ctx context.Context) {
+	// The idle case matters as much as the apply path: with no pending work
+	// nothing in the apply flow dials the admin, so a poller orphaned in a
+	// dead network namespace (the docker-kill shape) would sit unnoticed
+	// forever. Probe on a cadence that always outruns the grace window.
+	probeEvery := p.cfg.AdminGrace / 3
+	if probeEvery <= 0 || probeEvery > adminProbeEvery {
+		probeEvery = adminProbeEvery
+	}
+	ticker := time.NewTicker(probeEvery)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-p.applyKick:
+		case <-ticker.C:
+			if p.hasPending() {
+				continue // stepApply's own accounting covers the busy path
+			}
+			if gerr := p.adminTouch(p.adminProbe()); gerr != nil {
+				return // errAdminGone: Run reports it and the process exits
+			}
 		}
 		for {
 			again, err := p.stepApply(ctx)
@@ -118,6 +140,56 @@ func (p *Poller) applyLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// hasPending: whether stepApply has work (its own grace accounting runs there).
+func (p *Poller) hasPending() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pending != nil
+}
+
+// adminProbe: any HTTP answer from the admin proves caddy — and this shared
+// network namespace — is alive. The status is irrelevant; the body unread.
+func (p *Poller) adminProbe() bool {
+	resp, err := p.cfg.Client.Get("http://" + p.cfg.CaddyAdmin + "/config/")
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return true
+}
+
+// adminTouch records one contact attempt with the caddy admin: ok = the
+// admin ANSWERED (or no contact was needed). Transport failures accumulate
+// in adminFirstFail; once the window has outlived AdminGrace this returns
+// errAdminGone, having logged it and armed adminFail for Run.
+func (p *Poller) adminTouch(ok bool) error {
+	p.mu.Lock()
+	if ok {
+		p.adminFirstFail = time.Time{}
+		p.mu.Unlock()
+		return nil
+	}
+	if p.adminFirstFail.IsZero() {
+		p.adminFirstFail = time.Now()
+	}
+	waited := time.Since(p.adminFirstFail)
+	grace := p.cfg.AdminGrace
+	p.mu.Unlock()
+	if waited < grace {
+		return nil
+	}
+	// The one fatal case: loopback admin unreachable for the whole grace
+	// window. A slow caddy answers long before this; a dead network
+	// namespace never will.
+	p.log("error", "caddy admin unreachable for %s (grace %s) — exiting so docker's restart policy rejoins the edge's fresh network namespace",
+		waited.Round(time.Millisecond), grace)
+	select {
+	case p.adminFail <- errAdminGone:
+	default:
+	}
+	return errAdminGone
 }
 
 // stepApply performs at most one /load attempt ((false, nil) = no pending
@@ -163,35 +235,16 @@ func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 	}
 	p.mu.Unlock()
 	if err == nil {
+		_ = p.adminTouch(true) // the admin answered: the grace window starts over
 		return true, nil
 	}
 	p.log("error", "caddy apply FAILED — keeping the last-good config: %v", err)
 	if adminTransport(err) {
-		p.mu.Lock()
-		if p.adminFirstFail.IsZero() {
-			p.adminFirstFail = time.Now()
-		}
-		waited := time.Since(p.adminFirstFail)
-		grace := p.cfg.AdminGrace
-		p.mu.Unlock()
-		if waited >= grace {
-			// The one fatal case: loopback admin unreachable for the whole
-			// grace window. A slow caddy answers long before this; a dead
-			// network namespace never will.
-			p.log("error", "caddy admin unreachable for %s (grace %s) — exiting so docker's restart policy rejoins the edge's fresh network namespace",
-				waited.Round(time.Millisecond), grace)
-			select {
-			case p.adminFail <- errAdminGone:
-			default:
-			}
-			return false, errAdminGone
+		if gerr := p.adminTouch(false); gerr != nil {
+			return false, gerr
 		}
 	} else {
-		// Caddy answered (rejection) or the failure was local: the admin is
-		// demonstrably reachable, so the grace window starts over.
-		p.mu.Lock()
-		p.adminFirstFail = time.Time{}
-		p.mu.Unlock()
+		_ = p.adminTouch(true) // a local failure says nothing about the admin
 	}
 	// caddyLoad wraps every caddy ANSWER (a rejected config) in a
 	// "caddy /load:" error; anything else is a transport failure.
