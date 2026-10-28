@@ -338,6 +338,54 @@ and tagged)
   `request>headers`, `resp_headers` whole; e2e control proved the real
   caddy binary is used (fails with `/bin/false`, passes with real caddy).
 
+## 2026-10-28 — item 7 acceptance hardened: true cold start, https deny posture, dial-time TOCTOU (f2)
+
+- **Section (a) is now a TRUE cold start**: `dc down` + `dc up -d edge
+  origin-test poller` with the API still down and the saved snapshot on the
+  poller volume — containers are REMOVED and recreated, not restarted, so
+  the poller joins a fresh edge network namespace (the cold-start race the
+  v0.4-edge tag note describes). Serves from the snapshot over http AND
+  https (internal cert) with the API down.
+- **Section (b) gained https**: known, denied AND unknown hosts all answer
+  421 over https on the no-snapshot boot (fallback cert, no ask answer).
+- **New section (f2) — dial-time guard against a later-hostile resolution**:
+  a hostname origin (`f2orig.test`) is accepted while it resolves public
+  (192.88.99.10 via the host DNS stub's new A-record mode), then the
+  POLLER's `/etc/hosts` is flipped to 169.254.169.254 and the edge must
+  refuse at dial time. Evidence in one run: 502 to the client, poller log
+  `refused 169.254.169.254 while proxying to f2orig.test (forbidden origin:
+  … inside 169.254.0.0/16)`, and the origin listener's hit count FROZEN at
+  the first refusal (6 then, 6 after). Mechanism notes pinned the hard way:
+  - the API's set-time check resolves through the host stub; the poller
+    resolves through its own /etc/hosts (docker refuses `dns:` with
+    `network_mode: service:edge` — "conflicting options", tested) — so the
+    flip is a hosts rewrite via `dc exec -u root`;
+  - `/etc/hosts` is a bind-mounted FILE: `sed -i` fails with "Resource
+    busy" (it renames), and a `sed | tee` same-file pipe races (wiped the
+    file once during diagnosis; restored) — the flip prepares content in
+    /tmp then truncate-writes in place;
+  - origin port 9003 closes EVERY connection (`Connection: close` +
+    `self.close_connection` in origin_test.py): caddy's reverse_proxy
+    keep-alive pool otherwise rides the pre-flip connection and the 502
+    only appears after the pool expires (~78s observed) — the dial guard's
+    guarantee is per connection, so the f2 origin must force a re-dial per
+    request;
+  - Go caches /etc/hosts for ~5s (pure-Go resolver): requests issued right
+    after the flip legitimately reach the pre-flip address, so the
+    silence check measures the guarantee that actually holds — the hit
+    count freezes at the FIRST refusal, not at the flip instant.
+- **until_ok now counts successes** (`pass "$what"` on success): a passed
+  wait used to be silent AND uncounted, so a fully-green run undercounted
+  (89 vs the true 102); failures always counted. Verdict line is now
+  exact. Final run: **102 passed, 0 failed** (raw timestamped output
+  `/tmp/opencode/accept-final.txt`; the two diagnostic runs on the way
+  there: `/tmp/opencode/accept-newchecks{,2}.txt` — 86/4 each, all four
+  failures f2, first diagnosed as the sed -i EBUSY, second as the
+  keep-alive pool). The DNS stub gained A answers from `$STUB_A` re-read
+  per query (validated standalone: `/tmp/opencode/stub-e2e.py` — TXT
+  verify unchanged, flip without restart, NOERROR/0-answers for unlisted
+  A and any AAAA).
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:

@@ -3,5 +3,5 @@
 # chunked response on ports 9001 + 9002. See origin_test.py.
 FROM python:3.12-alpine
 COPY origin_test.py /origin_test.py
-EXPOSE 9001 9002
+EXPOSE 9001 9002 9003
 ENTRYPOINT ["python3", "/origin_test.py"]

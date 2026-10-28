@@ -12,6 +12,9 @@
 #   d) an API origin change reaches the edge — with the seconds it took
 #   e) a spoofed X-Forwarded-For is replaced with the real client IP
 #   f) private/metadata origins are refused at set time, never reached
+#   f2) an origin HOSTNAME accepted while it resolved public is refused at
+#       dial time once its resolution turns hostile (metadata address) —
+#       and the origin listener records no request
 #   g) unknown host: 421, no certificate attempt
 #   h) allowed host gets a certificate (internal issuer); a denied host
 #      does not (the ask answers 421)
@@ -31,14 +34,14 @@ API=http://172.17.0.1:8090
 EDGE_HTTP=http://127.0.0.1:8081
 EDGE_HTTPS=https://127.0.0.1:8445
 ORIGIN_IP=192.88.99.10
-STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"
+STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"; STUB_A="$(mktemp)"
 JAR="$(mktemp)"
 API_PID=""; STUB_PID=""
 # The compose supervisor (scripts/edge-supervise.sh) must stay out of the
 # run: it reconciles the stack every ~15s and would fight the teardown and
 # fresh-volume setup below. Off for the run, restored by the EXIT trap.
 SUPERVISE_OFF=deploy/dev/.supervise-off
-trap 'kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$JAR" "$SUPERVISE_OFF"' EXIT
+trap 'kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
 
 [ -f .env ] || { echo "no .env at repo root (create it yourself; never paste it here)" >&2; exit 2; }
 mkdir -p outbox "$SECRETS" && chmod 755 "$SECRETS"
@@ -70,7 +73,7 @@ until_ok() {
   local timeout="$1" what="$2" cond="$3"
   local deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    eval "$cond" >/dev/null 2>&1 && return 0
+    if eval "$cond" >/dev/null 2>&1; then pass "$what"; return 0; fi
     sleep 1
   done
   fail "$what did not happen within ${timeout}s"
@@ -133,32 +136,66 @@ check_ne "snapshot key material is non-empty" "$KEY" ""
 check "no host route squats the origin fixture's range (192.88.99.0/24)" \
   "$(ip route show | grep -c 192.88.99)" "0"
 
-# the DNS TXT stub (raw UDP, from demo-nodes.sh): answers _gatepost-verify.*
-# with whatever token file it holds, re-read on every query
+# the DNS stub (raw UDP, from demo-nodes.sh): answers _gatepost-verify.*
+# with whatever token file it holds, re-read on every query — and, for the
+# f2 dial-time check, A records for the names listed in $STUB_A (also
+# re-read per query, so a rewrite flips the answer with no restart)
 cat > "$STUB_PY" <<'EOF'
 import socket, sys
-tok_path = sys.argv[1]
+tok_path, a_path = sys.argv[1], sys.argv[2]
 srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 srv.bind(("127.0.0.1", 5344))
 while True:
     data, addr = srv.recvfrom(4096)
     try:
-        i = 12
-        while data[i] != 0:
-            i += 1 + data[i]
-        i += 1
-        question = data[12:i+4]
-        txt = b'gatepost-verify=' + open(tok_path, 'rb').read().strip()
-        answer = (b'\xc0\x0c' + b'\x00\x10\x00\x01' + b'\x00\x00\x00\x05'
-                  + (len(txt) + 1).to_bytes(2, 'big') + bytes([len(txt)]) + txt)
-        srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x01\x00\x00\x00\x00'
-                   + question + answer, addr)
+        j = 12
+        while data[j] != 0:
+            j += 1 + data[j]
+        nul = j
+        j += 1
+        qtype = data[j:j+2]
+        question = data[12:j+4]
+        if qtype == b'\x00\x01':  # A: the f2 test-resolver answer
+            ip = None
+            try:
+                for line in open(a_path):
+                    n, _, v = line.strip().partition(' ')
+                    labels = []
+                    k = 12
+                    while data[k] != 0:
+                        l = data[k]
+                        labels.append(data[k+1:k+1+l].decode())
+                        k += 1 + l
+                    qname = '.'.join(labels).lower().rstrip('.')
+                    if n.rstrip('.').lower() == qname:
+                        ip = v
+                        break
+            except OSError:
+                pass
+            if ip:
+                rdata = bytes(int(x) for x in ip.split('.'))
+                srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x01\x00\x00\x00\x00'
+                           + question + b'\xc0\x0c' + b'\x00\x01\x00\x01'
+                           + b'\x00\x00\x00\x05' + b'\x00\x04' + rdata, addr)
+                continue
+            srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x00\x00\x00\x00\x00'
+                       + question, addr)  # NOERROR, no answer: this name has no A
+            continue
+        if qtype == b'\x00\x10':  # TXT: the verify flow, unchanged
+            txt = b'gatepost-verify=' + open(tok_path, 'rb').read().strip()
+            answer = (b'\xc0\x0c' + b'\x00\x10\x00\x01' + b'\x00\x00\x00\x05'
+                      + (len(txt) + 1).to_bytes(2, 'big') + bytes([len(txt)]) + txt)
+            srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x01\x00\x00\x00\x00'
+                       + question + answer, addr)
+            continue
+        srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x00\x00\x00\x00\x00'
+                   + question, addr)  # anything else: NOERROR, no answers
     except Exception:
         pass
 EOF
-python3 "$STUB_PY" "$STUB_TOK" >/dev/null 2>&1 &
+python3 "$STUB_PY" "$STUB_TOK" "$STUB_A" >/dev/null 2>&1 &
 STUB_PID=$!
-sleep 0.5; kill -0 "$STUB_PID" 2>/dev/null && pass "DNS TXT stub up on 127.0.0.1:5344" || { fail "DNS stub did not start"; exit 2; }
+sleep 0.5; kill -0 "$STUB_PID" 2>/dev/null && pass "DNS stub up on 127.0.0.1:5344 (TXT verify + A answers)" || { fail "DNS stub did not start"; exit 2; }
 
 start_api && pass "API up on $API"
 
@@ -228,18 +265,14 @@ check "/chunked: all three chunks arrived" \
 section "a) cold start with the API down and a saved snapshot"
 kill_api
 check "API is down" "$(code_of "$API/api/me")" "000"
-# Restart edge and poller in dependency order: the poller shares the edge's
-# network namespace (network_mode: service:edge), so edge must be running
-# before the poller starts. A combined "dc restart edge poller" races — Docker
-# Compose starts the poller before the edge's namespace is ready, and the
-# poller exits (cannot join network namespace). Stop poller, restart edge,
-# wait for edge, then recreate the poller.
-dc stop poller >/dev/null 2>&1
-dc restart edge >/dev/null 2>&1
-# Edge needs ~1s to boot Caddy and bind :80/:443.
-until_ok 10 "edge is back after restart" 'code_of "$EDGE_HTTP/ok"' >/dev/null 2>&1 || true
-dc up -d --force-recreate poller >/dev/null 2>&1
-until_ok 45 "the restarted edge serves from the SAVED snapshot" \
+# True cold start: the containers are REMOVED and recreated (dc down + up,
+# not a restart) with the saved snapshot still on the poller volume and the
+# API still down. Compose's depends_on (edge healthy -> poller) owns the
+# ordering, and the poller joining a FRESH edge network namespace is the
+# cold-start race the v0.4-edge tag note describes.
+dc down >/dev/null 2>&1
+dc up -d edge origin-test poller >/dev/null 2>&1
+until_ok 45 "the cold-started edge serves from the SAVED snapshot" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
 until_ok 15 "a) https serves the snapshot (on-demand internal cert)" \
   '[ "$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "https://$HOST:8445/ok")" = "200" ]'
@@ -258,6 +291,10 @@ check "b) denied host over http = 421" "$(code_of -H "Host: $DENIED" "$EDGE_HTTP
 check "b) unknown host over http = 421" "$(code_of -H "Host: $STRANGER" "$EDGE_HTTP/ok")" "421"
 C=$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "$EDGE_HTTPS/ok")
 check "b) known host over https = 421 (fallback cert, no ask answer)" "$C" "421"
+C=$(code_of -sk --resolve "$DENIED:8445:127.0.0.1" "$EDGE_HTTPS/ok")
+check "b) denied host over https = 421 (fallback cert, no ask answer)" "$C" "421"
+C=$(code_of -sk --resolve "$STRANGER:8445:127.0.0.1" "$EDGE_HTTPS/ok")
+check "b) unknown host over https = 421 (fallback cert, no ask answer)" "$C" "421"
 
 # --- c) tampered snapshot rejected, last-good keeps serving ---------------
 section "c) tampered snapshot rejected; the last-good config keeps serving"
@@ -312,6 +349,59 @@ for BAD in "169.254.169.254:metadata" "10.99.99.99:private-rfc1918" "127.0.0.1:l
 done
 check "f) the edge still serves the last-good origin" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9002')" "1"
+
+# --- f2) dial-time guard: a hostname origin that LATER resolves private ----
+section "f2) an origin hostname that later resolves to a metadata address is refused at dial time"
+F2HOST="accept-f2-$TS.example.test"
+# The API's set-time check resolves through the host stub ($STUB_A); the
+# POLLER resolves through its own /etc/hosts (its resolver never reaches the
+# host stub), so the flip is a hosts rewrite inside the container — the
+# exact TOCTOU shape: the origin was accepted while it resolved public, and
+# the edge's dial guard must catch the later hostile answer. Port 9003
+# closes every connection, so each request re-dials the forwarder and hits
+# the fresh resolution immediately (caddy's keep-alive pool would otherwise
+# ride the pre-flip connection — the guard's guarantee is per connection).
+printf 'f2orig.test 192.88.99.10\n' > "$STUB_A"
+dc exec -u root poller sh -c "echo '192.88.99.10 f2orig.test' >> /etc/hosts"
+OUT=$(cb -X POST "$API/v1/domains" -H 'Content-Type: application/json' -d "{\"hostname\":\"$F2HOST\"}")
+check "f2) claim $F2HOST" "$(codeof "$OUT")" "201"
+F2DOM=$(jget "$(bodyof "$OUT")" '["domain"]["id"]')
+VT=$(jget "$(bodyof "$(cb "$API/v1/domains/$F2DOM/verification")")" '["verification"]["record_value"]' | cut -d= -f2)
+printf '%s' "$VT" > "$STUB_TOK"
+OUT=$(cb -X POST "$API/v1/domains/$F2DOM/verify")
+check "f2) verify $F2HOST against the TXT stub" "$(codeof "$OUT")" "200"
+OUT=$(cb -X POST "$API/v1/domains/$F2DOM/origin" -H 'Content-Type: application/json' \
+  -d "{\"scheme\":\"http\",\"address\":\"f2orig.test\",\"port\":9003,\"tls_verify\":false}")
+check "f2) hostname origin accepted at set time (resolves public via the stub)" "$(codeof "$OUT")" "201"
+until_ok 120 "f2) the edge serves the hostname origin (public resolution)" \
+  'curl -s -H "Host: $F2HOST" $EDGE_HTTP/ok | grep -q "port 9003"'
+N1=$(dc logs origin-test 2>/dev/null | grep -c "$F2HOST")
+check_ne "f2) the origin saw requests while the resolution was public ($N1 hit(s))" "$N1" "0"
+# THE FLIP: same hostname, now the cloud-metadata address. /etc/hosts is a
+# bind-mounted FILE: sed -i renames and fails ("Resource busy"), and a
+# `sed | tee` same-file pipe races — so prepare the content first, then
+# truncate-write it in place.
+dc exec -u root poller sh -c "sed 's/^192\.88\.99\.10 f2orig\.test\$/169.254.169.254 f2orig.test/' /etc/hosts > /tmp/hosts.new && cat /tmp/hosts.new > /etc/hosts && rm -f /tmp/hosts.new"
+until_ok 20 "f2) the edge now 502s the hostname origin (dial-time refusal)" \
+  '[ "$(code_of -H "Host: $F2HOST" "$EDGE_HTTP/ok")" = 502 ]'
+check "f2) refused at dial time: 502, no connection attempted" \
+  "$(code_of -H "Host: $F2HOST" "$EDGE_HTTP/ok")" "502"
+REFUSED=$(dc logs --since 2m poller 2>/dev/null | grep -c 'refused 169.254.169.254')
+if [ "$REFUSED" -ge 1 ]; then
+  pass "f2) the poller logged the dial-time refusal ($REFUSED line(s): link-local refused before any dial)"
+else
+  fail "f2) no dial-time refusal line in the poller log"
+fi
+# Go caches /etc/hosts for ~5s, so requests issued immediately after the
+# flip can still reach the pre-flip address — the dial guard's guarantee
+# starts at the FIRST refusal: from there every fresh dial is refused and
+# the origin's hit count must freeze.
+NMID=$(dc logs origin-test 2>/dev/null | grep -c "$F2HOST")
+check "f2) another request still 502s through a fresh dial" \
+  "$(code_of -H "Host: $F2HOST" "$EDGE_HTTP/ok")" "502"
+sleep 2
+N2=$(dc logs origin-test 2>/dev/null | grep -c "$F2HOST")
+check "f2) the origin listener recorded NO request after the first refusal ($NMID then, $N2 after)" "$N2" "$NMID"
 
 # --- g) unknown host: 421, no certificate attempt -------------------------
 section "g) unknown host: 421 and no certificate attempt"

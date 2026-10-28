@@ -19,7 +19,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import sleep
 
-PORTS = (9001, 9002)
+PORTS = (9001, 9002, 9003)  # 9003: the f2 dial-time-check listener (see end_headers)
 
 
 class OriginHandler(BaseHTTPRequestHandler):
@@ -37,6 +37,9 @@ class OriginHandler(BaseHTTPRequestHandler):
     def route(self):
         port = self.server.server_address[1]
         path = self.path.split("?", 1)[0]
+        # one line per request on stderr (docker logs): the f2 check proves
+        # the listener stayed SILENT for a dial-time-refused origin
+        print(f"hit {path} host={self.headers.get('Host', '(none)')}", flush=True)
         if path == "/ok":
             self.body(f"ok from origin-test port {port}\n")
         elif path == "/slow":
@@ -91,6 +94,16 @@ class OriginHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.body(f"not found on origin-test port {port}\n")
+
+    def end_headers(self):
+        # Port 9003 closes EVERY connection: the edge must re-dial (and so
+        # re-resolve + re-validate the origin) per request — the f2 check
+        # flips the hostname's resolution and needs the fresh dial to happen
+        # immediately, not after caddy's keep-alive pool expires.
+        if self.server.server_address[1] == 9003:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        super().end_headers()
 
     def body(self, text, extra_headers=()):
         data = text.encode()
