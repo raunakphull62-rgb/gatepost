@@ -29,6 +29,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatepost/internal/domains"
@@ -48,10 +49,11 @@ type forwarder struct {
 	dial          func(ctx context.Context, network, addr string) (net.Conn, error)
 	log           func(kind string, format string, args ...any)
 
-	mu     sync.Mutex
-	active map[string]*egressListener // origins of the CURRENT config
-	fading map[string]*egressListener // dropped recently; pruned at the next swap
-	gen    int
+	mu        sync.Mutex
+	active    map[string]*egressListener // origins of the CURRENT config
+	fading    map[string]*egressListener // dropped recently; pruned at the next swap
+	gen       int
+	unhealthy atomic.Bool // an accept loop died; /health fails it until the next Swap
 }
 
 func newForwarder(cfg Config) *forwarder {
@@ -129,6 +131,7 @@ func (f *forwarder) Swap(d *snapshot.Document) (map[string]int, error) {
 		}
 	}
 	f.active = desired
+	f.unhealthy.Store(false) // every desired origin has a live listener now
 	fresh = nil
 	return ports, nil
 }
@@ -147,6 +150,7 @@ func (l *egressListener) serve(f *forwarder) {
 			// retire so the next Swap allocates a fresh port. Connections
 			// dialled meanwhile fail closed.
 			f.log("error", "egress listener for %s died: %v", originKey(l.origin), err)
+			f.unhealthy.Store(true) // /health fails until the next Swap rebuilds this listener
 			f.retire(l)
 			return
 		}

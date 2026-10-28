@@ -665,3 +665,63 @@ func TestNoCaddyNoApply(t *testing.T) {
 		t.Fatal("forwarder created without caddy wiring")
 	}
 }
+
+func TestServeHealthReportsStalls(t *testing.T) {
+	var mu sync.Mutex
+	cur := time.Unix(1_000_000, 0) // 2001-09-09 — an arbitrary stable epoch
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return cur
+	}
+	mov := func(d time.Duration) {
+		mu.Lock()
+		cur = cur.Add(d)
+		mu.Unlock()
+	}
+
+	cfg := newTestCfg(t, &logHook{}, t.TempDir(), "", "", nil)
+	cfg.Now = now
+	p := NewPoller(cfg) // seeds both ticks to now()
+
+	rec := func() *httptest.ResponseRecorder {
+		r := httptest.NewRecorder()
+		p.serveHealth(r, nil)
+		return r
+	}
+
+	if r := rec(); r.Code != http.StatusOK {
+		t.Fatalf("fresh poller: /health = %d %q, want 200 ok", r.Code, r.Body.String())
+	}
+
+	// apply loop silent 31s (> applyStallLimit 30s).
+	mov(31 * time.Second)
+	if r := rec(); r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("apply stall: /health = %d %q, want 500", r.Code, r.Body.String())
+	}
+
+	// poll loop silent: move the clock well past 90s from boot, then refresh
+	// applyTick to "now" so ONLY the poll branch is stale (pollTick is still
+	// the boot epoch).
+	mov(91 * time.Second)
+	p.applyTick.Store(now().UnixNano())
+	if r := rec(); r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("poll stall: /health = %d %q, want 500", r.Code, r.Body.String())
+	}
+
+	// forwarder accept-loop died: refresh both ticks, set the flag.
+	p.applyTick.Store(now().UnixNano())
+	p.pollTick.Store(now().UnixNano())
+	p.fwd = &forwarder{}
+	p.fwd.unhealthy.Store(true)
+	if r := rec(); r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("egress unhealthy: /health = %d %q, want 500", r.Code, r.Body.String())
+	}
+
+	// Reversing the flag restores health — proves the flag, not a stray
+	// tick, drives this branch.
+	p.fwd.unhealthy.Store(false)
+	if r := rec(); r.Code != http.StatusOK {
+		t.Fatalf("egress recovered: /health = %d %q, want 200", r.Code, r.Body.String())
+	}
+}

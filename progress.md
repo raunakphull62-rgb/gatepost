@@ -386,6 +386,41 @@ and tagged)
   verify unchanged, flip without restart, NOERROR/0-answers for unlisted
   A and any AAAA).
 
+## 2026-10-28 — item 3: poller liveness healthcheck + supervisor restart
+
+- `/health` now does REAL liveness (cmd/gatepost-edge/poller.go): serveHealth
+  answers 500 when the apply loop has been silent >30s, the poll loop >90s,
+  or the egress forwarder's `unhealthy` flag is set (a listener accept-loop
+  died, until the next Swap rebuilds it). NewPoller seeds both ticks at
+  boot so a fresh process is healthy by definition; the apply loop stamps
+  applyTick every wake (apply.go), the poll loop stamps pollTick every tick
+  (poller.go Run). The old handler returned 200 unconditionally — a frozen or
+  deadlocked poller served a stale config forever. (A SIGSTOPped body can't
+  answer the healthcheck at all, so compose's timeout catches it; the 500
+  branch covers the in-process-deadlock shape the unit test builds.)
+- forwarder `unhealthy` flag (egress.go): the accept-death path sets
+  `f.unhealthy.Store(true)`; Swap clears it on success. A dead listener
+  means the dial guard can't forward that origin (fails closed) until Swap
+  re-allocates it — /health surfaces that instead of silently 502-ing.
+- Supervisor reconcile (scripts/edge-supervise.sh): `docker compose up -d`
+  ignores running-but-unhealthy containers, so reconcile now inspects edge
+  and poller and `docker restart`s any in running/unhealthy BEFORE compose
+  up — closing the gap the v0.4-edge compose healthcheck comment describes.
+- Test: TestServeHealthReportsStalls (apply_test.go) — fresh->200; applyTick
+  31s stale->500; pollTick 91s stale with applyTick fresh->500; fwd unhealthy
+  ->500; clearing the flag -> 200. `go test -race ./cmd/gatepost-edge/` green
+  (12.7s, including the existing apply/e2e/ratelimit suites).
+- SIGSTOP recovery (live evidence, /tmp/opencode/sigstop-probes.txt): stopped
+  the poller's HOST PID (PID 1 in the container ignores in-namespace signals
+  — same class as SIGKILL, proven earlier), so the stop had to come from the
+  host (.State.Pid + sudo kill -STOP). compose healthcheck drove the state
+  starting->unhealthy (~24s), the supervisor restarted it (journal `18:06:53
+  restarting unhealthy poller (reason: running/unhealthy)`), PID
+  479552->481282, health starting->healthy (~17s post-restart), and the final
+  probe returned `ok from origin-test port 9001`. 51 of 1299 probes were
+  non-200 during the ~46s window (frozen forwarder: 000, then 502 until the
+  listener rebound) — no outage after recovery.
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:

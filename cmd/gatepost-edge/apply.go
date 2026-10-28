@@ -115,6 +115,7 @@ func (p *Poller) applyLoop(ctx context.Context) {
 	ticker := time.NewTicker(probeEvery)
 	defer ticker.Stop()
 	for {
+		p.applyTick.Store(p.cfg.Now().UnixNano()) // liveness: /health checks this
 		select {
 		case <-ctx.Done():
 			return

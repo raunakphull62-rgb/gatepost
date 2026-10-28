@@ -51,6 +51,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatepost/internal/domains"
@@ -106,6 +107,9 @@ type Poller struct {
 	lastLoad       time.Time          // last /load attempt (success or failure)
 	adminFirstFail time.Time          // start of the current admin-unreachable window
 	adminFail      chan error         // the apply loop's one fatal outcome (errAdminGone)
+
+	applyTick atomic.Int64 // last applyLoop wake (liveness: see serveHealth)
+	pollTick  atomic.Int64 // last poll-loop wake
 
 	throttle      *logThrottle // repeated identical failure lines resolve here
 	certWindow    time.Time    // start of the current on-demand cap window
@@ -183,7 +187,11 @@ func NewPoller(cfg Config) *Poller {
 			}
 		}
 	}
-	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1), adminFail: make(chan error, 1), throttle: newLogThrottle()}
+	p := &Poller{cfg: cfg, applyKick: make(chan struct{}, 1), adminFail: make(chan error, 1), throttle: newLogThrottle()}
+	now := cfg.Now().UnixNano()
+	p.applyTick.Store(now)
+	p.pollTick.Store(now)
+	return p
 }
 
 // Run starts the apply loop (caddy wiring) BEFORE the boot snapshot load so
@@ -213,6 +221,7 @@ func (p *Poller) Run(ctx context.Context) error {
 			return err // the apply loop's one fatal case: see errAdminGone
 		case <-timer.C:
 		}
+		p.pollTick.Store(p.cfg.Now().UnixNano())
 		p.tick(ctx)
 		timer.Reset(p.nextDelay())
 	}
@@ -447,11 +456,10 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 	mux.HandleFunc("/check", p.serveAsk)
 	mux.HandleFunc("/ask", p.serveAsk) // accept either anchor name; item 3 pins one
 	// compose healthcheck target: any answer means this process — and its
-	// network namespace — is alive. 200 by construction, no snapshot needed.
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-	})
+	// network namespace — is alive. serveHealth also FAILS (500) when a loop
+	// has stalled or the egress forwarder died, so a frozen or deadlocked
+	// poller is marked unhealthy and restarted by the supervisor.
+	mux.HandleFunc("/health", p.serveHealth)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln := p.cfg.AskLn
 	if ln == nil {
@@ -464,6 +472,40 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 	}
 	go func() { _ = srv.Serve(ln) }()
 	return srv
+}
+
+// Staleness limits before /health reports the poller stalled. The apply
+// loop wakes at least every adminProbeEvery (5s); the poll loop's backoff
+// is capped at BackoffCap (60s), so 90s allows one full backoff cycle.
+const (
+	applyStallLimit = 30 * time.Second
+	pollStallLimit  = 90 * time.Second
+)
+
+// serveHealth is the liveness endpoint the compose healthcheck polls. A
+// frozen (SIGSTOP'd) or deadlocked poller stops answering or answers 500,
+// which marks the container unhealthy so the supervisor restarts it rather
+// than silently serving a stale config. A refused dial in egress also fails
+// the forwarder via its unhealthy flag until the next Swap recreates it.
+func (p *Poller) serveHealth(w http.ResponseWriter, _ *http.Request) {
+	now := p.cfg.Now().UnixNano()
+	switch {
+	case now-p.applyTick.Load() > applyStallLimit.Nanoseconds():
+		p.log("error", "health: apply loop silent for %s", applyStallLimit)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "apply loop stalled")
+	case now-p.pollTick.Load() > pollStallLimit.Nanoseconds():
+		p.log("error", "health: poll loop silent for %s", pollStallLimit)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "poll loop stalled")
+	case p.fwd != nil && p.fwd.unhealthy.Load():
+		p.log("error", "health: egress forwarder listener died")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "egress forwarder unhealthy")
+	default:
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}
 }
 
 // serveAsk: the on-demand permission gate. Answers 200 only for a hostname

@@ -26,6 +26,18 @@ SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
 
 reconcile() {
   [ -f "$OFF" ] && exit 0 # operator (or an acceptance run) turned it off
+  # compose `up -d` ignores running-but-unhealthy containers — the poller
+  # goes unhealthy when its /health fails (a stalled loop or a dead egress
+  # listener); the edge when caddy's admin is wedged. Restart those, then
+  # let compose reconcile everything else.
+  for svc in edge poller; do
+    c="gatepost-edge-dev-$svc-1"
+    st=$(docker inspect --format '{{.State.Status}}/{{.State.Health.Status}}' "$c" 2>/dev/null)
+    if [ "$st" = "running/unhealthy" ]; then
+      echo "$(date -u +%H:%M:%S) restarting unhealthy $svc (reason: $st)"
+      docker restart "$c" >/dev/null
+    fi
+  done
   exec env GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$APIBASE" \
     docker compose -f "$COMPOSE" --profile poller up -d
 }
