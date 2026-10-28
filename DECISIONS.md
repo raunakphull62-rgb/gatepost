@@ -420,3 +420,17 @@ resilient; the one process that can notice the dead namespace is the poller
 itself, and exit-with-restart-policy is the only mechanism docker offers
 for it.
 
+**Poller downtime is a 502 window — accepted, documented (2026-10-28).**
+The egress forwarder listeners live in the poller process (they must: the
+dial guard runs at accept time in Go, not in caddy config), so any poller
+downtime 502s, and the listeners' ephemeral ports mean a restarted poller
+cannot serve before its first apply pushes the new ports (~0.3s after
+start). Measured on this box: a crashed poller (self-exit) restarts via
+docker's own policy and 502s for ~0.3s total; a `docker kill`ed poller
+bypasses the restart policy entirely (RestartCount stays 0, dockerd logs
+"stopping restart-manager") and waits for the supervisor timer — 0.8-0.9s
+when a tick coincides with the kill, 13.7s worst case on the 15s cadence.
+Deterministic forwarder ports were considered and rejected: they only
+remove the ~0.3s post-boot apply gap, not the downtime, which the
+supervisor bounds either way.
+

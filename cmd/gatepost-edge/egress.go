@@ -9,6 +9,10 @@
 // check and dial: there is no TOCTOU window. Nothing here trusts the build
 // time either: the dial guard is the rule that matters.
 //
+// shortcut: the poller process owns these listeners — its downtime 502s
+// (crash ~0.3s via restart policy; docker kill waits for the supervisor);
+// deterministic ports would only shave the ~0.3s re-apply, not the downtime.
+//
 // Port lifecycle across reloads: Swap assigns a port when an origin first
 // appears and keeps it stable while that origin remains in any config. A
 // dropped origin's port keeps LISTENING for exactly one more swap (caddy may

@@ -279,6 +279,55 @@ and tagged)
   snapshot. Proven both ways in a scratch worktree: guard reverted → FAIL
   (the retry loaded the `edge.invalid` deny-all shape); guard present → PASS.
 
+### Item-8 live kill evidence (2026-10-28, supervisor installed)
+- **`docker kill edge`**: the supervisor's `docker compose up -d` restarted
+  the edge at T0+4s (journal "Starting" 14:57:43 → "Healthy" 14:57:49), the
+  poller grace-exited at T0+15s (`caddy admin unreachable for 15.001s
+  (grace 15s) — exiting so docker's restart policy rejoins the edge's fresh
+  network namespace`) and came back via its restart policy, re-applying
+  snapshot generation 132 from disk. Traffic back in **16.4s**; during the
+  gap the API probe was down and the revoked-token 401s kept being logged
+  (last-good kept serving, HTTPS included).
+- **`docker kill poller`** (3 runs): RestartCount stayed 0 and dockerd logged
+  `stopping restart-manager` every time — a manual kill bypasses the restart
+  policy, so recovery came ONLY from the supervisor timer (15s cadence):
+  0.83s / 0.94s when a tick coincided with the kill, **13.7s worst case**
+  when the tick had just passed (poller down 15:04:30 → 15:04:43, supervisor
+  journal). While the poller is down requests 502 — the poller owns the
+  egress forwarder listeners, so caddy's upstreams die with it. The access
+  log pins kill #3's window to **0.856s**: last 200 15:06:02.508 → first 502
+  .637 (kill landed .602) → first 200 15:06:03.493, matching the restarted
+  poller's apply at .433. The earlier "~12s of 502s" read was arithmetic,
+  not outage: failed requests return in ~10ms, so 80 consecutive 502s ≈ 1s.
+- **Poller crash (self-exit — the realistic failure)**: signal to PID 1 from
+  inside the container (`docker exec … kill -9 1` is ignored by PID 1; the
+  SIGTERM fallback landed, "gatepost-edge stopped" then boot 291ms later,
+  snapshot applied at +293ms). RestartCount 0→1 — docker's OWN
+  restart-manager, not the supervisor (policy `unless-stopped`). **12 of 200
+  probes failed, spanning 0.29s.** So crashes self-heal in <1s; only manual
+  kills depend on the supervisor (bounded by its 15s cadence).
+- **One-off observed, not fully explained**: during acceptance run 2's
+  container churn the poller logged `snapshot refused: signature
+  verification failed (tampering?)` once at boot, treated the saved snapshot
+  as none (fail-closed), and re-applied generation 130 from the API 15ms
+  later. The envelope roundtrip is byte-preserving (`Payload` is a plain
+  string, atomic rename on save) and a key mismatch logs `unknown key`, not
+  `tampered` — so at that moment the on-disk payload genuinely didn't match
+  its HMAC. Root cause not pinned; the refusal path worked as designed.
+  Flagged for a follow-up look.
+- **Acceptance (item 3)**: `scripts/edge-accept.sh` twice, both **80 passed /
+  0 failed** (raw output `/tmp/opencode/edge-accept-run2.txt`, host
+  `accept-a-1793199201-26690.example.test`); d) took 60s (5s poll + 60s
+  cooldown), i) recovery 49s. **Egress firewall (item 4)**: `iptables -S
+  GATEPOST-EGRESS` diff empty before/during/after; allowlist
+  `-d 172.17.0.1/32 tcp --dport 8090`; jumps scoped `-s 172.28.0.0/24`;
+  unit active since boot 14:21:51. **Access logs (item 5)**:
+  `TestEdgeAccessLogs`, `TestLogThrottleBrands`,
+  `TestRepeatedFailureLinesThrottled`, `TestUnauthorized401OnePerGap`,
+  `TestSecretsNeverLogged` all pass; caddygen strips `request>uri`,
+  `request>headers`, `resp_headers` whole; e2e control proved the real
+  caddy binary is used (fails with `/bin/false`, passes with real caddy).
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:
