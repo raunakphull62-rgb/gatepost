@@ -262,6 +262,13 @@ and tagged)
 - Tests: `TestAdminGraceBailsOutOfDeadNamespace` (bail at a 200ms grace +
   the 60s grace holds through the joint cold start's ~2s of failures).
   Race suite green. Live evidence: item-8 kill runs below.
+- **ensureDenyAll guard pinned by a test** (`TestEnsureDenyAllDoesNotOvertakePendingConfig`):
+  a queued-but-not-yet-loaded config (appliedGeneration still 0) survives a
+  failing tick — without the `&& p.pending == nil` guard the zero document
+  REPLACES the pending config (enqueueApply overwrites unconditionally) and
+  the edge's next successful load is deny-all despite holding a good
+  snapshot. Proven both ways in a scratch worktree: guard reverted → FAIL
+  (the retry loaded the `edge.invalid` deny-all shape); guard present → PASS.
 
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).

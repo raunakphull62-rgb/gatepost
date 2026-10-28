@@ -551,6 +551,52 @@ func TestAdminGraceBailsOutOfDeadNamespace(t *testing.T) {
 	}
 }
 
+// The ensureDenyAll guard: a queued-but-not-yet-loaded config must survive
+// a tick that ends with nothing applied. This is the exact state the guard
+// names ("pending snapshot that is not yet applied": appliedGeneration == 0
+// while a real config waits, e.g. the admin refused the first /load).
+// Without the guard the zero document REPLACES the pending config —
+// enqueueApply overwrites pending unconditionally — and the edge's next
+// successful load is deny-all despite holding a perfectly good snapshot.
+func TestEnsureDenyAllDoesNotOvertakePendingConfig(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-denyall-pending"
+	fake := newFakeAPI(t, key, token) // env == nil: every poll fails, nothing is accepted
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	al.rejectNext(http.StatusBadRequest) // the queued config's first /load is REFUSED
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, t.TempDir(), base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 300 * time.Millisecond
+	p := NewPoller(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.startApply(ctx)
+
+	// A real config is queued (what accept does the moment a snapshot
+	// verifies) but not yet loaded — appliedGeneration is still 0.
+	p.enqueueApply(newAdminDoc(1, "pending.a.test"))
+	until(t, 5*time.Second, "first /load (the queued config, refused)", func() bool { return al.count() == 1 })
+	if body := al.lastBody(); !strings.Contains(body, "pending.a.test") {
+		t.Fatalf("first /load is not the queued config:\n%s", body)
+	}
+
+	// A tick with nothing applied runs while the retry waits out the cooldown.
+	p.tick(context.Background())
+
+	// The retry after the cooldown must carry the QUEUED config — not the
+	// deny-all shape an unguarded ensureDenyAll would have swapped in.
+	until(t, 5*time.Second, "retry after the cooldown", func() bool { return al.count() >= 2 })
+	if body := al.lastBody(); !strings.Contains(body, "pending.a.test") {
+		t.Fatalf("the queued config was overtaken — the retry loaded:\n%s", body)
+	}
+}
+
 // Without caddy wiring there is no /load and no forwarder, ever.
 func TestNoCaddyNoApply(t *testing.T) {
 	key := makeKey(t)
