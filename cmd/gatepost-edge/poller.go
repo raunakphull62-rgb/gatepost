@@ -85,6 +85,7 @@ type Config struct {
 	CertHourlyCap  int              // on-demand cert approvals per fixed hour window (default 50)
 	CaddyAccessLog string           // path of the edge's JSON access log; "" = logging off
 	ErrorLogGap    time.Duration    // min spacing of repeated failure lines (default 30s)
+	AdminGrace     time.Duration    // how long an unreachable caddy admin is tolerated before the process exits (default 15s)
 	Now            func() time.Time // clock for the cap window (tests)
 }
 
@@ -97,12 +98,14 @@ type Poller struct {
 	acked      int64              // last generation the API acknowledged
 	streak     int                // consecutive failed polls
 
-	fwd         *forwarder         // nil until startApply runs (caddy wiring)
-	applyKick   chan struct{}      // buffered 1: "the pending set changed"
-	pending     *snapshot.Document // newest verified doc not loaded into caddy yet
-	pendingHash string             // content hash of pending
-	appliedHash string             // content hash of what caddy is running
-	lastLoad    time.Time          // last /load attempt (success or failure)
+	fwd            *forwarder         // nil until startApply runs (caddy wiring)
+	applyKick      chan struct{}      // buffered 1: "the pending set changed"
+	pending        *snapshot.Document // newest verified doc not loaded into caddy yet
+	pendingHash    string             // content hash of pending
+	appliedHash    string             // content hash of what caddy is running
+	lastLoad       time.Time          // last /load attempt (success or failure)
+	adminFirstFail time.Time          // start of the current admin-unreachable window
+	adminFail      chan error         // the apply loop's one fatal outcome (errAdminGone)
 
 	throttle      *logThrottle // repeated identical failure lines resolve here
 	certWindow    time.Time    // start of the current on-demand cap window
@@ -154,6 +157,9 @@ func NewPoller(cfg Config) *Poller {
 	if cfg.ErrorLogGap <= 0 {
 		cfg.ErrorLogGap = 30 * time.Second // one failure line per gap is the flood cap
 	}
+	if cfg.AdminGrace <= 0 {
+		cfg.AdminGrace = 15 * time.Second // an orphaned namespace never heals; a slow caddy is up long before this
+	}
 	if cfg.AskURL == "" { // Caddy must reach the ask listener; derive its URL
 		switch {
 		case cfg.AskAddr != "":
@@ -177,7 +183,7 @@ func NewPoller(cfg Config) *Poller {
 			}
 		}
 	}
-	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1), throttle: newLogThrottle()}
+	return &Poller{cfg: cfg, applyKick: make(chan struct{}, 1), adminFail: make(chan error, 1), throttle: newLogThrottle()}
 }
 
 // Run starts the apply loop (caddy wiring) BEFORE the boot snapshot load so
@@ -203,6 +209,8 @@ func (p *Poller) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-p.adminFail:
+			return err // the apply loop's one fatal case: see errAdminGone
 		case <-timer.C:
 		}
 		p.tick(ctx)
@@ -438,6 +446,12 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/check", p.serveAsk)
 	mux.HandleFunc("/ask", p.serveAsk) // accept either anchor name; item 3 pins one
+	// compose healthcheck target: any answer means this process — and its
+	// network namespace — is alive. 200 by construction, no snapshot needed.
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln := p.cfg.AskLn
 	if ln == nil {

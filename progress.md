@@ -245,6 +245,24 @@ and tagged)
 
   before touching item 7.
 
+## 2026-10-28 — item 8: crash resilience (kill the edge, both come back)
+- **The failure, evidenced on this box**: `gatepost-edge-dev-poller-1`
+  `Exited (128) cannot join network namespace of a non running container` —
+  the poller shares the edge's netns (`network_mode: service:edge`); a
+  killed/restarted edge orphans it (loopback admin gone forever) and no
+  docker mechanism noticed, which is why the acceptance script restarted it
+  by hand.
+- **Fix**: the poller exits after `GP_EDGE_ADMIN_GRACE` (default 15s) of
+  continuous admin TRANSPORT failure (`errAdminGone` → `Run` → main
+  `log.Fatalf` → exit 1) → docker's `restart: unless-stopped` restarts it
+  into the edge's fresh namespace, where the saved snapshot re-applies.
+  Dial failures only; any caddy answer resets the window. Compose: edge
+  healthcheck (admin `/config`), poller healthcheck (new ask `/health`
+  route), `depends_on: edge: {condition: service_healthy, restart: true}`.
+- Tests: `TestAdminGraceBailsOutOfDeadNamespace` (bail at a 200ms grace +
+  the 60s grace holds through the joint cold start's ~2s of failures).
+  Race suite green. Live evidence: item-8 kill runs below.
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:

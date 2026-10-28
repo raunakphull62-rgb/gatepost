@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -490,6 +491,63 @@ func TestApplyFailureKeepsServing(t *testing.T) {
 	// swapped at accept, even when caddy's side was still failing).
 	if code := askGet(t, ask, "/check?domain=late.b.test"); code != http.StatusOK {
 		t.Fatalf("ask = %d, want 200 (in-memory state is newer than caddy)", code)
+	}
+}
+
+// The docker-kill shape: the edge container is killed, docker restarts the
+// EDGE — but this poller is left in the dead network namespace, where the
+// loopback admin can never answer again. After AdminGrace of continuous
+// transport failure the poller exits (Run returns errAdminGone → main
+// log.Fatalf → exit 1) so docker's restart policy drops it into the edge's
+// FRESH namespace, where the saved snapshot is applied again. A slow caddy
+// must NOT trip this: the default grace outlives the joint cold start by
+// orders of magnitude.
+func TestAdminGraceBailsOutOfDeadNamespace(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-admin-grace"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(newAdminDoc(1, "grace.a.test"))
+	base := fake.serve().URL
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "grace.a.test"))
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg.CaddyAdmin = closedPort(t) // nothing will ever listen there
+	cfg.AdminGrace = 200 * time.Millisecond
+	cfg.ReloadCooldown = 10 * time.Millisecond
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { done <- NewPoller(cfg).Run(ctx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errAdminGone) {
+			t.Fatalf("Run returned %v, want errAdminGone", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("poller did not bail out of the dead namespace within 10s")
+	}
+	if n := hook.count("exiting so docker"); n != 1 {
+		t.Fatalf("bail-out log lines = %d, want 1:\n%s", n, hook.all())
+	}
+
+	// The grace window must hold through the joint cold start: two transport
+	// failures ~2s apart (adminRetryDelay) never trip a 60s grace.
+	cfg2 := newTestCfg(t, hook, t.TempDir(), base, token, key)
+	cfg2.CaddyAdmin = closedPort(t)
+	cfg2.AdminGrace = 60 * time.Second
+	cfg2.ReloadCooldown = 10 * time.Millisecond
+	done2 := make(chan error, 1)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	t.Cleanup(cancel2)
+	go func() { done2 <- NewPoller(cfg2).Run(ctx2) }()
+	time.Sleep(2500 * time.Millisecond)
+	select {
+	case err := <-done2:
+		t.Fatalf("poller exited early with %v — the grace window did not hold", err)
+	default:
 	}
 }
 

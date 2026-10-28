@@ -22,6 +22,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,30 @@ import (
 // cold-start race: the poller boots before caddy's admin listens, and the
 // edge must converge as soon as caddy is ready, not one cooldown later.
 const adminRetryDelay = 2 * time.Second
+
+// errAdminGone: the apply loop's one fatal outcome. The caddy admin has been
+// unreachable for the whole AdminGrace window — on the real edge that is the
+// shared network namespace dying with a killed edge container (docker
+// restarts the EDGE, but this container is left in the dead namespace where
+// loopback can never answer again). No retry inside this process can fix it;
+// Run returns the error, main log.Fatalf's, and docker's restart policy drops
+// the container into the edge's FRESH namespace, where the saved snapshot is
+// applied again.
+var errAdminGone = errors.New("caddy admin unreachable beyond the grace window")
+
+// adminTransport reports whether err is a failure to REACH caddy's admin API
+// (a dial error) rather than caddy answering with a rejection ("caddy
+// /load:") or a local forwarder/generator failure. Only a dial failure can
+// mean the shared network namespace is gone.
+func adminTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return !strings.HasPrefix(s, "caddy /load:") &&
+		!strings.HasPrefix(s, "egress forwarder") &&
+		!strings.HasPrefix(s, "caddygen:")
+}
 
 // startApply builds the forwarder and the apply loop. Without CaddyAdmin
 // wired (tests / optional deployments), nothing here runs.
@@ -80,7 +105,14 @@ func (p *Poller) applyLoop(ctx context.Context) {
 			return
 		case <-p.applyKick:
 		}
-		for p.stepApply(ctx) {
+		for {
+			again, err := p.stepApply(ctx)
+			if err != nil { // errAdminGone: Run reports it and the process exits
+				return
+			}
+			if !again {
+				break
+			}
 			if ctx.Err() != nil {
 				return
 			}
@@ -88,31 +120,32 @@ func (p *Poller) applyLoop(ctx context.Context) {
 	}
 }
 
-// stepApply performs at most one /load attempt (false = no pending work).
-// The cooldown gates every attempt caddy ANSWERED — success or rejection —
-// so a failing edge retries at the same "once per 60s" pace it reloads
-// with. A TRANSPORT error (caddy's admin not answering — the joint
+// stepApply performs at most one /load attempt ((false, nil) = no pending
+// work). The cooldown gates every attempt caddy ANSWERED — success or
+// rejection — so a failing edge retries at the same "once per 60s" pace it
+// reloads with. A TRANSPORT error (caddy's admin not answering — the joint
 // cold-start race, the poller boots faster than caddy listens) opens no
 // cooldown window and retries after adminRetryDelay instead: an edge that
 // would otherwise sit denied for a cooldown must converge the moment its
-// caddy comes up.
-func (p *Poller) stepApply(ctx context.Context) bool {
+// caddy comes up. Transport errors that outlive AdminGrace are fatal:
+// (false, errAdminGone), delivered to Run via adminFail.
+func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 	p.mu.Lock()
 	pend, hash := p.pending, p.pendingHash
 	applied, last := p.appliedHash, p.lastLoad
 	p.mu.Unlock()
 	if pend == nil {
-		return false
+		return false, nil
 	}
 	if hash == applied {
-		return false // already running this content (dropped while we waited)
+		return false, nil // already running this content (dropped while we waited)
 	}
 	if wait := p.cfg.ReloadCooldown - time.Since(last); wait > 0 {
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
 		case <-time.After(wait):
-			return true // re-check: the pending set may have changed while we waited
+			return true, nil // re-check: the pending set may have changed while we waited
 		}
 	}
 	err := p.applyCaddy(ctx, pend)
@@ -129,21 +162,49 @@ func (p *Poller) stepApply(ctx context.Context) bool {
 		p.lastLoad = time.Now()
 	}
 	p.mu.Unlock()
-	if err != nil {
-		p.log("error", "caddy apply FAILED — keeping the last-good config: %v", err)
-		// caddyLoad wraps every caddy ANSWER (a rejected config) in a
-		// "caddy /load:" error; anything else is a transport failure.
-		retryAfter := adminRetryDelay
-		if strings.HasPrefix(err.Error(), "caddy /load:") {
-			retryAfter = p.cfg.ReloadCooldown
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(retryAfter):
-		}
+	if err == nil {
+		return true, nil
 	}
-	return true
+	p.log("error", "caddy apply FAILED — keeping the last-good config: %v", err)
+	if adminTransport(err) {
+		p.mu.Lock()
+		if p.adminFirstFail.IsZero() {
+			p.adminFirstFail = time.Now()
+		}
+		waited := time.Since(p.adminFirstFail)
+		grace := p.cfg.AdminGrace
+		p.mu.Unlock()
+		if waited >= grace {
+			// The one fatal case: loopback admin unreachable for the whole
+			// grace window. A slow caddy answers long before this; a dead
+			// network namespace never will.
+			p.log("error", "caddy admin unreachable for %s (grace %s) — exiting so docker's restart policy rejoins the edge's fresh network namespace",
+				waited.Round(time.Millisecond), grace)
+			select {
+			case p.adminFail <- errAdminGone:
+			default:
+			}
+			return false, errAdminGone
+		}
+	} else {
+		// Caddy answered (rejection) or the failure was local: the admin is
+		// demonstrably reachable, so the grace window starts over.
+		p.mu.Lock()
+		p.adminFirstFail = time.Time{}
+		p.mu.Unlock()
+	}
+	// caddyLoad wraps every caddy ANSWER (a rejected config) in a
+	// "caddy /load:" error; anything else is a transport failure.
+	retryAfter := adminRetryDelay
+	if strings.HasPrefix(err.Error(), "caddy /load:") {
+		retryAfter = p.cfg.ReloadCooldown
+	}
+	select {
+	case <-ctx.Done():
+		return false, nil
+	case <-time.After(retryAfter):
+	}
+	return true, nil
 }
 
 // applyCaddy: swap forwarder ports FIRST, generate, POST /load.

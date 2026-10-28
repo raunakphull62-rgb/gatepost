@@ -379,3 +379,41 @@ firewall is not even consulted — and would pass it as public anyway.
 The API stores the literal IP; no DNS is involved. A preflight in the
 acceptance script refuses to run if the host already routes that range.
 
+## 2026-10-28 — A killed edge container resurrects BOTH containers with no manual commands (B3b item 8)
+
+**Rule.** `docker kill` on the edge container must end with the edge AND the
+poller serving again on their own. The edge recovers by docker's own
+`restart: unless-stopped`; the poller — which shares the edge's network
+namespace (`network_mode: service:edge`) — recovers by EXITING and letting
+the same policy restart it into the edge's fresh namespace.
+
+**Mechanics.** When the edge container dies, docker recreates its network
+namespace on restart, but the poller keeps running inside the ORPHANED old
+one: loopback 2019 (the admin API) can never answer again, and no docker
+mechanism notices (restart policies fire on process exit; healthchecks only
+report). So the poller's apply loop now keeps a deadline: transport failures
+reaching the admin are tolerated for `GP_EDGE_ADMIN_GRACE` (default 15s —
+the joint cold start's caddy answers in ~2s, an orphaned namespace never
+answers), then `stepApply` returns `errAdminGone`, `Run` returns it, main
+`log.Fatalf`s (exit 1), and docker's `restart: unless-stopped` starts the
+container again — this time joining the edge's CURRENT namespace, where the
+boot load re-applies the saved snapshot. Only dial failures count
+(`adminTransport`: not a `caddy /load:` rejection, not a forwarder/caddygen
+local error); any caddy answer resets the window. The same grace covers
+`docker restart edge`, which orphans the poller identically.
+
+**Mechanics, compose.** Both services carry healthchecks (edge: caddy admin
+`/config`; poller: the ask listener's new `/health` route — any answer means
+the process and its loopback are alive), and the poller's `depends_on` is
+the long form `edge: {condition: service_healthy, restart: true}`, so
+compose-driven restarts/recreations of the edge also restart the poller in
+order. The daemon-level kill case is the grace exit; the compose-level case
+is `restart: true`.
+
+**Why.** The acceptance script had to stop/recreate the poller BY HAND
+around every edge restart (its section a) — evidence that no automatic
+path existed. An edge that needs an operator after a crash is not crash
+resilient; the one process that can notice the dead namespace is the poller
+itself, and exit-with-restart-policy is the only mechanism docker offers
+for it.
+

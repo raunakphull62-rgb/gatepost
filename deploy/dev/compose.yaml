@@ -10,6 +10,15 @@ services:
       dockerfile: Dockerfile.edge
     image: gatepost-edge:dev
     restart: unless-stopped
+    healthcheck:
+      # The admin API answering is the edge's liveness (caddy's own process
+      # health): the bootstrap config and every generated config listen on
+      # 2019. Any answer = healthy; the poller's depends_on gates on this.
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:2019/config"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     ports:
       - "8081:80"
       - "8445:443"
@@ -54,8 +63,24 @@ services:
       dockerfile: deploy/dev/Dockerfile.poller
     image: gatepost-poller:dev
     restart: unless-stopped
-    depends_on: [edge]
+    depends_on:
+      edge:
+        condition: service_healthy
+        # docker kill on the edge leaves this container in the dead network
+        # namespace; compose restarts it whenever the edge is restarted or
+        # recreated (the daemon-level kill case is the poller's own
+        # AdminGrace exit + restart policy).
+        restart: true
     network_mode: "service:edge"
+    healthcheck:
+      # The ask listener answering /health means this process is alive AND
+      # its loopback still works — the check dies with a killed edge
+      # container exactly like the poller itself does.
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8099/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     environment:
       GP_EDGE_API_BASE: ${GP_EDGE_API_BASE:-http://172.17.0.1:8080}
       GP_EDGE_TOKEN_FILE: /run/secrets/token

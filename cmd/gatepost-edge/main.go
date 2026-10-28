@@ -80,6 +80,7 @@ func loadConfig() Config {
 		CaddyHTTPS: firstNonEmpty(os.Getenv("GP_EDGE_HTTPS_ADDR"), ":443"),
 
 		ReloadCooldown: durEnv("GP_EDGE_RELOAD_COOLDOWN", 60*time.Second),
+		AdminGrace:     durEnv("GP_EDGE_ADMIN_GRACE", 15*time.Second),
 		AllowLoopback:  allowLoopback,
 		Interval:       durEnv("GP_EDGE_POLL_INTERVAL", 5*time.Second),
 		BackoffCap:     durEnv("GP_EDGE_BACKOFF_CAP", 60*time.Second),
