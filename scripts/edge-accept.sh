@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Gatepost edge acceptance (item 7). Runs against the REAL compose stack
 # (edge + poller + the realistic origin-test container), the REAL API on
-# 172.17.0.1:8080 (this script owns it for the whole run) and a node minted
+# 172.17.0.1:8090 (this script owns it for the whole run) and a node minted
 # for the run. Proves, with a PASS/FAIL line each:
 #
 #   fixture  origin-test through the edge: /ok /slow /big /redirect (passed
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 
 COMPOSE=deploy/dev/compose.yaml
 SECRETS=deploy/dev/secrets
-API=http://172.17.0.1:8080
+API=http://172.17.0.1:8090
 EDGE_HTTP=http://127.0.0.1:8081
 EDGE_HTTPS=https://127.0.0.1:8445
 ORIGIN_IP=192.88.99.10
@@ -58,7 +58,7 @@ section() { echo; echo "== $*"; }
 
 # dc — every compose call: root for the docker socket, internal issuer so
 # the run mints certificates deterministically and never touches ACME.
-dc() { sudo env GP_EDGE_ISSUER=internal docker compose -f "$COMPOSE" --profile poller "$@"; }
+dc() { sudo env GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$API" docker compose -f "$COMPOSE" --profile poller "$@"; }
 
 # until_ok <timeout-s> <what> <shell-condition>: evaluated in THIS shell
 # (dc is a function) until it succeeds; a FAIL line on timeout.
@@ -86,7 +86,7 @@ kill_api() { if [ -n "${API_PID:-}" ]; then sudo kill "$API_PID" 2>/dev/null; AP
 # start_api: clean environment, this run's operator + snapshot key, the
 # stub as its only resolver. .env (cwd) supplies the database URL.
 start_api() {
-  env -i ENV=development GP_HTTP_ADDR=172.17.0.1:8080 \
+  env -i ENV=development GP_HTTP_ADDR=172.17.0.1:8090 \
     GP_DNS_RESOLVERS=127.0.0.1:5344 GP_SNAPSHOT_KEY="$KEY" \
     GP_OPERATOR_EMAILS="$U" GP_TRUSTED_PROXIES=127.0.0.1/32 \
     ./gatepost >/tmp/gatepost-edge-accept-api.log 2>&1 &
@@ -103,7 +103,15 @@ start_api() {
 # --- 0. preflight: binary, ports, the API address is ours ------------------
 section "setup"
 go build -o gatepost ./cmd/gatepost || exit 2
-OLD_PID=$(sudo ss -ltnp 'sport = :8080' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+
+# Tear down any leftover stack FIRST — dc down removes the docker networks
+# (and their 192.88.99.0/24 route), so the preflight check below passes.
+dc down >/dev/null 2>&1
+for v in caddy_data caddy_config poller_state; do sudo docker volume rm "gatepost-edge-dev_$v" >/dev/null 2>&1; done
+
+# Kill any leftover process on the API port (port 8090, not 8080 — docker's
+# NAT for the host-publish 8080 would intercept 172.17.0.1:8080).
+OLD_PID=$(sudo ss -ltnp 'sport = :8090' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 if [ -n "$OLD_PID" ]; then sudo kill "$OLD_PID" 2>/dev/null; sleep 1; fi
 # a previous run's stub can survive a killed script (it has no parent to
 # clean it up); the port is ours for this run
@@ -151,8 +159,6 @@ start_api && pass "API up on $API"
 
 # the compose stack: fresh volumes (certs, caddy state, poller state) so
 # every byte of this run's access log and cert store belongs to this run
-dc down >/dev/null 2>&1
-for v in caddy_data caddy_config poller_state; do sudo docker volume rm "gatepost-edge-dev_$v" >/dev/null 2>&1; done
 dc up -d --build edge origin-test >/dev/null 2>&1 \
   && pass "compose stack rebuilt: edge + origin-test (fresh volumes)" \
   || { fail "compose up failed"; exit 2; }
@@ -217,10 +223,22 @@ check "/chunked: all three chunks arrived" \
 section "a) cold start with the API down and a saved snapshot"
 kill_api
 check "API is down" "$(code_of "$API/api/me")" "000"
-dc restart edge poller >/dev/null 2>&1
+# Restart edge and poller in dependency order: the poller shares the edge's
+# network namespace (network_mode: service:edge), so edge must be running
+# before the poller starts. A combined "dc restart edge poller" races — Docker
+# Compose starts the poller before the edge's namespace is ready, and the
+# poller exits (cannot join network namespace). Stop poller, restart edge,
+# wait for edge, then recreate the poller.
+dc stop poller >/dev/null 2>&1
+dc restart edge >/dev/null 2>&1
+# Edge needs ~1s to boot Caddy and bind :80/:443.
+until_ok 10 "edge is back after restart" 'code_of "$EDGE_HTTP/ok"' >/dev/null 2>&1 || true
+dc up -d --force-recreate poller >/dev/null 2>&1
 until_ok 45 "the restarted edge serves from the SAVED snapshot" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
-C=$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "$EDGE_HTTPS/ok")
+until_ok 15 "a) https serves the snapshot (on-demand internal cert)" \
+  '[ "$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "https://$HOST:8445/ok")" = "200" ]'
+C=$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "https://$HOST:8445/ok")
 check "a) https serves too (ask answers from the snapshot, internal cert)" "$C" "200"
 
 # --- b) cold start, no snapshot -------------------------------------------
@@ -244,7 +262,8 @@ until_ok 120 "the poller refetches a good config after the no-snapshot boot" \
 dc exec poller sh -c "sed -i 's/9001/9003/' /state/snapshot.json"
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")
 check "c) edge serves while the on-disk snapshot is tampered (caddy untouched)" "$C" "200"
-dc restart poller >/dev/null 2>&1
+dc stop poller >/dev/null 2>&1
+dc start poller >/dev/null 2>&1
 until_ok 30 "the restarted poller REJECTS the tampered snapshot (log line)" \
   'dc logs --since 2m poller 2>/dev/null | grep -q -e "failed verification" -e "unusable"'
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")

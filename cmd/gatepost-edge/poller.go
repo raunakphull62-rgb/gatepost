@@ -244,7 +244,7 @@ func (p *Poller) tick(ctx context.Context) {
 // and enqueueApply's content-hash gate makes repeats no-ops — a node that
 // has, or then gets, a real snapshot never re-queues it.
 func (p *Poller) ensureDenyAll() {
-	if p.appliedGeneration() == 0 {
+	if p.appliedGeneration() == 0 && p.pending == nil {
 		p.enqueueApply(snapshot.Document{})
 	}
 }
