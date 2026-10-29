@@ -6,8 +6,8 @@ name: gatepost-edge-dev
 services:
   edge:
     build:
-      context: .
-      dockerfile: Dockerfile.edge
+      context: ../..
+      dockerfile: deploy/dev/Dockerfile.edge
     image: gatepost-edge:dev
     restart: unless-stopped
     healthcheck:
