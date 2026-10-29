@@ -9,9 +9,11 @@ RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
 # cache-handler: the official Caddy plugin built on Souin v1.7.9 (the souin
 # repo's own plugins/souin module is a standalone program, not a Caddy
 # module; cache-handler is what `caddyxcaddy` integrations use).
+COPY x/wafredactor/*.go go.mod go.sum /tmp/wafredactor/
 RUN CGO_ENABLED=0 xcaddy build v2.11.7 \
     --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 \
     --with github.com/caddyserver/cache-handler@v0.17.0 \
+    --with gatepost/x/wafredactor=/tmp/wafredactor \
     --output /out/caddy
 
 FROM alpine:3.21
