@@ -82,12 +82,17 @@ type Config struct {
 	ReloadCooldown time.Duration // min spacing between caddy /loads (default 60s)
 	AllowLoopback  bool          // TEST/DEMO hook: egress may dial loopback origins
 
-	Issuer         string           // staging (default) | internal | production
-	CertHourlyCap  int              // on-demand cert approvals per fixed hour window (default 50)
-	CaddyAccessLog string           // path of the edge's JSON access log; "" = logging off
-	ErrorLogGap    time.Duration    // min spacing of repeated failure lines (default 30s)
-	AdminGrace     time.Duration    // how long an unreachable caddy admin is tolerated before the process exits (default 15s)
-	Now            func() time.Time // clock for the cap window (tests)
+	Issuer         string        // staging (default) | internal | production
+	CertHourlyCap  int           // on-demand cert approvals per fixed hour window (default 50)
+	CaddyAccessLog string        // path of the edge's JSON access log; "" = logging off
+	ErrorLogGap    time.Duration // min spacing of repeated failure lines (default 30s)
+	AdminGrace     time.Duration // how long an unreachable caddy admin is tolerated before the process exits (default 15s)
+
+	// WAF configures the Coraza edge WAF surfaced into generated Caddy JSON.
+	// Mode "detection" (the dev default) = CRS rules log+audit but never block
+	// (SecRuleEngine DetectionOnly). "blocking" / "off" for item 2 only.
+	WAF WAFConfig
+	Now func() time.Time // clock for the cap window (tests)
 }
 
 type Poller struct {

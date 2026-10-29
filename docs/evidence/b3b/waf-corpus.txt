@@ -1,0 +1,31 @@
+B3c corpus: host=accept-a-1792999531-13000.example.test mode=detection-only secret=z4X9qKm7vLp2wRn8sT1uHb3fGd0yJe5Ac6Oi4E
+audit engine: SecAuditEngine On (RelevantOnly+recommends' relevant-status 
+  excludes 200 -> attacks pass-through undetected; On audits all, redaction 
+  still holds: Part A has no HTTP data, normal traffic matches no rule -> empty H)
+
+=== ATTACK CORPUS (DetectionOnly => NOT 403; pass-through to origin) ===
+  sqli-query     code=200 fail-open
+  xss-query      code=200 fail-open
+  traversal      code=502 fail-open
+  admin-scan     code=502 fail-open
+  scanner-ua     code=200 fail-open
+  sqli-body      code=200 fail-open
+
+=== NORMAL CORPUS (expect 200; not 403 => no false-positive block) ===
+  json-body      code=200 pass
+  form-body      code=200 pass
+  file-upload    code=200 pass
+  quoted-search  code=200 pass
+  cookie-secret  code=200 pass
+  plain-get      code=200 pass
+
+=== REDACTION CHECK (audit log) ===
+  rule id 913100: 1 occurrence(s) (attack logged)
+  rule id 942100: 2 occurrence(s) (attack logged)
+  rule id 941100: 1 occurrence(s) (attack logged)
+  rule id 949110: 5 occurrence(s) (attack logged)
+  audit bytes: 9766
+  audit lines: 95
+  SECRET occurrences in audit: 0 (MUST be 0)
+  Part A headers (-H--): 12 (attack txns)
+  Part Z terminators (-Z--): 12

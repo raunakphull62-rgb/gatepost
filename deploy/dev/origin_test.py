@@ -34,6 +34,23 @@ class OriginHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # a client that hangs up mid-stream is not a crash
 
+    # POST reuses the same routing so the B3c corpus can send JSON/form/upload
+    # bodies through the edge and assert a clean 200 (not a WAF block). The
+    # body is consumed by the edge's request_body handler; the origin just
+    # needs to accept the method and return 200.
+    def do_POST(self):
+        try:
+            # Drain the body so the upstream connection stays healthy.
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length:
+                self.rfile.read(length)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        try:
+            self.route()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def route(self):
         port = self.server.server_address[1]
         path = self.path.split("?", 1)[0]

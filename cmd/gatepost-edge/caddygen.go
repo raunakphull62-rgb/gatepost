@@ -76,6 +76,8 @@ type CaddyParams struct {
 	// access logging off). The path lives on the edge's own data volume;
 	// the poller only names it in every generated config.
 	AccessLogPath string
+
+	WAF WAFConfig // B3c: Coraza wiring surfaced as Caddy JSON; Mode off|detection|blocking
 }
 
 type caddyConfig struct {
@@ -366,6 +368,10 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 
 	routes := make([]caddyRoute, 0, len(doms)+1)
 	logged := p.AccessLogPath != ""
+	waf, werr := wafHandler(p.WAF) // B3c: one validated handler, reused across routes
+	if werr != nil {
+		return nil, werr
+	}
 	for _, dm := range doms {
 		port, ok := p.EgressPorts[originKey(dm.Origin)]
 		if !ok {
@@ -385,6 +391,9 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		handle = append(handle, requestBodyHandler{Handler: "request_body", MaxSize: maxBodyBytes})
 		if logged {
 			handle = append(handle, logAppendsOnce(originVar)...)
+		}
+		if waf != nil {
+			handle = append(handle, waf) // B3c: inspect before reverse_proxy; response inspection is off
 		}
 		rp := reverseProxyHandler{
 			Handler: "reverse_proxy",
@@ -603,4 +612,132 @@ func portsOf(httpAddr, httpsAddr string) (int, int, error) {
 		httpsPort = p
 	}
 	return httpPort, httpsPort, nil
+}
+
+// ---- B3c: Coraza WAF wiring (item 1: detection-only for all hosts) ----------
+//
+// coraza-caddy v2.6.2 is already compiled into the edge image (Dockerfile.edge
+// line 13). These types and helpers emit the coraza.waf handler in the JSON
+// pushed to Caddy's /load. The module ID is "http.handlers.waf"
+// (CaddyModule().ID in coraza-caddy v2.6.2/coraza.go).
+
+// WAFConfig is the edge's Coraza wiring surfaced as Caddy JSON. Mode is a
+// closed set so a hostile snapshot can only pick off|detection|blocking — it
+// can never splice itself into the SecAction directives (those live only in
+// the poller's trusted config, see corazaDirectives). Item 1 hard-wires
+// detection-only for every served host; item 2 will derive Mode per-domain
+// from the signed snapshot.Document.
+type WAFConfig struct {
+	Mode             string // "off" (default) | "detection" | "blocking"
+	AuditLogPath     string // required when Mode != off; native-format file (parts A+H+Z)
+	RequestBodyLimit int64  // bytes the WAF inspects; 0 = the edge body cap (maxBodyBytes)
+	ParanoiaLevel    int    // CRS paranoia level (1 default)
+}
+
+// corazaWAF is the JSON shape of the coraza-caddy handler. load_owasp_crs
+// merges the embedded coraza-coreruleset/v4 (v4.25.0, pinned in
+// coraza-caddy v2.6.2/go.mod) into the module's rootfs so the @-prefixed
+// Includes resolve without any mounted rule files.
+type corazaWAF struct {
+	Handler      string `json:"handler"` // "waf" (short name → http.handlers.waf)
+	LoadOWASPCRS bool   `json:"load_owasp_crs"`
+	Directives   string `json:"directives"` // ModSecurity-style SecActions/rules
+}
+
+// wafHandler validates Mode and builds the handler for the route chain. nil
+// (no error) means Mode is off/empty → no handler injected, so the B3b golden
+// configs (WAF absent) are byte-for-byte unchanged.
+func wafHandler(w WAFConfig) (*corazaWAF, error) {
+	mode := strings.ToLower(strings.TrimSpace(w.Mode))
+	if mode == "" || mode == "off" {
+		return nil, nil
+	}
+	if mode != "detection" && mode != "blocking" {
+		return nil, fmt.Errorf("caddygen: unknown WAF mode %q (want off|detection|blocking)", w.Mode)
+	}
+	d, err := corazaDirectives(mode, w)
+	if err != nil {
+		return nil, err
+	}
+	return &corazaWAF{
+		Handler:      "waf", // short name; Caddy resolves to http.handlers.waf
+		LoadOWASPCRS: true,
+		Directives:   d,
+	}, nil
+}
+
+// corazaDirectives emits the ModSecurity-style directives for the WAF. The
+// string is identical for every host route (one global mode), so coraza-caddy's
+// wafPool shares and reuses one WAF instance across reloads.
+//
+// detection-only (item 1): SecRuleEngine DetectionOnly makes every CRS rule
+// log + audit but never execute a disruptive action, so an attack is seen and
+// recorded while the request still reaches reverse_proxy — fail-open by
+// construction. (coraza-caddy's ServeHTTP returns 500 only on an internal
+// processRequest error; a body larger than SecRequestBodyLimit is handled with
+// ProcessPartial, so oversized bodies are partially inspected and pass
+// through — never rejected by the WAF.)
+//
+// audit redaction (the hard constraint): coraza v3.8.1's JSON audit formatter
+// does json.Marshal of the whole transaction (Parts_ is tagged json:"-"), so
+// the JSON format canNOT be redacted by SecAuditLogParts — it always dumps
+// request body, every header (cookies), the request URI (query), and the
+// response. The NATIVE formatter honours Parts_, so we use native + "AHZ":
+//
+//	A = header (timestamp, tx id, client/host IP+port) — no body/headers/query.
+//	H = matched-rule trailer (rule id, msg, matched variable NAME, and coraza's
+//	    native [uri "..."] which carries the request path+query of the request
+//	    that tripped the rule).
+//	Z = empty end-marker (coraza REQUIRES the parts string to end with Z).
+//
+// Parts B (request headers+uri), C (body), E/F/G (response), J (uploads) and
+// K (raw rule log) are EXCLUDED → no request body, no cookies, no response.
+// Under `On` every transaction is audited, but Part A carries no HTTP data
+// (timestamp/txid/IPs only), and Part H fires only on a rule match, so a
+// normal request (no CRS match) emits a header-only entry with no
+// body/cookies/headers/query -- the planted secret never appears.
+func corazaDirectives(mode string, w WAFConfig) (string, error) {
+	if w.AuditLogPath == "" {
+		return "", fmt.Errorf("caddygen: WAF mode %q enabled but AuditLogPath empty — the audit log path must be explicit", mode)
+	}
+	par := w.ParanoiaLevel
+	if par <= 0 {
+		par = 1 // CRS default; pinned for an explicit contract
+	}
+	limit := w.RequestBodyLimit
+	if limit <= 0 {
+		limit = maxBodyBytes // inspect up to the edge's own body cap
+	}
+	engine := "DetectionOnly"
+	if mode == "blocking" {
+		engine = "On" // item 2 only: CRS thresholds then block
+	}
+	b := strings.Builder{}
+	b.WriteString("Include @coraza.conf-recommended\n")
+	b.WriteString("Include @crs-setup.conf.example\n")
+	b.WriteString("Include @owasp_crs/*.conf\n")
+	// SecDefaultAction is NOT emitted here: @crs-setup.conf.example defines the
+	// phase:1/phase:2 default actions (log,auditlog,pass) and coraza rejects a
+	// second SecDefaultAction for an already-set phase. SecRuleEngine below
+	// then makes that pass action non-disruptive in DetectionOnly.
+	b.WriteString(fmt.Sprintf(`SecAction "id:900000,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',ver:'OWASP_CRS/4.25.0',setvar:tx.blocking_paranoia_level=%d,setvar:tx.detection_paranoia_level=%d"`, par, par) + "\n")
+	b.WriteString("SecRuleEngine " + engine + "\n") // repeat: re-sets engine (not phase-unique, unlike SecDefaultAction)
+	b.WriteString("SecRequestBodyAccess On\n")
+	b.WriteString(fmt.Sprintf("SecRequestBodyLimit %d", limit))
+	b.WriteString("\n")
+	b.WriteString("SecRequestBodyLimitAction ProcessPartial\n") // fail-open: oversized bodies inspected up to the limit, never rejected
+	b.WriteString("SecResponseBodyAccess Off\n")
+	// Audit every transaction (On). NOTE: RelevantOnly under coraza v3.8.1 did not
+	// emit an audit entry for rule matches whose response stayed 200 (DetectionOnly
+	// pass-through), so the serial file was never created — On makes detection
+	// auditing reliable. Redaction still holds: Part A has only timestamp/txid/IPs
+	// (no body/cookies/headers/query), Part H has only the matched-rule trailer,
+	// and a normal request matches no rule so its H is empty (no secret leakage).
+	b.WriteString("SecAuditEngine On\n")
+	b.WriteString("SecAuditLogType Serial\n")
+	b.WriteString(fmt.Sprintf("SecAuditLog %s", w.AuditLogPath))
+	b.WriteString("\n")
+	b.WriteString("SecAuditLogFormat Native\n") // JSON would dump the full transaction; native honours Parts for redaction
+	b.WriteString("SecAuditLogParts AHZ\n")     // A=tx header; H=matched-rule trailer; Z=empty terminator (coraza requires parts to end with Z)
+	return b.String(), nil
 }

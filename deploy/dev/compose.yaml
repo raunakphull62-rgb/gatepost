@@ -97,6 +97,13 @@ services:
       # generated caddy config; caddy's file writer on the edge volume
       # (caddy_data) creates the dir and rolls at 10MB x5. Empty = logging off.
       GP_EDGE_ACCESS_LOG: /data/logs/access.json
+      # B3c item 1: Coraza edge WAF, detection-only for every served host.
+      # CRS rules log+audit (never block). Edge ships coraza-caddy v2.6.2.
+      # Audit native-format parts A+H only (no body/cookies/headers/query).
+      GP_EDGE_WAF_MODE: ${GP_EDGE_WAF_MODE:-detection}
+      GP_EDGE_WAF_AUDIT_LOG: ${GP_EDGE_WAF_AUDIT_LOG:-/data/logs/waf_audit.log}
+      GP_EDGE_WAF_BODY_LIMIT_MB: ${GP_EDGE_WAF_BODY_LIMIT_MB:-10}
+      GP_EDGE_WAF_PARANOIA: ${GP_EDGE_WAF_PARANOIA:-1}
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state

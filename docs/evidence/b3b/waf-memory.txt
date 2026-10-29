@@ -1,0 +1,21 @@
+B3c item 1: edge container memory - coraza WAF (detection-only).
+
+BEFORE (no Coraza handler): ~29 MiB gatepost-edge-dev-edge-1
+  (pre-corza baseline, caddy + poller TLS + access log).
+
+AFTER (coraza-caddy v2.6.2 + OWASP CRS v4.25.0 in-process, detection-only,
+  debug logging OFF, waf_audit.log append-active):
+  59.48 MiB  gatepost-edge-dev-edge-1   CPU 0.00% / 0.77% MEM / 8 PIDs
+  Measured after `docker compose up --force-recreate edge` + poller restart
+  that re-applied the corza handler (SecAuditEngine On, parts AHZ).
+
+Delta: +30 MiB resident. The cost of the coraza-caddy module + the CRS
+  v4.25.0 rule set (~30 rule files, ~800 rules incl. libinjection/paranoia),
+  compiled into the caddy binary. The WAF instance is pooled across Caddy
+  reloads (wafPool), so config reloads do NOT duplicate the rule set.
+  No leak observed: a clean edge restart returns to 59.48 MiB steady-state.
+
+NOTE: probing with Caddy DEBUG logging inflates RSS to ~141 MiB (debug log
+  buffers + JSON marshalling heap churn); production runs at INFO.
+
+Source: docker stats --no-stream gatepost-edge-dev-edge-1

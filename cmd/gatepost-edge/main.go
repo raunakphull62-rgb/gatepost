@@ -90,6 +90,13 @@ func loadConfig() Config {
 
 		CaddyAccessLog: accessLog,
 		ErrorLogGap:    durEnv("GP_EDGE_ERROR_LOG_GAP", 30*time.Second),
+
+		// B3c: Coraza edge WAF. Detection-only by default on the dev stack
+		// (via deploy/dev compose env); the binary itself defaults OFF so a
+		// non-coraza caddy (and tests) get unchanged configs. The dev stack
+		// sets GP_EDGE_WAF_MODE=detection, which injects the coraza.waf
+		// handler with CRS loaded and audit to a bounded native-format file.
+		WAF: wafEnv(),
 	}
 }
 
@@ -126,6 +133,23 @@ func envRequired(name, what string) string {
 		log.Fatalf("%s must be set (%s)", name, what)
 	}
 	return v
+}
+
+// wafEnv: B3c edge WAF config from env. Default mode is OFF in the binary so a
+// non-coraza caddy (and the e2e tests) get byte-identical configs; the dev
+// stack opts into detection-only via GP_EDGE_WAF_MODE=detection.
+func wafEnv() WAFConfig {
+	mode := strings.ToLower(strings.TrimSpace(firstNonEmpty(os.Getenv("GP_EDGE_WAF_MODE"), "off")))
+	if mode != "off" && mode != "detection" && mode != "blocking" {
+		log.Fatalf("GP_EDGE_WAF_MODE=%q (want off|detection|blocking)", mode)
+	}
+	audit := firstNonEmpty(os.Getenv("GP_EDGE_WAF_AUDIT_LOG"), "data/logs/waf_audit.log")
+	limit := int64(intEnv("GP_EDGE_WAF_BODY_LIMIT_MB", 32)) * 1024 * 1024
+	par := intEnv("GP_EDGE_WAF_PARANOIA", 1)
+	if par < 1 || par > 4 {
+		log.Fatalf("GP_EDGE_WAF_PARANOIA=%d (CRS paranoia is 1..4)", par)
+	}
+	return WAFConfig{Mode: mode, AuditLogPath: audit, RequestBodyLimit: limit, ParanoiaLevel: par}
 }
 
 // envOrFile: env value first, else the mounted FILE (docker secrets style);

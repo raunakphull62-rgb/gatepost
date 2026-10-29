@@ -275,6 +275,7 @@ func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document) error {
 		AskURL:        p.cfg.AskURL,
 		Issuer:        p.cfg.Issuer,
 		AccessLogPath: p.cfg.CaddyAccessLog,
+		WAF:           p.cfg.WAF,
 	})
 	if err != nil {
 		return err
