@@ -368,7 +368,7 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 
 	routes := make([]caddyRoute, 0, len(doms)+1)
 	logged := p.AccessLogPath != ""
-	waf, werr := wafHandler(p.WAF) // B3c: one validated handler, reused across routes
+	waf, werr := wafHandler(p.WAF, doms) // B3c: one validated handler, reused across routes
 	if werr != nil {
 		return nil, werr
 	}
@@ -625,10 +625,10 @@ func portsOf(httpAddr, httpsAddr string) (int, int, error) {
 // closed set so a hostile snapshot can only pick off|detection|blocking — it
 // can never splice itself into the SecAction directives (those live only in
 // the poller's trusted config, see corazaDirectives). Item 1 hard-wires
-// detection-only for every served host; item 2 will derive Mode per-domain
-// from the signed snapshot.Document.
+// detection-only for every served host; item 2 derives Mode per-domain from
+// the signed snapshot.Document, emitting host-scoped ctl actions at phase:1.
 type WAFConfig struct {
-	Mode             string // "off" (default) | "detection" | "blocking"
+	Mode             string // "off" (default) | "detection" | "blocking" — the GLOBAL default
 	AuditLogPath     string // required when Mode != off; redacted Part A+H+Z native-format file (x/wafredactor)
 	RequestBodyLimit int64  // bytes the WAF inspects; 0 = the edge body cap (maxBodyBytes)
 	ParanoiaLevel    int    // CRS paranoia level (1 default)
@@ -644,10 +644,16 @@ type corazaWAF struct {
 	Directives   string `json:"directives"` // ModSecurity-style SecActions/rules
 }
 
-// wafHandler validates Mode and builds the handler for the route chain. nil
-// (no error) means Mode is off/empty → no handler injected, so the B3b golden
-// configs (WAF absent) are byte-for-byte unchanged.
-func wafHandler(w WAFConfig) (*corazaWAF, error) {
+// wafHandler validates Mode and builds the handler. nil (no error) means Mode
+// is off/empty → no handler injected, so the B3b golden configs (WAF absent)
+// are byte-for-byte unchanged.
+//
+// The directives include host-scoped phase:1 SecRules that use ctl actions to
+// override the global engine mode and remove specific rules per host — ONE
+// shared Coraza WAF instance across all hosts (≈30 MiB), not one per host.
+// coraza v3.8.1 supports both ctl:ruleEngine and ctl:ruleRemoveById at
+// phase:1, before any CRS rule fires.
+func wafHandler(w WAFConfig, doms []snapshot.Domain) (*corazaWAF, error) {
 	mode := strings.ToLower(strings.TrimSpace(w.Mode))
 	if mode == "" || mode == "off" {
 		return nil, nil
@@ -655,7 +661,7 @@ func wafHandler(w WAFConfig) (*corazaWAF, error) {
 	if mode != "detection" && mode != "blocking" {
 		return nil, fmt.Errorf("caddygen: unknown WAF mode %q (want off|detection|blocking)", w.Mode)
 	}
-	d, err := corazaDirectives(mode, w)
+	d, err := corazaDirectives(mode, w, doms)
 	if err != nil {
 		return nil, err
 	}
@@ -712,7 +718,7 @@ func wafHandler(w WAFConfig) (*corazaWAF, error) {
 // Audit file mode: 0644 (coraza default). No shared volume, no 0666 — the
 // poller no longer touches the audit file; the on-disk format is already
 // secret-free at format time.
-func corazaDirectives(mode string, w WAFConfig) (string, error) {
+func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string, error) {
 	if w.AuditLogPath == "" {
 		return "", fmt.Errorf("caddygen: WAF mode %q enabled but AuditLogPath empty — the audit log path must be explicit", mode)
 	}
@@ -755,5 +761,49 @@ func corazaDirectives(mode string, w WAFConfig) (string, error) {
 	b.WriteString("\n")
 	b.WriteString("SecAuditLogFormat redacted\n") // custom formatter (x/wafredactor): native Part A+H+Z with [data]/[uri] values blanked at format time, before write
 	b.WriteString("SecAuditLogParts AHZ\n")     // A=tx header; H=matched-rule trailer; Z=empty terminator (coraza requires parts to end with Z)
+
+	// B3c item 2: host-scoped phase:1 rules using ctl actions on ONE shared
+	// Coraza WAF instance. Each domain that differs from the global default
+	// mode gets a ctl:ruleEngine override; each excluded rule ID gets a
+	// ctl:ruleRemoveById. These fire at phase:1 BEFORE any CRS rule, so the
+	// per-host behavior is applied to every transaction without a second WAF
+	// instance (≈30 MiB each).
+	ruleID := 190000
+	for _, dom := range doms {
+		if !validateHostForWAF(dom.Hostname) {
+			return "", fmt.Errorf("caddygen: domain hostname %q failed WAF LDH validation — refusing to embed in directives", dom.Hostname)
+		}
+		hostMode := snapshotDomainWAF(dom)
+		if hostMode != mode {
+			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@streq %s" "id:%d,phase:1,pass,t:none,nolog,ctl:ruleEngine=%s"`,
+				dom.Hostname, ruleID, hostModeToCtl(hostMode)))
+			b.WriteString("\n")
+			ruleID++
+		}
+		for _, rid := range dom.ExcludedRuleIDs {
+			if rid < 1 || rid > 999999 {
+				return "", fmt.Errorf("caddygen: excluded rule ID %d out of range (1..999999) for host %s", rid, dom.Hostname)
+			}
+			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@streq %s" "id:%d,phase:1,pass,t:none,nolog,ctl:ruleRemoveById=%d"`,
+				dom.Hostname, ruleID, rid))
+			b.WriteString("\n")
+			ruleID++
+		}
+	}
+
 	return b.String(), nil
+}
+
+// hostModeToCtl converts the public mode string to the coraza ctl value.
+// "off" -> Off (no rule processing at all), "blocking" -> On (disruptive),
+// "detection" -> DetectionOnly (log only, never block).
+func hostModeToCtl(mode string) string {
+	switch mode {
+	case "off":
+		return "Off"
+	case "blocking":
+		return "On"
+	default:
+		return "DetectionOnly"
+	}
 }

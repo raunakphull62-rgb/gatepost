@@ -20,7 +20,7 @@ import (
 // the B3b golden configs are byte-for-byte unchanged when WAF is absent.
 func TestWAFHandlerOff(t *testing.T) {
 	for _, mode := range []string{"", "off", "  OFF  "} {
-		h, err := wafHandler(WAFConfig{Mode: mode})
+		h, err := wafHandler(WAFConfig{Mode: mode}, nil)
 		if err != nil {
 			t.Fatalf("mode %q: %v", mode, err)
 		}
@@ -31,7 +31,7 @@ func TestWAFHandlerOff(t *testing.T) {
 }
 
 func TestWAFHandlerRejectsUnknownMode(t *testing.T) {
-	if _, err := wafHandler(WAFConfig{Mode: "paranoid"}); err == nil {
+	if _, err := wafHandler(WAFConfig{Mode: "paranoid"}, nil); err == nil {
 		t.Fatal("expected error for unknown mode, got nil")
 	}
 }
@@ -44,7 +44,7 @@ func TestCorazaDirectivesDetection(t *testing.T) {
 		AuditLogPath:     "/var/lib/edge/waf_audit.log",
 		RequestBodyLimit: 1048576,
 		ParanoiaLevel:    2,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("corazaDirectives: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestCorazaDirectivesDetection(t *testing.T) {
 }
 
 func TestCoradaDirectivesRequiresAuditLogPath(t *testing.T) {
-	if _, err := corazaDirectives("detection", WAFConfig{Mode: "detection"}); err == nil {
+	if _, err := corazaDirectives("detection", WAFConfig{Mode: "detection"}, nil); err == nil {
 		t.Fatal("expected error when AuditLogPath empty, got nil")
 	}
 }
@@ -169,6 +169,142 @@ func TestGenerateWAFOffUnchanged(t *testing.T) {
 	// no coraza handler (or its CRS marker) anywhere in the JSON
 	if strings.Contains(string(b), "load_owasp_crs") {
 		t.Fatal("WAF off must not emit the coraza handler in the config JSON")
+	}
+}
+
+// TestCorazaDirectivesHostScoped verifies that per-domain WAF mode and
+// exclusions produce the correct ctl actions scoped to the Host header.
+func TestCorazaDirectivesHostScoped(t *testing.T) {
+	doms := []snapshot.Domain{
+		{Hostname: "detection.example.test", WAFMode: "detection"},
+		{Hostname: "blocking.example.test", WAFMode: "blocking"},
+		{Hostname: "off.example.test", WAFMode: "off"},
+		{Hostname: "excluded.example.test", WAFMode: "blocking",
+			ExcludedRuleIDs: []int{942100, 941100}},
+	}
+	d, err := corazaDirectives("blocking", WAFConfig{
+		Mode:         "blocking",
+		AuditLogPath: "/tmp/waf.log",
+	}, doms)
+	if err != nil {
+		t.Fatalf("corazaDirectives: %v", err)
+	}
+
+	// Global engine is "On" (the edge default for blocking mode).
+	if !strings.Contains(d, "SecRuleEngine On\n") {
+		t.Error("expected global SecRuleEngine On")
+	}
+
+	// Detection host: a ctl:ruleEngine=DetectionOnly override.
+	if !strings.Contains(d, `"id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=DetectionOnly"`) {
+		t.Error("missing ctl:ruleEngine=DetectionOnly for detection host")
+	}
+
+	// Off host: a ctl:ruleEngine=Off override.
+	if !strings.Contains(d, `"id:190001,phase:1,pass,t:none,nolog,ctl:ruleEngine=Off"`) {
+		t.Error("missing ctl:ruleEngine=Off for off host")
+	}
+
+	// Blocking host should NOT appear (it matches the global default).
+	if strings.Contains(d, "blocking.example.test") {
+		t.Error("blocking host should not emit a host-scoped rule (matches global default)")
+	}
+
+	// Excluded rules: ctl:ruleRemoveById for each.
+	if !strings.Contains(d, "ctl:ruleRemoveById=942100") {
+		t.Error("missing ctl:ruleRemoveById=942100")
+	}
+	if !strings.Contains(d, "ctl:ruleRemoveById=941100") {
+		t.Error("missing ctl:ruleRemoveById=941100")
+	}
+
+	// Host-scoped rules must match on the Host header.
+	if !strings.Contains(d, `REQUEST_HEADERS:Host "@streq excluded.example.test"`) {
+		t.Error("missing Host-scoped match for excluded host")
+	}
+}
+
+// TestCorazaDirectivesHostileRejects ensures hostile snapshot values never
+// reach the directives string.
+func TestCorazaDirectivesHostileRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		mode string
+		ids  []int
+	}{
+		{"quotes in hostname", "test\x00.com", "blocking", nil},
+		{"newline in hostname", "test\n.com", "detection", nil},
+		{"semicolon injection", "test;SecRuleEngine Off", "detection", nil},
+		{"rule ID 0", "ok.example.com", "blocking", []int{0}},
+		{"rule ID negative", "ok.example.com", "blocking", []int{-1}},
+		{"rule ID overflow", "ok.example.com", "blocking", []int{1000000}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doms := []snapshot.Domain{{
+				Hostname: tc.host, WAFMode: tc.mode, ExcludedRuleIDs: tc.ids,
+			}}
+			_, err := corazaDirectives("blocking", WAFConfig{
+				Mode:         "blocking",
+				AuditLogPath: "/tmp/waf.log",
+			}, doms)
+			if err == nil {
+				t.Fatalf("expected error for hostile host %q mode %q ids %v, got nil",
+					tc.host, tc.mode, tc.ids)
+			}
+		})
+	}
+}
+
+// TestSnapshotDomainWAFDefault verifies that schema-1 snapshots (empty mode)
+// default to "detection".
+func TestSnapshotDomainWAFDefault(t *testing.T) {
+	cases := []struct {
+		mode  string
+		want  string
+	}{
+		{"", "detection"},
+		{"detection", "detection"},
+		{"blocking", "blocking"},
+		{"off", "off"},
+		{"INVALID", "detection"},
+	}
+	for _, tc := range cases {
+		d := snapshot.Domain{Hostname: "test.example.com", WAFMode: tc.mode}
+		if got := snapshotDomainWAF(d); got != tc.want {
+			t.Errorf("mode %q: got %q, want %q", tc.mode, got, tc.want)
+		}
+	}
+}
+
+// TestValidateHostForWAF tests the LDH hostname check.
+func TestValidateHostForWAF(t *testing.T) {
+	valid := []string{
+		"example.com",
+		"test.example.com",
+		"a-b.example.org",
+		"1.example.com",
+	}
+	for _, h := range valid {
+		if !validateHostForWAF(h) {
+			t.Errorf("host %q should be valid", h)
+		}
+	}
+	hostile := []string{
+		"",
+		"host\x00name.com",
+		"host\nname.com",
+		"host\"name.com",
+		"-example.com",
+		"example-.com",
+		"ho st.com",
+		strings.Repeat("a", 64) + ".com",
+	}
+	for _, h := range hostile {
+		if validateHostForWAF(h) {
+			t.Errorf("host %q should be INVALID", h)
+		}
 	}
 }
 

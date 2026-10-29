@@ -53,7 +53,7 @@ func (d Document) ToContent() Content {
 
 // SchemaVersion — bump when the snapshot shape changes meaningfully;
 // consumers pin to one.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // Defaults carries the fixed site posture of this version.
 type Defaults struct {
@@ -72,9 +72,11 @@ type Origin struct {
 
 // Domain is one verified-and-served customer hostname.
 type Domain struct {
-	Hostname  string `json:"hostname"`
-	SetupType string `json:"setup_type"`
-	Origin    Origin `json:"origin"`
+	Hostname        string `json:"hostname"`
+	SetupType       string `json:"setup_type"`
+	Origin          Origin `json:"origin"`
+	WAFMode         string `json:"waf_mode"`         // "off" (default) | "detection" | "blocking"
+	ExcludedRuleIDs []int  `json:"excluded_rule_ids"` // CRS rule IDs to skip for this host
 }
 
 var (

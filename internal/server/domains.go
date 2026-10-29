@@ -23,22 +23,24 @@ const claimTTL = 7 * 24 * time.Hour
 // verification token never appears here — only the instructions endpoint
 // needs it. Status values: pending | verified | rejected | expired | disabled.
 type domainRow struct {
-	ID         string     `json:"id"`
-	Hostname   string     `json:"hostname"`
-	Status     string     `json:"status"`
-	SetupType  string     `json:"setup_type"`
-	ClaimedAt  time.Time  `json:"claimed_at"`
-	VerifiedAt *time.Time `json:"verified_at"`
-	ExpiresAt  *time.Time `json:"expires_at"`
-	Ns1        string     `json:"ns1"`
-	Ns2        string     `json:"ns2"`
+	ID             string   `json:"id"`
+	Hostname       string   `json:"hostname"`
+	Status         string   `json:"status"`
+	SetupType      string   `json:"setup_type"`
+	ClaimedAt      time.Time `json:"claimed_at"`
+	VerifiedAt     *time.Time `json:"verified_at"`
+	ExpiresAt      *time.Time `json:"expires_at"`
+	Ns1            string   `json:"ns1"`
+	Ns2            string   `json:"ns2"`
+	WAFMode        string   `json:"waf_mode"`
+	ExcludedRuleIDs []int   `json:"excluded_rule_ids"`
 }
 
-const domainCols = `id::text, hostname, status, setup_type, claimed_at, verified_at, expires_at, coalesce(ns1,'') as ns1, coalesce(ns2,'') as ns2`
+const domainCols = `id::text, hostname, status, setup_type, claimed_at, verified_at, expires_at, coalesce(ns1,'') as ns1, coalesce(ns2,'') as ns2, coalesce(waf_mode,'detection') as waf_mode, coalesce(excluded_rule_ids, '{}'::int[]) as excluded_rule_ids`
 
 func (s *Server) scanDomain(row pgx.Row) (domainRow, error) {
 	var d domainRow
-	err := row.Scan(&d.ID, &d.Hostname, &d.Status, &d.SetupType, &d.ClaimedAt, &d.VerifiedAt, &d.ExpiresAt, &d.Ns1, &d.Ns2)
+	err := row.Scan(&d.ID, &d.Hostname, &d.Status, &d.SetupType, &d.ClaimedAt, &d.VerifiedAt, &d.ExpiresAt, &d.Ns1, &d.Ns2, &d.WAFMode, &d.ExcludedRuleIDs)
 	return d, err
 }
 

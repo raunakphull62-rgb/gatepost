@@ -70,9 +70,10 @@ func (s *Server) recordGeneration(ctx context.Context, contentHash string) (int6
 // resulting content changes.
 func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot.Envelope, error) {
 	rows, err := s.pool.Query(ctx, `SELECT d.id::text, d.hostname, d.setup_type,
-		o.scheme, o.address, o.port, o.host_header, o.tls_verify
+		o.scheme, o.address, o.port, o.host_header, o.tls_verify,
+		d.waf_mode, d.excluded_rule_ids
 		FROM domains d JOIN origins o ON o.domain_id = d.id
-		WHERE d.status = 'verified' ORDER BY d.hostname`)
+		WHERE d.status = 'verified' AND d.waf_mode IS NOT NULL ORDER BY d.hostname`)
 	if err != nil {
 		return snapshot.Document{}, snapshot.Envelope{}, err
 	}
@@ -84,7 +85,10 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 		var port int
 		var hh *string
 		var tlsVerify bool
-		if err := rows.Scan(&id, &hostname, &setupType, &scheme, &address, &port, &hh, &tlsVerify); err != nil {
+		var wafMode string
+		var excludedRuleIDs []int
+		if err := rows.Scan(&id, &hostname, &setupType, &scheme, &address, &port, &hh, &tlsVerify,
+			&wafMode, &excludedRuleIDs); err != nil {
 			return snapshot.Document{}, snapshot.Envelope{}, err
 		}
 		verdict := s.originVerdict(ctx, address)
@@ -99,8 +103,10 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 				hostname, address, verdict.reason)
 		}
 		domainsOut = append(domainsOut, snapshot.Domain{
-			Hostname:  hostname,
-			SetupType: setupType,
+			Hostname:        hostname,
+			SetupType:       setupType,
+			WAFMode:         wafMode,
+			ExcludedRuleIDs: excludedRuleIDs,
 			Origin: snapshot.Origin{
 				Scheme: scheme, Address: address, Port: port,
 				HostHeader: hh, TLSVerify: tlsVerify,

@@ -216,6 +216,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/domains", s.requireAuth(s.listDomains))
 	s.mux.HandleFunc("GET /v1/domains/{id}", s.requireAuth(s.getDomain))
 	s.mux.HandleFunc("DELETE /v1/domains/{id}", s.requireAuth(s.deleteDomain))
+	s.mux.HandleFunc("PUT /v1/domains/{id}/waf", s.requireAuth(s.putDomainWAF))
 	s.mux.HandleFunc("GET /v1/domains/{id}/verification", s.requireAuth(s.domainVerification))
 	s.mux.HandleFunc("POST /v1/domains/{id}/verify", s.requireAuth(s.verifyDomain))
 	s.mux.HandleFunc("POST /v1/domains/{id}/origin", s.requireAuth(s.addOrigin))
