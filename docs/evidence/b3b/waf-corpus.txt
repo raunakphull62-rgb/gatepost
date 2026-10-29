@@ -1,8 +1,9 @@
-=== ATTACK CORPUS ===
 B3c corpus: host=accept-a-1792999531-13000.example.test mode=detection-only
 audit engine: SecAuditEngine On; SecAuditLogParts AHZ; Native format
 redaction: Part A (timestamp+IPs only, no HTTP data) + Part H (rule id/metadata only)
   -> scrubber blanks [data "..."] and [uri "..."] in-place (inode preserved)
+
+=== ATTACK CORPUS (DetectionOnly => NOT 403; passed in detection mode) ===
 
   sqli-query      code=200 passed in detection mode (secret AQ-Q in query)
   sqli-body       code=200 passed in detection mode (secret AQ-B in body)
@@ -43,5 +44,6 @@ redaction: Part A (timestamp+IPs only, no HTTP data) + Part H (rule id/metadata 
   and it does not: the 502 is the origin-test fixture's behavior.
 
 === MEMORY ===
+  edge RSS: 56.16 MiB (coraza active, scrubber in poller)
   (see waf-memory.txt for before/after coraza load)
 === CORPUS RESULT: PASS ===
