@@ -421,6 +421,22 @@ and tagged)
   non-200 during the ~46s window (frozen forwarder: 000, then 502 until the
   listener rebound) — no outage after recovery.
 
+## 2026-10-29 — small fixes following B3b commit
+
+- f2 silence window widened 2s -> 8s (scripts/edge-accept.sh): 8s comfortably exceeds
+  Go's ~5s /etc/hosts cache plus a first-refusal confirmation, so a frozen hit count
+  after the flip proves the dial guard held rather than a measurement gap.
+- Raw evidence vendored into docs/evidence/b3b/ (accept-final.txt = 102/0 PASS at
+  02:54:19; sigstop-probes.txt regenerated: host PID stopped -> healthcheck running->unhealthy
+  -> supervisor 'restarting unhealthy poller' -> PID change -> healthy -> 200; 69/1405 probes
+  non-200 during the ~43s window, none after recovery). The earlier accept-newchecks
+  diagnostics (86/4, the sed-EBUSY + keep-alive-pool root causes) are superseded by the
+  final 102/0 run; their /tmp copies were pruned by the environment and are not re-added.
+- test-alpine-exit: alpine:3.21, sh -c exit 137, RestartPolicy always, Created
+  2026-10-28T11:49:13Z (pre-session, no gatepost labels/env/GP_* vars) — a stray restart-
+  loop scratch container, NOT created by this session. Left untouched per the
+  no-outside-containers rule.
+
 ## Dev DB on this server
 - Dedicated container `gatepost-auth-pg` (postgres:16-alpine, volume `gatepost_auth_pgdata`, host port 127.0.0.1:54330, DB `gatepost_auth`). Credentials in `.env` (gitignored, never printed).
 - **2026-10-24, fresh dev server rebuild**: this box started with no containers and no volumes (the v1-era containers noted below are not here), and no `.env`. `.env` was recreated locally from `.env.example`'s essentials: `DATABASE_URL`/`DATABASE_URL_DIRECT` point at `127.0.0.1:54330/gatepost_auth`, `ENV=development`, outbox driver; the DB password was generated in place (`openssl rand`) and never printed. Container credentials reach postgres via `--env-file`, keeping the command secret-free and copy-pasteable:

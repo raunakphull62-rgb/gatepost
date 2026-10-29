@@ -1,0 +1,134 @@
+02:48:54 
+02:48:54 == setup
+02:49:08 PASS: snapshot key material is non-empty
+02:49:08 PASS: no host route squats the origin fixture's range (192.88.99.0/24)
+02:49:08 PASS: DNS stub up on 127.0.0.1:5344 (TXT verify + A answers)
+02:49:09 PASS: API up on http://172.17.0.1:8090
+02:49:11 PASS: compose stack rebuilt: edge + origin-test (fresh volumes)
+02:49:11 PASS: operator signup
+02:49:11 PASS: operator verified (mail loop)
+02:49:11 PASS: node minted (201)
+02:49:11 PASS: node token material is non-empty
+02:49:11 PASS: claim accept-a-1793242134-16675.example.test
+02:49:11 PASS: verify accept-a-1793242134-16675.example.test against the TXT stub
+02:49:11 PASS: origin set: http://192.88.99.10:9001 (public-range fixture)
+02:49:11 PASS: claim accept-d-1793242134-16675.example.test (left UNVERIFIED on purpose)
+02:49:32 PASS: poller up (node token from deploy/dev/secrets/token)
+02:49:34 PASS: poller applied the snapshot
+02:49:34 PASS: edge serves accept-a-1793242134-16675.example.test from origin-test
+02:49:34 PASS: snapshot fetched and the edge serves the origin through the tunnel
+02:49:34 
+02:49:34 == origin-test fixture through the edge
+02:49:36 PASS: /slow: delayed body, >= 2s (took 2.047023s)
+02:49:36 PASS: /big: 5 MiB streamed body
+02:49:36 PASS: /redirect: edge passes the 302 through (does not follow)
+02:49:36 PASS: /redirect: Location header survives
+02:49:36 PASS: /redirect: a following client lands on /ok
+02:49:36 PASS: /cookie: Set-Cookie passes through
+02:49:36 PASS: /status/503: status code passes through
+02:49:36 PASS: /chunked: chunked transfer to the client
+02:49:36 PASS: /chunked: all three chunks arrived
+02:49:36 
+02:49:36 == a) cold start with the API down and a saved snapshot
+02:49:36 PASS: API is down
+02:49:52 PASS: the cold-started edge serves from the SAVED snapshot
+02:49:52 PASS: a) https serves the snapshot (on-demand internal cert)
+02:49:53 PASS: a) https serves too (ask answers from the snapshot, internal cert)
+02:49:53 
+02:49:53 == b) cold start with NO snapshot: 421 for every host
+02:50:09 PASS: the no-snapshot edge takes the deny-all posture
+02:50:09 PASS: b) known host over http = 421
+02:50:09 PASS: b) denied host over http = 421
+02:50:09 PASS: b) unknown host over http = 421
+02:50:09 PASS: b) known host over https = 421 (fallback cert, no ask answer)
+02:50:09 PASS: b) denied host over https = 421 (fallback cert, no ask answer)
+02:50:09 PASS: b) unknown host over https = 421 (fallback cert, no ask answer)
+02:50:09 
+02:50:09 == c) tampered snapshot rejected; the last-good config keeps serving
+02:51:09 PASS: the poller refetches a good config after the no-snapshot boot
+02:51:09 PASS: c) edge serves while the on-disk snapshot is tampered (caddy untouched)
+02:51:10 PASS: the restarted poller REJECTS the tampered snapshot (log line)
+02:51:10 PASS: c) the last-good config kept serving across the poller restart
+02:51:10 PASS: the poller refetches and re-applies the good config
+02:51:10 PASS: c) the tampered bytes were never applied (still origin 9001)
+02:51:10 
+02:51:10 == d) an API origin change reaches the edge (timed)
+02:51:10 PASS: origin replaced via PUT (port 9001 -> 9002)
+02:52:11 PASS: the new origin reaches the edge
+02:52:11      origin change reached the edge in 61s (poll interval 5s + reload cooldown 60s)
+02:52:11 PASS: d) the edge now serves the new origin
+02:52:11 
+02:52:11 == e) spoofed X-Forwarded-For is replaced with the real client IP
+02:52:11 PASS: e) the origin sees the public hostname as Host
+02:52:11 PASS: e) spoofed XFF replaced with the real client IP (172.28.0.1)
+02:52:11 PASS: e) the spoofed value 1.2.3.4 never reached the origin
+02:52:11 
+02:52:11 == f) private and metadata origins are refused, never reached
+02:52:11 PASS: f) origin metadata refused at set time (422)
+02:52:11 PASS: f) origin private-rfc1918 refused at set time (422)
+02:52:11 PASS: f) origin loopback refused at set time (422)
+02:52:11 PASS: f) the edge still serves the last-good origin
+02:52:11 
+02:52:11 == f2) an origin hostname that later resolves to a metadata address is refused at dial time
+02:52:11 PASS: f2) claim accept-f2-1793242134-16675.example.test
+02:52:11 PASS: f2) verify accept-f2-1793242134-16675.example.test against the TXT stub
+02:52:11 PASS: f2) hostname origin accepted at set time (resolves public via the stub)
+02:53:11 PASS: f2) the edge serves the hostname origin (public resolution)
+02:53:11 PASS: f2) the origin saw requests while the resolution was public (1 hit(s))
+02:53:16 PASS: f2) the edge now 502s the hostname origin (dial-time refusal)
+02:53:16 PASS: f2) refused at dial time: 502, no connection attempted
+02:53:16 PASS: f2) the poller logged the dial-time refusal (2 line(s): link-local refused before any dial)
+02:53:16 PASS: f2) another request still 502s through a fresh dial
+02:53:24 PASS: f2) the origin listener recorded NO request after the first refusal (6 then, 6 after)
+02:53:24 
+02:53:24 == g) unknown host: 421 and no certificate attempt
+02:53:24 PASS: g) unknown host over http = 421
+02:53:24 PASS: g) unknown host over https = 421 (fallback handshake)
+02:53:25 PASS: g) no log line names the stranger (no issuance attempt)
+02:53:25 PASS: g) no certificate file for the stranger
+02:53:25 
+02:53:25 == h) allowed host gets a certificate (internal issuer); denied host does not
+02:53:25 PASS: h) the allowed host's certificate carries the hostname
+02:53:25 PASS: h) the allowed host's certificate is persisted
+02:53:25 PASS: h) the ask endpoint refuses the denied host (421)
+02:53:25 PASS: h) the denied host completes TLS only on the FALLBACK cert (SAN: edge.invalid)
+02:53:25 PASS: h) the denied host's cert does not name it
+02:53:25 PASS: h) the denied host serves 421
+02:53:25 PASS: h) no certificate file for the denied host
+02:53:25 
+02:53:25 == i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
+02:53:26 PASS: i) the API is down
+02:53:26 PASS: i) the edge keeps serving with the API down
+02:53:34 PASS: i) poll failures are throttled in the poller log (1 line(s) in a minute, not one per 5s tick)
+02:53:34 PASS: origin PUT after the API restart (recovery probe)
+02:54:11 PASS: the edge recovers: the change propagates again
+02:54:11      recovery: the post-restart change reached the edge in 37s
+02:54:11 PASS: node revoked (idempotent route)
+02:54:19 PASS: i) the poller logged the 401 (once, loudly)
+02:54:19 PASS: i) the revoked node keeps serving the last-good config
+02:54:19 
+02:54:19 == j) the whole run's access log: no secrets, no query strings
+02:54:19 PASS: the access log recorded the run (259 requests)
+02:54:19 PASS: j) the access log has no 'SECRET123'
+02:54:19 PASS: j) the access log has no 'code=abc'
+02:54:19 PASS: j) the access log has no 'token='
+02:54:19 PASS: j) the access log has no 'LEAK-AUTH-123'
+02:54:19 PASS: j) the access log has no 'LEAK-COOKIE-456'
+02:54:19 PASS: j) the access log has no 'LEAK-APIKEY-789'
+02:54:19 PASS: j) the access log has no 'LEAK-REF-321'
+02:54:19 PASS: j) the access log has no 'Authorization'
+02:54:19 PASS: j) the access log has no 'Cookie'
+02:54:19 PASS: j) the access log has no 'X-Api-Key'
+02:54:19 PASS: j) the access log has no 'Referer'
+02:54:19 PASS: j) the access log has no 'Set-Cookie'
+02:54:19 PASS: j) the access log has no 'gporigin='
+02:54:19 PASS: j) the access log has no 'OseO49bDdF_iYIBsc_DuDH9Uu0MG7S2HUXwuI1tnXzg'
+02:54:19 PASS: j) the access log has no 'accept-snapshot-key-be9404664098927aac6c99828742099f'
+02:54:19 PASS: j) the access log has no '1.2.3.4'
+02:54:19 PASS: j) not one question mark anywhere (no query strings at all)
+02:54:19 PASS: j) every line: user_agent present, no uri/headers/resp_headers
+02:54:19 PASS: j) no access entry ever reached the edge container's stderr (docker log)
+02:54:19 
+02:54:19 == verdict
+02:54:19 === edge acceptance: 102 passed, 0 failed ===
+rc=0

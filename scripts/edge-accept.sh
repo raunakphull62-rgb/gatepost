@@ -399,7 +399,10 @@ fi
 NMID=$(dc logs origin-test 2>/dev/null | grep -c "$F2HOST")
 check "f2) another request still 502s through a fresh dial" \
   "$(code_of -H "Host: $F2HOST" "$EDGE_HTTP/ok")" "502"
-sleep 2
+# 8s comfortably exceeds Go's ~5s /etc/hosts cache (see the f2 header
+# above) plus a first-refusal confirmation, so a frozen hit count here
+# proves the dial guard held - not a measurement gap.
+sleep 8
 N2=$(dc logs origin-test 2>/dev/null | grep -c "$F2HOST")
 check "f2) the origin listener recorded NO request after the first refusal ($NMID then, $N2 after)" "$N2" "$NMID"
 
