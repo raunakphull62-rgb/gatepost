@@ -504,18 +504,21 @@ check "j) every line: user_agent present, no uri/headers/resp_headers" "$STRUCT"
 TWIN=$(dc logs edge 2>/dev/null | grep -c 'handled request')
 check "j) no access entry ever reached the edge container's stderr (docker log)" "$TWIN" "0"
 
-# --- k) B3c WAF audit redaction (detection-only, scrubbed) --------------------
+# --- k) B3c WAF audit redaction (detection-only, in-process) ------------------
 # coraza's NATIVE Part H hard-codes request-derived values: [data "Matched Data:
 # <value> found within VAR: <value>"] and [uri "/path?query"]. No seclang
 # directive can suppress them and corala-caddy v2.6.2 has no audit filter hook,
-# so the poller scrubs the audit file in place (blanks [data]/[uri]). This
-# sends attacks carrying a unique secret in FIVE positions, then asserts the
-# scrubbed audit holds none of them and contains no "?" (no query leaks).
-section "k) B3c WAF audit redaction (detection-only, scrubbed, no values)"
+# so a custom "redacted" audit formatter (x/wafredactor, compiled into the edge
+# image via xcaddy --with) blanks [data]/[uri] VALUES at format time — before
+# they ever reach the file. The file is owned by the edge only (no shared
+# volume, default 0644 mode): the poller never touches it. This sends attacks
+# carrying a unique secret in FIVE positions, then asserts the audit log holds
+# none of them and contains no "?" (no query leaks).
+section "k) B3c WAF audit redaction (detection-only, in-process, no values)"
 until_ok 30 "k) coraza handler present in the edge config" \
   'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q load_owasp_crs'
 # unique secrets embedded INSIDE attack payloads (sqlmap UA triggers 913100 so
-# a Part H is emitted). Each must be ABSENT from the scrubbed audit log.
+# a Part H is emitted). Each must be ABSENT from the redacted audit log.
 dc exec edge sh -c "truncate -s 0 /data/logs/waf_audit.log" 2>/dev/null
 sleep 1
 curl -sk --resolve "$HOST:8445:127.0.0.1" -o /dev/null -H "Host: $HOST" -A "sqlmap/1.6" "https://127.0.0.1:8445/ok?id=%27%20OR%20%27S-Q-Q%27%3D%271" 2>/dev/null
@@ -523,7 +526,9 @@ curl -sk --resolve "$HOST:8445:127.0.0.1" -o /dev/null -H "Host: $HOST" -A "sqlm
 curl -sk --resolve "$HOST:8445:127.0.0.1" -o /dev/null -H "Host: $HOST" -A "sqlmap/1.6" "https://127.0.0.1:8445/S-Q-P/ok" 2>/dev/null
 curl -sk --resolve "$HOST:8445:127.0.0.1" -o /dev/null -H "Host: $HOST" -A "sqlmap/1.6" -H "Cookie: s=S-Q-C" "https://127.0.0.1:8445/ok" 2>/dev/null
 curl -sk --resolve "$HOST:8445:127.0.0.1" -o /dev/null -H "Host: $HOST" -A "sqlmap/1.6" -H "Authorization: Bearer S-Q-A" "https://127.0.0.1:8445/ok" 2>/dev/null
-sleep 3   # let the poller scrubber (2s ticker) sanitize the file
+# No scrubber delay: the redactor blanks values at format time (in-process).
+# A short settle is still needed for corza's O_APPEND write to flush.
+sleep 1
 AUDIT=$(dc exec edge cat /data/logs/waf_audit.log 2>/dev/null)
 for S in S-Q-Q S-Q-B S-Q-P S-Q-C S-Q-A; do
   N=$(printf '%s\n' "$AUDIT" | grep -c "$S")
@@ -533,10 +538,12 @@ QM=$(printf '%s\n' "$AUDIT" | grep -c '?')
 check "k) no '?' anywhere in the WAF audit log (no URI query)" "$QM" "0"
 check_ne "k) rule 913100 still logged (detection intact)" \
   "$(printf '%s\n' "$AUDIT" | grep -c '913100')" "0"
-check_ne "k) [data] fields blanked by the scrubber" \
+check_ne "k) [data] fields blanked by the redacted formatter" \
   "$(printf '%s\n' "$AUDIT" | grep -c '\[data ""\]')" "0"
-check_ne "k) [uri] fields blanked by the scrubber" \
+check_ne "k) [uri] fields blanked by the redacted formatter" \
   "$(printf '%s\n' "$AUDIT" | grep -c '\[uri ""\]')" "0"
+check "k) audit log mode is 0644 (no shared-volume 0666)" \
+  "$(dc exec edge sh -c 'stat -c %a /data/logs/waf_audit.log 2>/dev/null || echo missing')" "644"
 
 section "verdict"
 echo "=== edge acceptance: $PASS passed, $FAIL failed ==="

@@ -24,7 +24,6 @@ services:
       - "8445:443"
     volumes:
       - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data      # certificates (item 4) survive restarts
       - caddy_config:/config  # Caddy's own persisted state
     # BOTH networks: the default (pinned 172.28.0.0/24) carries the
     # published ports, and `origin` hosts the item-7 test origin. The
@@ -98,8 +97,9 @@ services:
       # (caddy_data) creates the dir and rolls at 10MB x5. Empty = logging off.
       GP_EDGE_ACCESS_LOG: /data/logs/access.json
       # B3c item 1: Coraza edge WAF, detection-only for every served host.
-      # CRS rules log+audit (never block). Edge ships coraza-caddy v2.6.2.
-      # Audit native-format parts A+H only (no body/cookies/headers/query).
+      # CRS rules log+audit (never block). Edge ships coraza-caddy v2.6.2 with
+      # the x/wafredactor custom audit formatter (blanks [data]/[uri] values at
+      # format time). Audit: redacted Part A+H+Z only (no body/cookies/headers/query).
       GP_EDGE_WAF_MODE: ${GP_EDGE_WAF_MODE:-detection}
       GP_EDGE_WAF_AUDIT_LOG: ${GP_EDGE_WAF_AUDIT_LOG:-/data/logs/waf_audit.log}
       GP_EDGE_WAF_BODY_LIMIT_MB: ${GP_EDGE_WAF_BODY_LIMIT_MB:-10}
@@ -107,9 +107,6 @@ services:
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state
-      # B3c: poller shares the edge data volume so its audit-log scrubber can
-      # sanitize waf_audit.log IN PLACE (same inode coraza's O_APPEND fd needs).
-      - caddy_data:/data
     logging:
       driver: json-file
       options:
