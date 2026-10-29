@@ -13,6 +13,7 @@
 package wafredactor
 
 import (
+	"crypto/rand"
 	"fmt"
 	"regexp"
 	"strings"
@@ -106,26 +107,26 @@ func sanitizeLine(line string) string {
 	return auditValueRe.ReplaceAllString(line, "[$1 \"\"]")
 }
 
-// randomBoundary returns a deterministic 16-char string for the audit boundary.
-// coraza uses crypto/rand; we use FNV-1a so Format() output is reproducible in
-// tests (and the real edge does not depend on randomness in the audit format).
+// randomBoundary returns a 16-byte cryptographically-random boundary string,
+// mirroring coraza's native formatter which uses crypto/rand for its serial
+// boundary. Each audit entry therefore has a unique delimiter, preventing
+// cross-transaction parsing ambiguity in the native serial format.
 func randomBoundary() string {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	h := fnv1a([]byte("waf-redactor"))
 	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// rand.Read on Linux never returns an error for len(b) < 1<<32; fall
+		// back to deterministic bytes only if the OS rng is unavailable (never
+		// observed in practice — crypto/rand on /dev/urandom blocks only at
+		// boot before the pool is initialized, and the edge starts post-boot).
+		for i := range b {
+			b[i] = letters[byte(i)%byte(len(letters))]
+		}
+	}
 	for i := range b {
-		b[i] = letters[int(h%uint64(len(letters)))]
-		h *= 1099511628217
+		b[i] = letters[byte(b[i])%byte(len(letters))]
 	}
 	return string(b)
 }
 
-// fnv1a: FNV-1a 64-bit (offset basis 14695981039649018699, prime 1099511628217).
-func fnv1a(b []byte) uint64 {
-	h := uint64(14695981039649018699)
-	for _, c := range b {
-		h ^= uint64(c)
-		h *= 1099511628217
-	}
-	return h
-}
+
