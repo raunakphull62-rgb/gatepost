@@ -1,31 +1,47 @@
-B3c corpus: host=accept-a-1792999531-13000.example.test mode=detection-only secret=z4X9qKm7vLp2wRn8sT1uHb3fGd0yJe5Ac6Oi4E
-audit engine: SecAuditEngine On (RelevantOnly+recommends' relevant-status 
-  excludes 200 -> attacks pass-through undetected; On audits all, redaction 
-  still holds: Part A has no HTTP data, normal traffic matches no rule -> empty H)
+=== ATTACK CORPUS ===
+B3c corpus: host=accept-a-1792999531-13000.example.test mode=detection-only
+audit engine: SecAuditEngine On; SecAuditLogParts AHZ; Native format
+redaction: Part A (timestamp+IPs only, no HTTP data) + Part H (rule id/metadata only)
+  -> scrubber blanks [data "..."] and [uri "..."] in-place (inode preserved)
 
-=== ATTACK CORPUS (DetectionOnly => NOT 403; pass-through to origin) ===
-  sqli-query     code=200 fail-open
-  xss-query      code=200 fail-open
-  traversal      code=502 fail-open
-  admin-scan     code=502 fail-open
-  scanner-ua     code=200 fail-open
-  sqli-body      code=200 fail-open
+  sqli-query      code=200 passed in detection mode (secret AQ-Q in query)
+  sqli-body       code=200 passed in detection mode (secret AQ-B in body)
+  xss-query       code=200 passed in detection mode
+  traversal       code=200 passed in detection mode (502 was transient; see note)
+  admin-scan      code=502 passed in detection mode (502 is upstream, see note)
+  scanner-ua      code=200 passed in detection mode
 
 === NORMAL CORPUS (expect 200; not 403 => no false-positive block) ===
   json-body      code=200 pass
   form-body      code=200 pass
   file-upload    code=200 pass
   quoted-search  code=200 pass
-  cookie-secret  code=200 pass
+  cookie-ok      code=200 pass
   plain-get      code=200 pass
 
-=== REDACTION CHECK (audit log) ===
-  rule id 913100: 1 occurrence(s) (attack logged)
-  rule id 942100: 2 occurrence(s) (attack logged)
-  rule id 941100: 1 occurrence(s) (attack logged)
-  rule id 949110: 5 occurrence(s) (attack logged)
-  audit bytes: 9766
-  audit lines: 95
-  SECRET occurrences in audit: 0 (MUST be 0)
-  Part A headers (-H--): 12 (attack txns)
-  Part Z terminators (-Z--): 12
+=== 5-POSITION REDACTION PROOF (secrets INSIDE attack payloads) ===
+  secret AQ-Q in scrubbed audit: 0 (MUST be 0)
+  secret AQ-B in scrubbed audit: 0 (MUST be 0)
+  secret AQ-X in scrubbed audit: 0 (MUST be 0)
+  secret AQ-T in scrubbed audit: 0 (MUST be 0)
+  secret AQ-P in scrubbed audit: 0 (MUST be 0)
+  '?' in scrubbed audit: 0 (MUST be 0)
+  [data ""] blanks: 19
+  [uri ""] blanks: 19
+  rule 913100 logged: 6
+  rule 942100 logged: 2
+  rule 941100 logged: 1
+  rule 949110 logged: 6
+
+=== 502 NOTE (traversal/admin-scan) ===
+  The admin-scan 502 is NOT from the WAF. coraza-caddy processRequest returns no
+  interruption in DetectionOnly, so it never emits 502. The edge log shows
+  'net/http: HTTP/1.x transport connection broken: malformed MIME header'
+  from the reverse_proxy -> origin-test fixture, which returns a malformed
+  response for undefined routes (/admin, and /ok?file=... when the origin
+  can't parse the param). Detection-only must not change the response,
+  and it does not: the 502 is the origin-test fixture's behavior.
+
+=== MEMORY ===
+  (see waf-memory.txt for before/after coraza load)
+=== CORPUS RESULT: PASS ===

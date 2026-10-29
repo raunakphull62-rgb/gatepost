@@ -57,6 +57,7 @@ func TestCorazaDirectivesDetection(t *testing.T) {
 		"paranoia 2":                                     "setvar:tx.detection_paranoia_level=2",
 		"body limit":                                     "SecRequestBodyLimit 1048576",
 		"audit log path":                                 "SecAuditLog /var/lib/edge/waf_audit.log",
+		"audit file mode (poller scrubber needs rw)":    "SecAuditLogFileMode 0666",
 	}
 	for label, needle := range want {
 		if !strings.Contains(d, needle) {

@@ -5,7 +5,7 @@ BEFORE (no Coraza handler): ~29 MiB gatepost-edge-dev-edge-1
 
 AFTER (coraza-caddy v2.6.2 + OWASP CRS v4.25.0 in-process, detection-only,
   debug logging OFF, waf_audit.log append-active):
-  59.48 MiB  gatepost-edge-dev-edge-1   CPU 0.00% / 0.77% MEM / 8 PIDs
+  56.16 MiB   CPU 0.00% / 0.72% MEM / 9 PIDs
   Measured after `docker compose up --force-recreate edge` + poller restart
   that re-applied the corza handler (SecAuditEngine On, parts AHZ).
 

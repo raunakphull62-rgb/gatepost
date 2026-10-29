@@ -107,6 +107,9 @@ services:
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state
+      # B3c: poller shares the edge data volume so its audit-log scrubber can
+      # sanitize waf_audit.log IN PLACE (same inode coraza's O_APPEND fd needs).
+      - caddy_data:/data
     logging:
       driver: json-file
       options:

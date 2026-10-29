@@ -75,6 +75,12 @@ func (p *Poller) startApply(ctx context.Context) {
 	}
 	p.fwd = newForwarder(p.cfg)
 	go p.applyLoop(ctx)
+	// B3c: scrub the WAF audit log in place. coraza's NATIVE Part H hard-codes
+	// request-derived values ([data "..."] matched logdata, [uri "..."] full URI
+	// incl. query); no seclang directive can suppress them, so the poller rewrites
+	// the shared audit file to the allowed redaction set. Only runs when the WAF
+	// is on (itself a no-op when Mode is off/empty).
+	go p.scrubAuditLoop(ctx)
 }
 
 // enqueueApply is accept's hook into the apply loop: content-equal to what

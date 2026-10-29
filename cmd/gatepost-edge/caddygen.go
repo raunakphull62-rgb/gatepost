@@ -739,5 +739,12 @@ func corazaDirectives(mode string, w WAFConfig) (string, error) {
 	b.WriteString("\n")
 	b.WriteString("SecAuditLogFormat Native\n") // JSON would dump the full transaction; native honours Parts for redaction
 	b.WriteString("SecAuditLogParts AHZ\n")     // A=tx header; H=matched-rule trailer; Z=empty terminator (coraza requires parts to end with Z)
+	// Dev-only: 0666 so the poller (a separate container, different uid) can
+	// sanitize this file IN PLACE (the audit scrubber blanks [data]/[uri]
+	// values). The file holds no request body/cookies/headers/query (AHZ) and
+	// the scrubbed [data]/[uri] carry no values, so the permissive mode is
+	// scoped to the dev stack's single shared volume. shortcut: relax to 0640
+	// with a shared gid when the poller ships as a dedicated root sidecar.
+	b.WriteString("SecAuditLogFileMode 0666\n")
 	return b.String(), nil
 }
