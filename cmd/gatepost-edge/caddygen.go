@@ -629,7 +629,7 @@ func portsOf(httpAddr, httpsAddr string) (int, int, error) {
 // from the signed snapshot.Document.
 type WAFConfig struct {
 	Mode             string // "off" (default) | "detection" | "blocking"
-	AuditLogPath     string // required when Mode != off; native-format file (parts A+H+Z)
+	AuditLogPath     string // required when Mode != off; redacted Part A+H+Z native-format file (x/wafredactor)
 	RequestBodyLimit int64  // bytes the WAF inspects; 0 = the edge body cap (maxBodyBytes)
 	ParanoiaLevel    int    // CRS paranoia level (1 default)
 }
@@ -680,14 +680,26 @@ func wafHandler(w WAFConfig) (*corazaWAF, error) {
 //
 // audit redaction (the hard constraint): coraza v3.8.1's JSON audit formatter
 // does json.Marshal of the whole transaction (Parts_ is tagged json:"-"), so
-// the JSON format canNOT be redacted by SecAuditLogParts — it always dumps
+// the JSON format canNOT be redacted by SecAuditLogParts — it always dumps the
 // request body, every header (cookies), the request URI (query), and the
-// response. The NATIVE formatter honours Parts_, so we use native + "AHZ":
+// response. The NATIVE formatter honours Parts_, but even it hard-codes two
+// value-bearing fields in Part H:
+//
+//	[data "Matched Data: <value> found within ARGS:key: <value>"]
+//	[uri "/path?query"]
+//
+// — no seclang directive can suppress them (coraza's nativeFormatter writes the
+// trailer verbatim, escaping only CR/LF for log-forgery safety, not redacting
+// values) and corala-caddy v2.6.2 exposes no audit filter hook.
+//
+// x/wafredactor registers a "redacted" formatter (compiled into the edge image
+// via xcaddy --with) that reproduces native Part A+H+Z but blanks
+// [data "..."] -> [data ""] and [uri "..."] -> [uri ""] at format time,
+// so no request-derived value or URI query is ever written to disk.
 //
 //	A = header (timestamp, tx id, client/host IP+port) — no body/headers/query.
-//	H = matched-rule trailer (rule id, msg, matched variable NAME, and coraza's
-//	    native [uri "..."] which carries the request path+query of the request
-//	    that tripped the rule).
+//	H = matched-rule trailer (rule id, severity, action, msg, tags, and the
+//	    matched variable NAME only — e.g. ARGS:id — never the matched value).
 //	Z = empty end-marker (coraza REQUIRES the parts string to end with Z).
 //
 // Parts B (request headers+uri), C (body), E/F/G (response), J (uploads) and
@@ -696,6 +708,10 @@ func wafHandler(w WAFConfig) (*corazaWAF, error) {
 // (timestamp/txid/IPs only), and Part H fires only on a rule match, so a
 // normal request (no CRS match) emits a header-only entry with no
 // body/cookies/headers/query -- the planted secret never appears.
+//
+// Audit file mode: 0644 (coraza default). No shared volume, no 0666 — the
+// poller no longer touches the audit file; the on-disk format is already
+// secret-free at format time.
 func corazaDirectives(mode string, w WAFConfig) (string, error) {
 	if w.AuditLogPath == "" {
 		return "", fmt.Errorf("caddygen: WAF mode %q enabled but AuditLogPath empty — the audit log path must be explicit", mode)
@@ -737,14 +753,7 @@ func corazaDirectives(mode string, w WAFConfig) (string, error) {
 	b.WriteString("SecAuditLogType Serial\n")
 	b.WriteString(fmt.Sprintf("SecAuditLog %s", w.AuditLogPath))
 	b.WriteString("\n")
-	b.WriteString("SecAuditLogFormat Native\n") // JSON would dump the full transaction; native honours Parts for redaction
+	b.WriteString("SecAuditLogFormat redacted\n") // custom formatter (x/wafredactor): native Part A+H+Z with [data]/[uri] values blanked at format time, before write
 	b.WriteString("SecAuditLogParts AHZ\n")     // A=tx header; H=matched-rule trailer; Z=empty terminator (coraza requires parts to end with Z)
-	// Dev-only: 0666 so the poller (a separate container, different uid) can
-	// sanitize this file IN PLACE (the audit scrubber blanks [data]/[uri]
-	// values). The file holds no request body/cookies/headers/query (AHZ) and
-	// the scrubbed [data]/[uri] carry no values, so the permissive mode is
-	// scoped to the dev stack's single shared volume. shortcut: relax to 0640
-	// with a shared gid when the poller ships as a dedicated root sidecar.
-	b.WriteString("SecAuditLogFileMode 0666\n")
 	return b.String(), nil
 }

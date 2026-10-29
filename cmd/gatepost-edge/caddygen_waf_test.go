@@ -3,8 +3,10 @@ package main
 // Unit tests for the B3c Coraza WAF generation (item 1: detection-only).
 // These pin the redaction contract (audit parts A+H only → no body/cookies/
 // headers/query in the audit log) and the fail-open posture, independent of a
-// running Caddy: coraza v3.8.1's JSON audit formatter can't be redacted by
-// parts, so native-format + "AH" is the one safe combination.
+// running Caddy: coraza v3.8.1's native formatter hard-codes [data] and [uri]
+// values in Part H that no seclang directive can suppress, so a custom
+// "redacted" formatter (x/wafredactor) is compiled into the edge image and
+// blanks them at format time — before they ever reach disk.
 
 import (
 	"encoding/json"
@@ -48,16 +50,15 @@ func TestCorazaDirectivesDetection(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"CRS include":                                    "Include @owasp_crs/*.conf",
-		"detection engine":                               "SecRuleEngine DetectionOnly",
-		"fail-open partial body":                         "SecRequestBodyLimitAction ProcessPartial",
-		"response body off":                              "SecResponseBodyAccess Off",
-		"native format (redactable)":                     "SecAuditLogFormat Native",
-		"audit parts A+H+Z (coraza requires trailing Z)": "SecAuditLogParts AHZ",
-		"paranoia 2":                                     "setvar:tx.detection_paranoia_level=2",
-		"body limit":                                     "SecRequestBodyLimit 1048576",
-		"audit log path":                                 "SecAuditLog /var/lib/edge/waf_audit.log",
-		"audit file mode (poller scrubber needs rw)":    "SecAuditLogFileMode 0666",
+		"CRS include":                                     "Include @owasp_crs/*.conf",
+		"detection engine":                                "SecRuleEngine DetectionOnly",
+		"fail-open partial body":                          "SecRequestBodyLimitAction ProcessPartial",
+		"response body off":                               "SecResponseBodyAccess Off",
+		"redacted format (in-process, no values on disk)": "SecAuditLogFormat redacted",
+		"audit parts A+H+Z (coraza requires trailing Z)":  "SecAuditLogParts AHZ",
+		"paranoia 2":                                      "setvar:tx.detection_paranoia_level=2",
+		"body limit":                                      "SecRequestBodyLimit 1048576",
+		"audit log path":                                  "SecAuditLog /var/lib/edge/waf_audit.log",
 	}
 	for label, needle := range want {
 		if !strings.Contains(d, needle) {
@@ -92,6 +93,15 @@ func TestCorazaDirectivesDetection(t *testing.T) {
 	// FAIL-OPEN: blocking mode is the only one that flips DetectionOnly->On
 	if strings.Contains(d, "SecRuleEngine On") {
 		t.Error("detection mode must set SecRuleEngine DetectionOnly, not On")
+	}
+
+	// NO permissive file mode: the poller no longer scrubs the file on disk,
+	// so SecAuditLogFileMode 0666 must NOT appear (default 0644 is correct).
+	if strings.Contains(d, "SecAuditLogFileMode 0666") {
+		t.Error("audit file mode 0666 must not be emitted — redaction is in-process now")
+	}
+	if strings.Contains(d, "SecAuditLogFileMode") {
+		t.Error("SecAuditLogFileMode should be absent entirely (default 0644)")
 	}
 }
 
