@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -975,11 +976,12 @@ func TestAskCertCapPerHour(t *testing.T) {
 	fake.publish(1, "cap.example.com", "other.example.com")
 	base := fake.serve().URL
 
-	now := time.Unix(1_800_000_000, 0)
+	nowNs := atomic.Int64{}
+	nowNs.Store(time.Unix(1_800_000_000, 0).UnixNano())
 	hook := &logHook{}
 	cfg := newTestCfg(t, hook, t.TempDir(), base, token, key)
 	cfg.CertHourlyCap = 2
-	cfg.Now = func() time.Time { return now }
+	cfg.Now = func() time.Time { return time.Unix(0, nowNs.Load()) }
 	ask := startPoller(t, cfg)
 	until(t, 3*time.Second, "apply for the cap test", func() bool { return hook.count("applied snapshot") >= 1 })
 
@@ -1004,7 +1006,7 @@ func TestAskCertCapPerHour(t *testing.T) {
 	}
 
 	// An hour later the window resets and approvals flow again.
-	now = now.Add(time.Hour)
+	nowNs.Add(int64(time.Hour))
 	if code := askGet(t, ask, "/check?domain=other.example.com"); code != http.StatusOK {
 		t.Fatalf("post-window ask = %d, want 200", code)
 	}
