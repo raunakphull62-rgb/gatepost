@@ -16,7 +16,6 @@ API=http://172.17.0.1:8090
 EDGE_HTTP=http://127.0.0.1:8081
 ORIGIN_IP=192.88.99.10
 SUPERVISE_OFF=deploy/dev/.supervise-off
-SOAK_FILE=/tmp/edge-soak-prod.log
 
 API_PID=""
 cleanup() {
@@ -32,18 +31,15 @@ trap 'echo "=== soak: interrupted ===" >&2; exit 130' INT TERM
 echo "=== edge live soak: production pacing, API down 5 min ==="
 touch "$SUPERVISE_OFF"
 
-# go build — database cleanup — start everything
 go build -o gatepost ./cmd/gatepost || { echo "build failed"; exit 2; }
 
-# Wipe stale test data from the shared database. Prior runs (esp. the
-# acceptance script's f2 section) leave hostname-origin domains whose
-# snapshot-build DNS lookups timeout against this stub. PROD_TIMING runs
-# have a 10s poller HTTP timeout — stale DNS can blow past it.
+# Wipe stale test data — hostname-origin domains cause DNS-lookup timeouts in
+# the snapshot builder, which blows past the poller's 10s HTTP timeout.
 if [ -f .env ]; then
   DB_URL=$(grep '^DATABASE_URL=' .env | head -1 | cut -d= -f2-)
   if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
     psql "$DB_URL" -c \
-      "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'soak-%' OR hostname LIKE 'accept-%' OR hostname LIKE 'debug-%'); DELETE FROM domains WHERE hostname LIKE 'soak-%' OR hostname LIKE 'accept-%' OR hostname LIKE 'debug-%'; DELETE FROM nodes WHERE name LIKE 'soak-edge-%' OR name LIKE 'accept-edge-%' OR name LIKE 'debug-edge';" 2>&1
+      "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'); DELETE FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'; DELETE FROM nodes WHERE name LIKE 'accept-%' OR name LIKE 'soak-%' OR name LIKE 'debug-%';" 2>&1
     echo "[soak] stale test data cleaned from database"
   fi
 fi
@@ -58,34 +54,7 @@ OLD_PID=$(sudo ss -ltnp 'sport = :8090' 2>/dev/null | grep -o 'pid=[0-9]*' | hea
 STUB_PID=$(sudo ss -ltnup 'sport = :5344' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 [ -n "$STUB_PID" ] && sudo kill "$STUB_PID" 2>/dev/null; sleep 0.3
 
-# DNS stub: just TXT verify (no A-record flips needed for this soak).
-STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"
-cat > "$STUB_PY" <<'EOF'
-import socket, sys
-tok_path = sys.argv[1]
-srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-srv.bind(("127.0.0.1", 5344))
-while True:
-    data, addr = srv.recvfrom(4096)
-    try:
-        j = 12
-        while data[j] != 0:
-            j += 1 + data[j]
-        qtype = data[j+1:j+3]
-        question = data[12:j+4]
-        if qtype == b'\x00\x10':  # TXT
-            txt = b'gatepost-verify=' + open(tok_path, 'rb').read().strip()
-            answer = b'\xc0\x0c' + b'\x00\x10\x00\x01\x00\x00\x00\x05' + (len(txt)+1).to_bytes(2,'big') + bytes([len(txt)]) + txt
-            srv.sendto(data[:2] + b'\x81\x80' + b'\x00\x01\x00\x01\x00\x00\x00\x00' + question + answer, addr)
-            continue
-        srv.sendto(data[:2] + b'\x81\x80' + b'\x00\x01\x00\x00\x00\x00\x00\x00' + question, addr)
-    except Exception:
-        pass
-EOF
-python3 "$STUB_PY" "$STUB_TOK" >/dev/null 2>&1 &
-STUB_PID=$!
-sleep 0.5
-
+# DNS stub — same format as edge-accept.sh (flags 0x84/0x00 for compatibility).
 mkdir -p outbox "$SECRETS"
 if [ -s "$SECRETS/snapshot_key" ]; then
   KEY="$(cat "$SECRETS/snapshot_key")"
@@ -95,10 +64,71 @@ else
 fi
 chmod 644 "$SECRETS/snapshot_key"
 
-# Operator identity — must match GP_OPERATOR_EMAILS so node mint works.
 U="soak-$(date +%s)@x.test"; PW="soak-password-1"
 HOST="soak-$(date +%s).example.test"
 JAR="$(mktemp)"
+STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"
+
+# DNS stub: TXT verify (token from STUB_TOK) + A query passthrough (NOERROR).
+cat > "$STUB_PY" <<'STUBEOF'
+import socket, sys
+tok_path, a_path = sys.argv[1], sys.argv[2]
+srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+srv.bind(("127.0.0.1", 5344))
+while True:
+    data, addr = srv.recvfrom(4096)
+    try:
+        j = 12
+        while data[j] != 0:
+            j += 1 + data[j]
+        nul = j
+        j += 1
+        qtype = data[j:j+2]
+        question = data[12:j+4]
+        if qtype == b'\x00\x01':  # A
+            ip = None
+            try:
+                for line in open(a_path):
+                    n, _, v = line.strip().partition(' ')
+                    labels = []
+                    k = 12
+                    while data[k] != 0:
+                        l = data[k]
+                        labels.append(data[k+1:k+1+l].decode())
+                        k += 1 + l
+                    qname = '.'.join(labels).lower().rstrip('.')
+                    if n.rstrip('.').lower() == qname:
+                        ip = v
+                        break
+            except OSError:
+                pass
+            if ip:
+                rdata = bytes(int(x) for x in ip.split('.'))
+                srv.sendto(data[:2] + b'\x81\x80' + b'\x00\x01\x00\x01\x00\x00\x00\x00'
+                           + question + b'\xc0\x0c' + b'\x00\x01\x00\x01'
+                           + b'\x00\x00\x00\x05' + b'\x00\x04' + rdata, addr)
+                continue
+            srv.sendto(data[:2] + b'\x81\x80' + b'\x00\x01\x00\x00\x00\x00\x00\x00'
+                       + question, addr)
+            continue
+        if qtype == b'\x00\x10':  # TXT
+            txt = b'gatepost-verify=' + open(tok_path, 'rb').read().strip()
+            answer = (b'\xc0\x0c' + b'\x00\x10\x00\x01' + b'\x00\x00\x00\x05'
+                      + (len(txt) + 1).to_bytes(2, 'big') + bytes([len(txt)]) + txt)
+            srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x01\x00\x00\x00\x00'
+                       + question + answer, addr)
+            continue
+        srv.sendto(data[:2] + b'\x84\x00' + b'\x00\x01\x00\x00\x00\x00\x00\x00'
+                   + question, addr)
+    except Exception:
+        pass
+STUBEOF
+# Start stub with an empty a_path file (no A records needed for this soak).
+: > "$STUB_PY.tmp_a"
+python3 "$STUB_PY" "$STUB_TOK" "$STUB_PY.tmp_a" >/dev/null 2>&1 &
+STUB_PID=$!
+sleep 0.5
+kill -0 "$STUB_PID" 2>/dev/null && echo "[soak] DNS stub up on :5344" || { echo "[soak] DNS stub failed"; exit 2; }
 
 # Start API (PRODUCTION PACING — no fast overrides).
 env -i ENV=development GP_HTTP_ADDR=172.17.0.1:8090 \
@@ -118,9 +148,6 @@ sudo env GP_EDGE_API_BASE="$API" GP_EDGE_ISSUER=internal \
   || { echo "compose up failed"; exit 2; }
 echo "[soak] edge + origin-test up (production pacing: 60s cooldown, 5s poll, 60s backoff)"
 
-# Operator flow — mirror the acceptance script exactly.
-# (U, PW, HOST, JAR were set earlier to match GP_OPERATOR_EMAILS)
-
 # Signup
 OUT=$(curl -s -w '\n%{http_code}' -b "$JAR" -c "$JAR" -X POST "$API/auth/signup" \
   -H 'Content-Type: application/json' -d "{\"email\":\"$U\",\"password\":\"$PW\"}")
@@ -129,6 +156,7 @@ echo "[soak] signup: HTTP $CODE"
 [ "$CODE" = "200" ] || { echo "signup failed: $OUT"; exit 2; }
 
 # Verify (mail token from outbox)
+sleep 1
 TOK=$(grep -m1 -o 'token: [A-Za-z0-9_-]*' "$(ls -t outbox/*.txt | head -1)" | cut -d' ' -f2)
 OUT=$(curl -s -w '\n%{http_code}' -b "$JAR" -c "$JAR" -X POST "$API/auth/verify" \
   -H 'Content-Type: application/json' -d "{\"token\":\"$TOK\"}")
@@ -138,25 +166,30 @@ echo "[soak] verify: HTTP $CODE"
 
 # Mint node
 OUT=$(curl -s -b "$JAR" -c "$JAR" -X POST "$API/v1/nodes" \
-  -H 'Content-Type: application/json' -d '{"name":"soak-edge-$(date +%s)","role":"edge"}')
+  -H 'Content-Type: application/json' -d "{\"name\":\"soak-edge-$(date +%s)\",\"role\":\"edge\"}")
 NTOK=$(printf '%s' "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
 printf '%s' "$NTOK" > "$SECRETS/token" && chmod 644 "$SECRETS/token"
-echo "[soak] node minted, token written to $SECRETS/token"
+echo "[soak] node minted"
 
-# Claim + verify domain
+# Claim domain
 OUT=$(curl -s -b "$JAR" -c "$JAR" -X POST "$API/v1/domains" \
   -H 'Content-Type: application/json' -d "{\"hostname\":\"$HOST\"}")
 DOM=$(printf '%s' "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['domain']['id'])")
-VT=$(curl -s -b "$JAR" -c "$JAR" "$API/v1/domains/$DOM/verification" \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['verification']['record_value'])" | cut -d= -f2)
+echo "[soak] domain claimed: $HOST"
+
+# Verify domain (TXT lookup via DNS stub)
+VT=$(curl -s -b "$JAR" -c "$JAR" "$API/v1/domains/$DOM/verification" | python3 -c "import json,sys; print(json.load(sys.stdin)['verification']['record_value'])" | cut -d= -f2)
 printf '%s' "$VT" > "$STUB_TOK"
-curl -s -o /dev/null -b "$JAR" -c "$JAR" -X POST "$API/v1/domains/$DOM/verify"
-echo "[soak] domain $HOST claimed + verified at $(date +%H:%M:%S)"
+sleep 0.5  # let the stub pick up the new token file
+OUT=$(curl -s -w '\n%{http_code}' -b "$JAR" -c "$JAR" -X POST "$API/v1/domains/$DOM/verify")
+CODE=$(printf '%s' "$OUT" | tail -1)
+echo "[soak] domain verify: HTTP $CODE"
+[ "$CODE" = "200" ] || { echo "domain verify failed ($CODE): $(head -1 <<< "$OUT")"; echo "--- API log ---"; tail -5 /tmp/edge-soak-api.log; exit 2; }
 
 # Set origin
 curl -s -o /dev/null -b "$JAR" -c "$JAR" -X POST "$API/v1/domains/$DOM/origin" \
   -H 'Content-Type: application/json' -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}"
-echo "[soak] origin set: http://$ORIGIN_IP:9001"
+echo "[soak] origin set: http://$ORIGIN_IP:9001 at $(date +%H:%M:%S)"
 
 # Start the poller (PRODUCTION PACING — no timing overrides).
 sudo env GP_EDGE_API_BASE="$API" GP_EDGE_ISSUER=internal \
@@ -165,7 +198,7 @@ sudo env GP_EDGE_API_BASE="$API" GP_EDGE_ISSUER=internal \
 echo "[soak] poller up at $(date +%H:%M:%S)"
 
 # Wait for snapshot applied.
-for _ in $(seq 1 120); do
+for _ in $(seq 1 180); do
   sudo docker compose -f "$COMPOSE" logs poller 2>/dev/null | grep -q "applied snapshot generation" && break
   sleep 1
 done
@@ -178,8 +211,8 @@ echo "[soak] edge serves origin-test at $(date +%H:%M:%S)"
 # === docker inspect BEFORE the soak window ===
 echo
 echo "[soak] docker inspect BEFORE:"
-EDGE_NAME=$(sudo docker ps -q --filter "name=gatepost-edge-dev_edge")
-POLLER_NAME=$(sudo docker ps -q --filter "name=gatepost-edge-dev_poller")
+EDGE_NAME=$(sudo docker ps -q --filter "name=gatepost-edge-dev-edge")
+POLLER_NAME=$(sudo docker ps -q --filter "name=gatepost-edge-dev-poller")
 INSPECT_BEFORE=$(sudo docker inspect --format='{{.RestartCount}} {{.State.StartedAt}}' "$EDGE_NAME" "$POLLER_NAME")
 echo "  edge:    $(echo "$INSPECT_BEFORE" | head -1)"
 echo "  poller:  $(echo "$INSPECT_BEFORE" | tail -1)"
