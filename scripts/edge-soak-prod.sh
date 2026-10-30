@@ -289,8 +289,9 @@ echo "  poller:  before=$POLLER_BEFORE_RC after=$POLLER_AFTER_RC"
 echo
 echo "--- non-200 response count during soak window: ---"
 TOTAL=$(wc -l < "$TRAFFIC_LOG" | tr -d ' ')
-NON200=$(grep -cv '^200$' "$TRAFFIC_LOG" 2>/dev/null || printf '0')
+NON200=$(grep -v '^200$' "$TRAFFIC_LOG" 2>/dev/null | wc -l | tr -d ' ' )
 ZEROS=$(grep -c '^000$' "$TRAFFIC_LOG" 2>/dev/null || printf '0')
+ZEROS=${ZEROS%%$'\n'*}
 echo "  total responses sampled: $TOTAL"
 echo "  non-200 responses: $NON200"
 echo "  connection failures (000): $ZEROS"
