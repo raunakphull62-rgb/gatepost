@@ -737,7 +737,6 @@ func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string,
 	b := strings.Builder{}
 	b.WriteString("Include @coraza.conf-recommended\n")
 	b.WriteString("Include @crs-setup.conf.example\n")
-	b.WriteString("Include @owasp_crs/*.conf\n")
 	// SecDefaultAction is NOT emitted here: @crs-setup.conf.example defines the
 	// phase:1/phase:2 default actions (log,auditlog,pass) and coraza rejects a
 	// second SecDefaultAction for an already-set phase. SecRuleEngine below
@@ -765,9 +764,12 @@ func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string,
 	// B3c item 2: host-scoped phase:1 rules using ctl actions on ONE shared
 	// Coraza WAF instance. Each domain that differs from the global default
 	// mode gets a ctl:ruleEngine override; each excluded rule ID gets a
-	// ctl:ruleRemoveById. These fire at phase:1 BEFORE any CRS rule, so the
-	// per-host behavior is applied to every transaction without a second WAF
-	// instance (≈30 MiB each).
+	// ctl:ruleRemoveById. These fire at phase:1 BEFORE any CRS rule — the
+	// host-scoped SecRules are emitted BEFORE the Include @owasp_crs line so
+	// ModSecurity's phase order guarantees the ctl action is set before a
+	// CRS rule can block or remove it for that host. Without this ordering,
+	// a CRS phase:1 rule (e.g. 913100) could fire before the host-scoped
+	// ctl:ruleEngine=Off takes effect, breaking host isolation.
 	ruleID := 190000
 	for _, dom := range doms {
 		if !validateHostForWAF(dom.Hostname) {
@@ -790,6 +792,10 @@ func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string,
 			ruleID++
 		}
 	}
+
+	// CRS rules loaded LAST — after all host-scoped ctl actions, so the per-host
+	// engine mode and rule removals are in effect before any CRS rule evaluates.
+	b.WriteString("Include @owasp_crs/*.conf\n")
 
 	return b.String(), nil
 }

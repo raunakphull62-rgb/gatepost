@@ -27,6 +27,7 @@ var isolationRoutes = []struct {
 	{"origin update", "PUT", "/v1/domains/{id}/origin",
 		`{"scheme":"https","address":"93.184.216.34","port":443}`},
 	{"origin test", "POST", "/v1/domains/{id}/origin/test", ""},
+	{"waf mode", "PUT", "/v1/domains/{id}/waf", `{"mode":"blocking","excluded_rule_ids":[942100]}`},
 	{"records create", "POST", "/v1/domains/{id}/records", `{"name":"@","type":"A","value":"93.184.216.34"}`},
 	{"records list", "GET", "/v1/domains/{id}/records", ""},
 }

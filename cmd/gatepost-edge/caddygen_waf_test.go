@@ -257,6 +257,93 @@ func TestCorazaDirectivesHostileRejects(t *testing.T) {
 	}
 }
 
+// TestCorazaDirectivesOrderingProof: the host-scoped phase:1 ctl rules MUST
+// appear BEFORE the Include @owasp_crs line in the directives string. In
+// ModSecurity's execution model, phase:1 rules evaluate in the order they appear
+// in the config — if the CRS rules are loaded first, a phase:1 CRS rule (e.g.
+// 913100 anomaly scoring) fires BEFORE the host-scoped ctl:ruleEngine=Off
+// takes effect, silently breaking host isolation. This test pins the ordering.
+func TestCorazaDirectivesOrderingProof(t *testing.T) {
+	doms := []snapshot.Domain{
+		{Hostname: "off.example.test", WAFMode: "off"},
+		{Hostname: "blocked.example.test", WAFMode: "blocking", ExcludedRuleIDs: []int{942100}},
+	}
+	d, err := corazaDirectives("detection", WAFConfig{
+		Mode:         "detection",
+		AuditLogPath: "/tmp/waf.log",
+	}, doms)
+	if err != nil {
+		t.Fatalf("corazaDirectives: %v", err)
+	}
+	crsIdx := strings.Index(d, "Include @owasp_crs/*.conf")
+	if crsIdx < 0 {
+		t.Fatal("missing Include @owasp_crs/*.conf")
+	}
+	// Every host-scoped SecRule must be before the CRS include.
+	for _, host := range []string{"off.example.test", "blocked.example.test"} {
+		idx := strings.Index(d, `REQUEST_HEADERS:Host "@streq `+host+`"`)
+		if idx < 0 {
+			t.Fatalf("missing host-scoped rule for %s", host)
+		}
+		if idx >= crsIdx {
+			t.Fatalf("host-scoped rule for %s (index %d) appears AFTER Include @owasp_crs (index %d) — CRS phase:1 rules would fire first, breaking host isolation", host, idx, crsIdx)
+		}
+	}
+	// The paranoia SecAction and SecRuleEngine must also be before CRS.
+	if idx := strings.Index(d, `SecAction "id:900000`); idx >= crsIdx {
+		t.Fatalf("SecAction paranoia (index %d) appears AFTER Include @owasp_crs (index %d) — CRS rules need paranoia vars set first", idx, crsIdx)
+	}
+	// off.example.test gets ctl:ruleEngine=Off (id 190000).
+	// blocked.example.test gets ctl:ruleEngine=On (id 190001), then its
+	// exclusion 942100 gets ctl:ruleRemoveById (id 190002) — both before CRS.
+	for _, needle := range []string{
+		`id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=Off`,
+		`id:190001,phase:1,pass,t:none,nolog,ctl:ruleEngine=On`,
+		`id:190002,phase:1,pass,t:none,nolog,ctl:ruleRemoveById=942100`,
+	} {
+		idx := strings.Index(d, needle)
+		if idx < 0 {
+			t.Fatalf("missing directive %q", needle)
+		}
+		if idx >= crsIdx {
+			t.Fatalf("directive %q (index %d) appears AFTER Include @owasp_crs (index %d) — ordering violation", needle, idx, crsIdx)
+		}
+	}
+}
+
+// TestCorazaDirectivesSchema1BackwardCompat: a schema-1 snapshot (pre-WAF-bump)
+// carries domains with an EMPTY WAFMode. snapshotDomainWAF must default those to
+// "detection". When the global mode is "blocking", a schema-1 domain must get
+// a ctl:ruleEngine=DetectionOnly override (it was never explicitly set to
+// blocking — fail safe to log-only). This proves the schema bump is backwards
+// compatible: old artifacts keep working without a migration step.
+func TestCorazaDirectivesSchema1BackwardCompat(t *testing.T) {
+	// Schema-1 domain: WAFMode is "" (the field didn't exist in schema 1).
+	// When the global mode is "blocking", this host must get a detection override.
+	doms := []snapshot.Domain{
+		{Hostname: "schema1.example.test", WAFMode: ""}, // simulates a schema-1 read
+	}
+	d, err := corazaDirectives("blocking", WAFConfig{
+		Mode:         "blocking",
+		AuditLogPath: "/tmp/waf.log",
+	}, doms)
+	if err != nil {
+		t.Fatalf("corazaDirectives: %v", err)
+	}
+	// Global engine is On (blocking).
+	if !strings.Contains(d, "SecRuleEngine On") {
+		t.Fatal("expected global SecRuleEngine On")
+	}
+	// But the schema-1 host (empty WAFMode) must get a DetectionOnly override —
+	// it never opted into blocking.
+	if !strings.Contains(d, `id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=DetectionOnly`) {
+		t.Fatal("schema-1 host (empty WAFMode) must get a ctl:ruleEngine=DetectionOnly override when global mode is blocking")
+	}
+	if !strings.Contains(d, `REQUEST_HEADERS:Host "@streq schema1.example.test"`) {
+		t.Fatal("missing host-scoped rule for schema-1 host")
+	}
+}
+
 // TestSnapshotDomainWAFDefault verifies that schema-1 snapshots (empty mode)
 // default to "detection".
 func TestSnapshotDomainWAFDefault(t *testing.T) {
