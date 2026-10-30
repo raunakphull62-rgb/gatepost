@@ -174,6 +174,19 @@ echo "  pacing: $PACE_LABEL"
 touch "$SUPERVISE_OFF"   # supervisor out of the run (restored by the trap)
 go build -o gatepost ./cmd/gatepost || exit 2
 
+# PROD_TIMING runs have a 10s poller HTTP timeout — stale hostname-origin
+# domains from prior runs can blow past it during snapshot build. The fast
+# mode's 1s poll + DNS stub make this less visible, so only clean in
+# production mode.
+if [ "${PROD_TIMING:-0}" = "1" ] && [ -f .env ]; then
+  DB_URL=$(grep '^DATABASE_URL=' .env | head -1 | cut -d= -f2-)
+  if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+    psql "$DB_URL" -c \
+      "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'); DELETE FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'; DELETE FROM nodes WHERE name LIKE 'accept-%' OR name LIKE 'soak-%' OR name LIKE 'debug-%';" 2>&1
+    pass "PROD_TIMING: stale test data cleaned from database"
+  fi
+fi
+
 # Tear down any leftover stack FIRST — dc down removes the docker networks
 # (and their 192.88.99.0/24 route), so the preflight check below passes.
 dc down >/dev/null 2>&1
