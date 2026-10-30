@@ -557,6 +557,18 @@ check "i) the poller logged the 401 (once, loudly)" \
 check "i) the revoked node keeps serving the last-good config" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
+# Re-mint a node so the poller can fetch new snapshots for the WAF (l-n)
+# and origin-change (o) sections that follow. The revoked token proved
+# last-good serving; the remaining sections need live propagation.
+OUT=$(cb -X POST "$API/v1/nodes" -H 'Content-Type: application/json' -d "{\"name\":\"accept-edge-$TS-b\",\"role\":\"edge\"}")
+check "i) node re-minted for post-revocation sections (201)" "$(codeof "$OUT")" "201"
+NTOK=$(jget "$(bodyof "$OUT")" '["token"]')
+NID=$(jget "$(bodyof "$OUT")" '["node"]["id"]')
+printf '%s' "$NTOK" > "$SECRETS/token" && chmod 644 "$SECRETS/token"
+dc restart poller >/dev/null 2>&1
+until_ok 30 "i) poller resumed with fresh node" \
+  'dc logs --since 1m poller 2>/dev/null | grep -q "applied snapshot generation"'
+
 # --- j) the whole run's access log: no secrets, no query strings ----------
 section "j) the whole run's access log: no secrets, no query strings"
 # one maximally hostile request first: query + every credential header
