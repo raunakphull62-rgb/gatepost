@@ -580,7 +580,7 @@ check "k) audit log mode is 0644 (no shared-volume 0666)" \
 section "verdict"
 FINISHED=1
 echo "--- section timing ---"
-for s in $(echo "${!SECTION_TIMINGS[@]}" | tr ' ' '\n' | sort); do
+for s in "${!SECTION_TIMINGS[@]}"; do
   printf '  %-50s %3ds\n' "$s" "${SECTION_TIMINGS[$s]}"
 done
 echo "=== edge acceptance: $PASS passed, $FAIL failed ==="
