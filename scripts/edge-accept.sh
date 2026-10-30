@@ -192,7 +192,7 @@ if [ -f .env ]; then
   DB_URL=$(grep '^DATABASE_URL=' .env | head -1 | cut -d= -f2-)
   if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
     psql "$DB_URL" -c \
-      "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'); DELETE FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'; DELETE FROM nodes WHERE name LIKE 'accept-%' OR name LIKE 'soak-%' OR name LIKE 'debug-%';" 2>&1
+      "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%' OR hostname LIKE 'rss-%'); DELETE FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%' OR hostname LIKE 'rss-%'; DELETE FROM nodes WHERE name LIKE 'accept-%' OR name LIKE 'soak-%' OR name LIKE 'debug-%' OR name LIKE 'rss-%';" 2>&1
     if [ "${PROD_TIMING:-0}" = "1" ]; then
       pass "PROD_TIMING: stale test data cleaned from database"
     else
