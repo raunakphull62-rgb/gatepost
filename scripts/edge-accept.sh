@@ -681,6 +681,10 @@ check "l) set $WAF_B to off" "$(codeof "$OUT")" "200"
 until_ok ${PROPAGATE_TIMEOUT} "l) WAF modes propagated to edge" \
   'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q ctl:ruleEngine=Off'
 echo "     l) WAF mode change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
+# Brief settle: the propagation check above confirms the config bytes are
+# loaded, but Caddy's coraza module needs a moment to bind the new directives
+# before requests are evaluated against them.
+sleep 2
 # blocking host: SQLi blocked (403). off host: SQLi passes (200) — host isolation.
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) blocking host: SQLi attack returns 403" "$C" "403"
@@ -699,6 +703,7 @@ check "l) set $HOST to blocking with 942100 excluded" "$(codeof "$OUT")" "200"
 until_ok ${PROPAGATE_TIMEOUT} "l) WAF exclusion propagated" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
 echo "     l) exclusion change reached the edge in $((SECONDS - T0))s"
+sleep 2
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) excluded rule 942100: SQLi passes through (200)" "$C" "200"
 C=$(code_of -H "Host: $HOST" -A "sqlmap/1.6" "$EDGE_HTTP/ok")
@@ -827,13 +832,14 @@ PYEOF
     # Stop API + poller, replace the snapshot, restart.
     kill_api
     dc stop poller >/dev/null 2>&1
-    printf '%s' "$SCHEMA1" | sudo docker run --rm -i -v gatepost-edge-dev_poller_state:/state sh -c 'cat > /state/snapshot.json'
+    N_START=$(date -u +%Y-%m-%dT%H:%M:%S)
+    printf '%s' "$SCHEMA1" | sudo docker run --rm -i -v gatepost-edge-dev_poller_state:/state alpine sh -c 'cat > /state/snapshot.json'
     dc start poller >/dev/null 2>&1
     # The restarted poller reads the schema-1 snapshot at boot and applies it.
     until_ok 30 "n) poller applied the schema-1 snapshot" \
-      'dc logs --since 2m poller 2>/dev/null | grep -q "applied snapshot generation"'
+      'dc logs --since "$N_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
     check "n) schema-1 snapshot accepted (no verification error in log)" \
-      "$(dc logs --since 2m poller 2>/dev/null | grep -c 'failed verification\|tampered\|unusable')" "0"
+      "$(dc logs --since "$N_START" poller 2>/dev/null | grep -c 'failed verification\|tampered\|unusable')" "0"
     # The edge must still serve the HOST domain (WAFMode defaulted to detection).
     check "n) edge serves $HOST from origin-test (schema-1 backward compat)" \
       "$(curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -c 'port 9001')" "1"
