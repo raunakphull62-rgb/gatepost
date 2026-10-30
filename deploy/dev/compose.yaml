@@ -20,8 +20,8 @@ services:
       retries: 3
       start_period: 5s
     ports:
-      - "8081:80"
-      - "8445:443"
+      - "127.0.0.1:8081:80"
+      - "127.0.0.1:8445:443"
     volumes:
       - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
       - caddy_config:/config  # Caddy's own persisted state
