@@ -865,22 +865,19 @@ print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
       "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRuleEngine DetectionOnly')" "1"
     # Restart API for schema-2 refetch. The schema-1 snapshot has gen bumped by
     # 1, so the API's current snapshot (same content → same gen) is "behind"
-    # the poller's applied gen. We toggle WAF_B's mode twice to produce two new
-    # generations via content-hash changes: detection→gen N+1 (skipped, equal to
-    # applied), then back to off→gen N+2 (poller applies). This proves the
-    # poller can upgrade from a schema-1 artifact to a live schema-2 fetch.
+    # the poller's applied gen. We toggle $DOM (WAF_A) mode twice to produce
+    # two new generations via content-hash changes: detection→gen N+1 (skipped,
+    # equal to applied), then back→gen N+2 (poller applies). WAF_B stays "off"
+    # throughout so the schema-2 check (ctl:ruleEngine=Off) still passes.
     start_api
-    # Need WAF_B's domain ID. Find it via the API.
-    WB_DOM=$(curl -s -b "$JAR" "$API/v1/domains/$WAF_B" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['domain']['id'])" 2>/dev/null || echo "")
-    if [ -n "$WB_DOM" ]; then
-      # Toggle: detection (gen N+1)
-      cb -X PUT "$API/v1/domains/$WB_DOM/waf" -H 'Content-Type: application/json' \
-        -d '{"mode":"detection","excluded_rule_ids":[]}' >/dev/null 2>&1
-      sleep 2
-      # Toggle back: off (gen N+2, strictly > applied gen N+1)
-      cb -X PUT "$API/v1/domains/$WB_DOM/waf" -H 'Content-Type: application/json' \
-        -d '{"mode":"off","excluded_rule_ids":[]}' >/dev/null 2>&1
-    fi
+    # Toggle $DOM (HOST) to a different mode first, then back. Each change
+    # produces a new content hash → new generation: gen N+1 (skipped, == applied),
+    # then gen N+2 (poller applies). WAF_B stays "off" throughout.
+    cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' \
+      -d '{"mode":"blocking","excluded_rule_ids":[]}' >/dev/null 2>&1
+    sleep 2
+    cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' \
+      -d '{"mode":"detection","excluded_rule_ids":[]}' >/dev/null 2>&1
     N_START2=$(date -u +%Y-%m-%dT%H:%M:%S)
     until_ok ${PROPAGATE_TIMEOUT} "n) poller refetched the schema-2 snapshot from the API" \
       'dc logs --since "$N_START2" poller 2>/dev/null | grep -q "applied snapshot generation"'
