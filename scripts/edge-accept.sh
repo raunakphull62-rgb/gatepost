@@ -181,16 +181,23 @@ echo "  pacing: $PACE_LABEL"
 touch "$SUPERVISE_OFF"   # supervisor out of the run (restored by the trap)
 go build -o gatepost ./cmd/gatepost || exit 2
 
-# PROD_TIMING runs have a 10s poller HTTP timeout — stale hostname-origin
-# domains from prior runs can blow past it during snapshot build. The fast
-# mode's 1s poll + DNS stub make this less visible, so only clean in
-# production mode.
-if [ "${PROD_TIMING:-0}" = "1" ] && [ -f .env ]; then
+# Stale test data cleanup: domains/origins/nodes from prior runs must not
+# linger in the database. Stale accept-wb-* hosts with waf_mode='off' would
+# put ctl:ruleEngine=Off in the snapshot BEFORE the current run's WAF changes
+# are even applied — making the propagation check a false positive (it finds
+# the stale Off rule and passes immediately). PROD_TIMING runs are especially
+# sensitive (10s poller HTTP timeout can blow past the snapshot build); fast
+# mode converges faster but still needs a clean slate to avoid false matches.
+if [ -f .env ]; then
   DB_URL=$(grep '^DATABASE_URL=' .env | head -1 | cut -d= -f2-)
   if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
     psql "$DB_URL" -c \
       "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'); DELETE FROM domains WHERE hostname LIKE 'accept-%' OR hostname LIKE 'soak-%' OR hostname LIKE 'debug-%'; DELETE FROM nodes WHERE name LIKE 'accept-%' OR name LIKE 'soak-%' OR name LIKE 'debug-%';" 2>&1
-    pass "PROD_TIMING: stale test data cleaned from database"
+    if [ "${PROD_TIMING:-0}" = "1" ]; then
+      pass "PROD_TIMING: stale test data cleaned from database"
+    else
+      pass "fast mode: stale test data cleaned from database"
+    fi
   fi
 fi
 
@@ -679,7 +686,7 @@ check "l) set $HOST to blocking" "$(codeof "$OUT")" "200"
 OUT=$(cb -X PUT "$API/v1/domains/$WAF_DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"off"}')
 check "l) set $WAF_B to off" "$(codeof "$OUT")" "200"
 until_ok ${PROPAGATE_TIMEOUT} "l) WAF modes propagated to edge" \
-  'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q ctl:ruleEngine=Off'
+  'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=On" && dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=Off"'
 echo "     l) WAF mode change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
 # Brief settle: the propagation check above confirms the config bytes are
 # loaded, but Caddy's coraza module needs a moment to bind the new directives
