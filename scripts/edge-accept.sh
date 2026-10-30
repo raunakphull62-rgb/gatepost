@@ -22,6 +22,13 @@
 #      propagates again); a revoked token (401): last-good keeps serving
 #   j) the run's whole access log: no secrets, no query strings — and no
 #      access entry ever reaches the edge container's stderr either
+#   k) B3c WAF audit redaction (detection-only, in-process, no values)
+#   l) WAF per-host: off vs detection vs blocking; exclusions for one host
+#      only; host isolation; mode-change propagation timing; generic 403
+#      body; live ordering proof (host-scoped ctl rules before CRS includes)
+#   m) edge RSS with 1/10/100 served hosts (shared WAF instance, sub-linear)
+#   n) schema-1 snapshot (pre-WAF bump): backward-compat, defaults to detection
+#   o) [PROD_TIMING=1] origin change after 60s silence reaches the edge in ~10s
 #
 # Secrets stay in deploy/dev/secrets/ (gitignored) and .env; nothing
 # secret is printed. Exits nonzero on any failure.
@@ -211,6 +218,10 @@ else
 fi
 chmod 644 "$SECRETS/snapshot_key"
 check_ne "snapshot key material is non-empty" "$KEY" ""
+DB_URL=""
+if [ -f .env ]; then
+  DB_URL=$(grep '^DATABASE_URL=' .env | head -1 | cut -d= -f2-)
+fi
 check "no host route squats the origin fixture's range (192.88.99.0/24)" \
   "$(ip route show | grep -c 192.88.99)" "0"
 
@@ -622,6 +633,244 @@ check_ne "k) [uri] fields blanked by the redacted formatter" \
   "$(printf '%s\n' "$AUDIT" | grep -c '\[uri ""\]')" "0"
 check "k) audit log mode is 0644 (no shared-volume 0666)" \
   "$(dc exec edge sh -c 'stat -c %a /data/logs/waf_audit.log 2>/dev/null || echo missing')" "644"
+
+# --- l) WAF per-host live tests (off/detection/blocking, exclusions, isolation) ----
+# Probes the per-host WAF controls end-to-end: the GLOBAL mode is "detection"
+# (compose.yaml default), so a host set to "blocking" emits ctl:ruleEngine=On
+# and a host set to "off" emits ctl:ruleEngine=Off — one shared Coraza instance,
+# host-scoped by phase:1 SecRules that match on the Host header.
+section "l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)"
+WAF_B="accept-wb-$TS.example.test"
+OUT=$(cb -X POST "$API/v1/domains" -H 'Content-Type: application/json' -d "{\"hostname\":\"$WAF_B\"}")
+check "l) claim $WAF_B" "$(codeof "$OUT")" "201"
+WAF_DOM=$(jget "$(bodyof "$OUT")" '["domain"]["id"]')
+VT=$(jget "$(bodyof "$(cb "$API/v1/domains/$WAF_DOM/verification")")" '["verification"]["record_value"]' | cut -d= -f2)
+printf '%s' "$VT" > "$STUB_TOK"
+OUT=$(cb -X POST "$API/v1/domains/$WAF_DOM/verify")
+check "l) verify $WAF_B" "$(codeof "$OUT")" "200"
+OUT=$(cb -X POST "$API/v1/domains/$WAF_DOM/origin" -H 'Content-Type: application/json' \
+  -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}")
+check "l) origin set for $WAF_B" "$(codeof "$OUT")" "201"
+until_ok 30 "l) edge serves $WAF_B from origin-test" \
+  'curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -q "port 9001"'
+# SQLi in query triggers CRS 942100; scanner UA triggers 913100.
+SQLI_ATTACK="ok?id=%27%20OR%20%271%27%3D%271"
+# Baseline: both at detection (default) — SQLi passes through.
+C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) detection baseline: SQLi passes through ($HOST)" "$C" "200"
+C=$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) detection baseline: SQLi passes through ($WAF_B)" "$C" "200"
+# Set HOST=blocking, WAF_B=off — global default stays detection.
+T0=$SECONDS
+OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"blocking"}')
+check "l) set $HOST to blocking" "$(codeof "$OUT")" "200"
+OUT=$(cb -X PUT "$API/v1/domains/$WAF_DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"off"}')
+check "l) set $WAF_B to off" "$(codeof "$OUT")" "200"
+until_ok ${PROPAGATE_TIMEOUT} "l) WAF modes propagated to edge" \
+  'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q ctl:ruleEngine=Off'
+echo "     l) WAF mode change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
+# blocking host: SQLi blocked (403). off host: SQLi passes (200) — host isolation.
+C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) blocking host: SQLi attack returns 403" "$C" "403"
+C=$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) off host: SQLi passes through (host isolation)" "$C" "200"
+# Generic 403 body: no attack payload, no host name, no query string.
+B=$(curl -s -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) 403 body has no SQLi payload" "$(printf '%s' "$B" | grep -c "OR.*1.*1")" "0"
+check "l) 403 body has no query string" "$(printf '%s' "$B" | grep -c '?')" "0"
+check "l) 403 body has no host name" "$(printf '%s' "$B" | grep -c "$HOST")" "0"
+# Exclusions: exclude 942100 on HOST — SQLi passes, scanner UA stays blocked.
+T0=$SECONDS
+OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' \
+  -d '{"mode":"blocking","excluded_rule_ids":[942100]}')
+check "l) set $HOST to blocking with 942100 excluded" "$(codeof "$OUT")" "200"
+until_ok ${PROPAGATE_TIMEOUT} "l) WAF exclusion propagated" \
+  'curl -s -H "Host: $HOST" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
+echo "     l) exclusion change reached the edge in $((SECONDS - T0))s"
+C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) excluded rule 942100: SQLi passes through (200)" "$C" "200"
+C=$(code_of -H "Host: $HOST" -A "sqlmap/1.6" "$EDGE_HTTP/ok")
+check "l) non-excluded rule 913100: scanner UA still blocked (403)" "$C" "403"
+# Mode-change timing: blocking → detection (should pass through again).
+T0=$SECONDS
+OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}')
+check "l) set $HOST to detection (mode change)" "$(codeof "$OUT")" "200"
+until_ok ${PROPAGATE_TIMEOUT} "l) mode change propagated" \
+  'curl -s -H "Host: $HOST" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
+echo "     l) mode change (blocking→detection) reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
+# Host isolation: WAF_B still off while HOST changed.
+check "l) host isolation: $WAF_B unaffected by $HOST mode change" \
+  "$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")" "200"
+# Ordering proof: live Caddy config must place host-scoped ctl rules BEFORE CRS includes.
+ORDERING=$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | python3 -c '
+import json, sys
+cfg = json.load(sys.stdin)
+srv = cfg.get("apps",{}).get("http",{}).get("servers",{}).get("edge",{})
+if not srv: print("NO_EDGE_SERVER"); sys.exit(0)
+for rt in srv.get("routes", []):
+    for h in rt.get("handle", []):
+        if isinstance(h, dict) and h.get("handler") == "waf":
+            d = h.get("directives", "")
+            ctl_idx = d.find("REQUEST_HEADERS:Host")
+            crs_idx = d.find("@owasp_crs")
+            if ctl_idx >= 0 and (crs_idx < 0 or ctl_idx < crs_idx): print("ORDERED")
+            else: print("UNORDERED")
+            break
+    else: continue
+    break
+else: print("NO_WAF_HANDLER")
+' 2>/dev/null)
+check "l) ordering: host-scoped ctl rules precede CRS includes" "$ORDERING" "ORDERED"
+# Reset HOST to detection (global default) for subsequent sections.
+cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}' >/dev/null 2>&1
+
+# --- m) edge RSS with 1/10/100 served hosts ----------------------------------
+section "m) edge RSS with 1/10/100 served hosts"
+get_rss() { dc exec edge sh -c "grep VmRSS /proc/1/status" 2>/dev/null | awk '{print $2}'; }
+# Baseline: HOST + WAF_B = 2 hosts already served by the edge.
+until_ok 30 "m) baseline 2 hosts serving" \
+  'curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -q "port 9001"'
+RSS_2=$(get_rss)
+echo "     m) RSS: 2 hosts = ${RSS_2} kB"
+check "m) edge RSS measurable with 2 hosts" "$([ -n "$RSS_2" ] && echo ok || echo fail)" "ok"
+# 10 hosts: add 8 more via psql (bypass DNS verify — direct DB insert).
+if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+  psql "$DB_URL" <<SQL >/dev/null 2>&1
+WITH uid AS (SELECT id FROM users WHERE email = '$U' LIMIT 1),
+     d AS (
+       INSERT INTO domains (owner_user_id, hostname, status, verify_token, setup_type, verified_at, waf_mode, excluded_rule_ids)
+       SELECT uid.id, 'rss-' || gs::text || '-$TS.example.test', 'verified', 'tok-' || gs::text || '-$TS',
+              'http', now(), 'detection', '{}'::int[]
+       FROM uid, generate_series(1, 8) gs
+       RETURNING id
+     )
+INSERT INTO origins (domain_id, scheme, address, port, tls_verify)
+SELECT d.id, 'http', '$ORIGIN_IP', 9001, false FROM d;
+SQL
+  # Trigger snapshot rebuild.
+  cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection","excluded_rule_ids":[]}' >/dev/null 2>&1
+  until_ok ${PROPAGATE_TIMEOUT} "m) 10 hosts in snapshot" \
+    'curl -s -H "Host: rss-8-$TS.example.test" $EDGE_HTTP/ok | grep -q "port 9001"'
+  RSS_10=$(get_rss)
+  echo "     m) RSS: 10 hosts = ${RSS_10} kB"
+  check "m) edge RSS measurable with 10 hosts" "$([ -n "$RSS_10" ] && echo ok || echo fail)" "ok"
+  # 100 hosts: add 90 more.
+  psql "$DB_URL" <<SQL >/dev/null 2>&1
+WITH uid AS (SELECT id FROM users WHERE email = '$U' LIMIT 1),
+     d AS (
+       INSERT INTO domains (owner_user_id, hostname, status, verify_token, setup_type, verified_at, waf_mode, excluded_rule_ids)
+       SELECT uid.id, 'rss100-' || gs::text || '-$TS.example.test', 'verified', 'tok100-' || gs::text || '-$TS',
+              'http', now(), 'detection', '{}'::int[]
+       FROM uid, generate_series(1, 90) gs
+       RETURNING id
+     )
+INSERT INTO origins (domain_id, scheme, address, port, tls_verify)
+SELECT d.id, 'http', '$ORIGIN_IP', 9001, false FROM d;
+SQL
+  cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection","excluded_rule_ids":[]}' >/dev/null 2>&1
+  until_ok ${PROPAGATE_TIMEOUT} "m) 100 hosts in snapshot" \
+    'curl -s -H "Host: rss100-90-$TS.example.test" $EDGE_HTTP/ok | grep -q "port 9001"'
+  RSS_100=$(get_rss)
+  echo "     m) RSS: 100 hosts = ${RSS_100} kB"
+  check "m) edge RSS measurable with 100 hosts" "$([ -n "$RSS_100" ] && echo ok || echo fail)" "ok"
+  # Sub-linear growth: 100 hosts should not be 50x the 2-host RSS.
+  if [ -n "$RSS_2" ] && [ -n "$RSS_100" ] && [ "$RSS_2" -gt 0 ]; then
+    RATIO=$(( RSS_100 * 10 / RSS_2 ))  # ratio * 10
+    if [ "$RATIO" -lt 200 ]; then
+      pass "m) sub-linear: RSS grew ${RATIO}‰ per host (100 vs 2 hosts)"
+    else
+      fail "m) RSS growth too linear (${RATIO}‰ per host)"
+    fi
+  fi
+else
+  fail "m) psql not available — skipping RSS test (DB_URL empty or psql missing)"
+fi
+
+# --- n) schema-1 snapshot backward-compat (old edge artifact) --------------------
+# An "old edge" artifact: a snapshot signed with the SAME key but schema_version=1
+# (no waf_mode field). The current edge must accept it and default WAFMode to
+# "detection" via snapshotDomainWAF — the schema bump is backward-compatible.
+section "n) schema-1 snapshot backward-compat (old edge artifact)"
+if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+  # Read the on-disk snapshot from the poller volume.
+  CUR_SNAPSHOT=$(dc exec poller cat /state/snapshot.json 2>/dev/null)
+  if [ -n "$CUR_SNAPSHOT" ]; then
+    # Craft a schema-1 snapshot: bump generation, clear waf_mode, re-sign.
+    SCHEMA1=$(python3 - "$KEY" "$CUR_SNAPSHOT" <<'PYEOF'
+import sys, json, hmac, hashlib
+key = sys.argv[1].strip()
+env = json.loads(sys.argv[2])
+doc = json.loads(env["payload"])
+doc["schema_version"] = 1
+for d in doc.get("domains", []):
+    d["waf_mode"] = ""
+    d["excluded_rule_ids"] = []
+doc["generation"] = int(doc.get("generation", 0)) + 1
+payload = json.dumps(doc, sort_keys=True, separators=(',', ':'))
+sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+key_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
+PYEOF
+)
+    # Stop API + poller, replace the snapshot, restart.
+    kill_api
+    dc stop poller >/dev/null 2>&1
+    printf '%s' "$SCHEMA1" | sudo docker run --rm -i -v gatepost-edge-dev_poller_state:/state sh -c 'cat > /state/snapshot.json'
+    dc start poller >/dev/null 2>&1
+    # The restarted poller reads the schema-1 snapshot at boot and applies it.
+    until_ok 30 "n) poller applied the schema-1 snapshot" \
+      'dc logs --since 2m poller 2>/dev/null | grep -q "applied snapshot generation"'
+    check "n) schema-1 snapshot accepted (no verification error in log)" \
+      "$(dc logs --since 2m poller 2>/dev/null | grep -c 'failed verification\|tampered\|unusable')" "0"
+    # The edge must still serve the HOST domain (WAFMode defaulted to detection).
+    check "n) edge serves $HOST from origin-test (schema-1 backward compat)" \
+      "$(curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -c 'port 9001')" "1"
+    check "n) edge serves $WAF_B from origin-test (schema-1 backward compat)" \
+      "$(curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -c 'port 9001')" "1"
+    # Audit: the schema-1 snapshot's waf_mode defaulted to detection — verify
+    # the generated directives use DetectionOnly as the global default.
+    check "n) directives default to DetectionOnly for schema-1 domains" \
+      "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRuleEngine DetectionOnly')" "1"
+    # Restart API + poller to get back to a clean state.
+    start_api
+    until_ok 30 "n) poller refetched the schema-2 snapshot from the API" \
+      'dc logs --since 1m poller 2>/dev/null | tail -5 | grep -q "applied snapshot generation"'
+    until_ok ${PROPAGATE_TIMEOUT} "n) edge serves $HOST after schema-2 refetch" \
+      'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
+  else
+    fail "n) no on-disk snapshot found in poller volume"
+  fi
+else
+  fail "n) psql not available — skipping schema-1 test"
+fi
+
+# --- o) PROD_TIMING: origin change after 60s silence (leading-edge) ----------------
+# After the cooldown has fully elapsed (60s at production pacing), the first
+# origin change must apply at the next poll — not after another full cooldown.
+# This is the leading-edge guarantee the TestApplyCooldownLeadingEdge unit test pins.
+if [ "${PROD_TIMING:-0}" = "1" ]; then
+  section "o) PROD_TIMING: origin change after 60s silence (leading-edge)"
+  echo "     o) waiting 60s for the reload cooldown to elapse (no reloads)..."
+  sleep 60
+  # Origin is currently on 9001; switch to 9003.
+  T0=$SECONDS
+  OUT=$(cb -X PUT "$API/v1/domains/$DOM/origin" -H 'Content-Type: application/json' \
+    -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9003,\"tls_verify\":false}")
+  check "o) origin PUT (9001 -> 9003)" "$(codeof "$OUT")" "200"
+  until_ok 30 "o) new origin reached the edge" \
+    'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9003"'
+  LATENCY=$((SECONDS - T0))
+  echo "     o) origin change after 60s silence reached the edge in ${LATENCY}s (target: < 10s)"
+  if [ "$LATENCY" -le 10 ]; then
+    pass "o) latency ${LATENCY}s — leading-edge cooldown (applied at next poll)"
+  else
+    fail "o) latency ${LATENCY}s — expected < 10s for leading-edge behavior"
+  fi
+  # Restore origin to 9001 for any subsequent steps.
+  OUT=$(cb -X PUT "$API/v1/domains/$DOM/origin" -H 'Content-Type: application/json' \
+    -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}")
+  check "o) origin RESTORED (9003 -> 9001)" "$(codeof "$OUT")" "200"
+fi
 
 section "verdict"
 FINISHED=1
