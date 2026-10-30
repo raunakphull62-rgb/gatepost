@@ -25,6 +25,11 @@
 #
 # Secrets stay in deploy/dev/secrets/ (gitignored) and .env; nothing
 # secret is printed. Exits nonzero on any failure.
+#
+# PROD_TIMING=1 runs the acceptance suite at real production pacing
+# (60s reload cooldown, 5s poll, 60s backoff cap) instead of the fast
+# defaults (5s/1s/10s). The fast mode is for quick iteration; the
+# production mode proves the pacing knobs and the soak that follows.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -96,12 +101,32 @@ section() {
   echo; echo "== $(date +%H:%M:%S) $*"
 }
 
+# Pacing: fast mode (default) collapses production pacing (60s reload + 5s
+# poll + 60s backoff cap) to 5s/1s/10s so the acceptance run converges in
+# seconds. PROD_TIMING=1 keeps the real production defaults from
+# deploy/dev/compose.yaml — used by the live soak and the production-pace run.
+if [ "${PROD_TIMING:-0}" = "1" ]; then
+  POLL_INTERVAL=5 POLL_COOLDOWN=60 BACKOFF_CAP=60
+  PACE_LABEL="production pacing (poll ${POLL_INTERVAL}s + reload cooldown ${POLL_COOLDOWN}s + backoff cap ${BACKOFF_CAP}s)"
+else
+  POLL_INTERVAL=1 POLL_COOLDOWN=5 BACKOFF_CAP=10
+  PACE_LABEL="fast pacing (poll ${POLL_INTERVAL}s + reload cooldown ${POLL_COOLDOWN}s + backoff cap ${BACKOFF_CAP}s)"
+fi
+# Propagation waits must clear poll_interval + one cooldown in production.
+PROPAGATE_TIMEOUT=120; [ "${PROD_TIMING:-0}" = "1" ] && PROPAGATE_TIMEOUT=180
+
 # dc — every compose call: root for the docker socket, internal issuer so
 # the run mints certificates deterministically and never touches ACME.
-# GP_EDGE_RELOAD_COOLDOWN=5s and GP_EDGE_POLL_INTERVAL=1s collapse the
-# production pacing (60s reload + 5s poll + 60s backoff cap) so the
-# acceptance run converges in seconds, not minutes.
-dc() { sudo env GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$API" GP_EDGE_RELOAD_COOLDOWN=5s GP_EDGE_POLL_INTERVAL=1s GP_EDGE_BACKOFF_CAP=10s docker compose -f "$COMPOSE" --profile poller "$@"; }
+# In fast mode (default) the env overrides below collapse the production
+# pacing so the acceptance run converges in seconds. PROD_TIMING=1 leaves
+# the compose.yaml defaults (60s/5s/60s) intact.
+dc() {
+  local env_args=(GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$API")
+  if [ "${PROD_TIMING:-0}" != "1" ]; then
+    env_args+=("GP_EDGE_RELOAD_COOLDOWN=${POLL_COOLDOWN}s" "GP_EDGE_POLL_INTERVAL=${POLL_INTERVAL}s" "GP_EDGE_BACKOFF_CAP=${BACKOFF_CAP}s")
+  fi
+  sudo env "${env_args[@]}" docker compose -f "$COMPOSE" --profile poller "$@"
+}
 
 # until_ok <timeout-s> <what> <shell-condition>: evaluated in THIS shell
 # (dc is a function) until it succeeds; a FAIL line on timeout.
@@ -145,6 +170,7 @@ start_api() {
 
 # --- 0. preflight: binary, ports, the API address is ours ------------------
 section "setup"
+echo "  pacing: $PACE_LABEL"
 touch "$SUPERVISE_OFF"   # supervisor out of the run (restored by the trap)
 go build -o gatepost ./cmd/gatepost || exit 2
 
@@ -338,7 +364,7 @@ check "b) unknown host over https = 421 (fallback cert, no ask answer)" "$C" "42
 # --- c) tampered snapshot rejected, last-good keeps serving ---------------
 section "c) tampered snapshot rejected; the last-good config keeps serving"
 start_api
-until_ok 120 "the poller refetches a good config after the no-snapshot boot" \
+until_ok ${PROPAGATE_TIMEOUT} "the poller refetches a good config after the no-snapshot boot" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
 dc exec poller sh -c "sed -i 's/9001/9003/' /state/snapshot.json"
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")
@@ -360,9 +386,9 @@ T0=$SECONDS
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/origin" -H 'Content-Type: application/json' \
   -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9002,\"tls_verify\":false}")
 check "origin replaced via PUT (port 9001 -> 9002)" "$(codeof "$OUT")" "200"
-until_ok 120 "the new origin reaches the edge" \
+until_ok ${PROPAGATE_TIMEOUT} "the new origin reaches the edge" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9002"'
-echo "     origin change reached the edge in $((SECONDS - T0))s (poll interval 5s + reload cooldown 60s)"
+echo "     origin change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
 check "d) the edge now serves the new origin" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9002')" "1"
 
@@ -496,9 +522,9 @@ T0=$SECONDS
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/origin" -H 'Content-Type: application/json' \
   -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}")
 check "origin PUT after the API restart (recovery probe)" "$(codeof "$OUT")" "200"
-until_ok 120 "the edge recovers: the change propagates again" \
+until_ok ${PROPAGATE_TIMEOUT} "the edge recovers: the change propagates again" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
-echo "     recovery: the post-restart change reached the edge in $((SECONDS - T0))s"
+echo "     recovery: the post-restart change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
 OUT=$(cb -X POST "$API/v1/nodes/$NID/revoke")
 check "node revoked (idempotent route)" "$(codeof "$OUT")" "200"
 sleep 8  # a few poll ticks against the 30s log-throttle gap
