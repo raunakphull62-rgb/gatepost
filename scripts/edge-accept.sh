@@ -865,6 +865,12 @@ print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
       "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRuleEngine DetectionOnly')" "1"
     # Restart API + poller to get back to a clean state.
     start_api
+    # Force the API to rebuild a fresh snapshot (invalidating its cache) so the
+    # generation is strictly newer than the schema-1 generation the poller just
+    # applied. Without this the API serves the same content hash → same gen, and
+    # the poller skips it ("generation N not strictly newer than applied N+1").
+    cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' \
+      -d '{"mode":"detection","excluded_rule_ids":[]}' >/dev/null 2>&1
     N_START2=$(date -u +%Y-%m-%dT%H:%M:%S)
     until_ok ${PROPAGATE_TIMEOUT} "n) poller refetched the schema-2 snapshot from the API" \
       'dc logs --since "$N_START2" poller 2>/dev/null | grep -q "applied snapshot generation"'
