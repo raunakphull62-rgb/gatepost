@@ -49,8 +49,12 @@ print_verdict() {
   local code=$?
   echo
   echo "== verdict"
-  local status="ABORTED"
-  if [ $code -eq 0 ] && [ "${FINISHED:-0}" = "1" ]; then status="PASSED"; fi
+  local status
+  if [ "${FINISHED:-0}" = "1" ]; then
+    [ "$FAIL" -eq 0 ] && status="PASSED" || status="FAILED ($FAIL check(s) failed)"
+  else
+    status="ABORTED"
+  fi
   echo "=== edge acceptance: $PASS passed, $FAIL failed, exit=$code, last_section=$LAST_SECTION, status=$status ==="
 }
 trap 'print_verdict; kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
@@ -147,6 +151,9 @@ go build -o gatepost ./cmd/gatepost || exit 2
 # Tear down any leftover stack FIRST — dc down removes the docker networks
 # (and their 192.88.99.0/24 route), so the preflight check below passes.
 dc down >/dev/null 2>&1
+# Docker leaves the bridge interface in "linkdown" for a moment after
+# network removal — give it a beat so the route check below doesn't race.
+sleep 1
 for v in caddy_data caddy_config poller_state; do sudo docker volume rm "gatepost-edge-dev_$v" >/dev/null 2>&1; done
 
 # Kill any leftover process on the API port (port 8090, not 8080 — docker's
