@@ -37,11 +37,24 @@ ORIGIN_IP=192.88.99.10
 STUB_PY="$(mktemp)"; STUB_TOK="$(mktemp)"; STUB_A="$(mktemp)"
 JAR="$(mktemp)"
 API_PID=""; STUB_PID=""
+LAST_SECTION="bootstrap"
 # The compose supervisor (scripts/edge-supervise.sh) must stay out of the
 # run: it reconciles the stack every ~15s and would fight the teardown and
 # fresh-volume setup below. Off for the run, restored by the EXIT trap.
 SUPERVISE_OFF=deploy/dev/.supervise-off
-trap 'kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
+
+# EXIT trap: ALWAYS print a verdict line, even on abort or signal. An aborted
+# run must never look like a pass — the ABORTED flag makes that explicit.
+print_verdict() {
+  local code=$?
+  echo
+  echo "== verdict"
+  local status="ABORTED"
+  if [ $code -eq 0 ] && [ "${FINISHED:-0}" = "1" ]; then status="PASSED"; fi
+  echo "=== edge acceptance: $PASS passed, $FAIL failed, exit=$code, last_section=$LAST_SECTION, status=$status ==="
+}
+trap 'print_verdict; kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
+trap 'echo "=== edge acceptance: interrupted (SIGINT/SIGTERM); exiting ===" >&2; exit 130' INT TERM
 
 [ -f .env ] || { echo "no .env at repo root (create it yourself; never paste it here)" >&2; exit 2; }
 mkdir -p outbox "$SECRETS" && chmod 755 "$SECRETS"
@@ -53,19 +66,38 @@ STRANGER="accept-x-$TS.example.test"  # never claimed at all
 NTOK=""; NID=""; DOM=""
 
 PASS=0 FAIL=0
-pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
-fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL+1)); }
+declare -A SECTION_TIMINGS
+CUR_SECTION=""
+SECTION_START=$SECONDS
+FINISHED=0
+pass() { echo "$(date +%H:%M:%S) PASS: $*"; PASS=$((PASS+1)); }
+fail() { echo "$(date +%H:%M:%S) FAIL: $*" >&2; FAIL=$((FAIL+1)); }
 check() { # check <desc> <actual> <want>
-  if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (want '$3', got '$2')"; fi
+  ts=$(date +%H:%M:%S)
+  if [ "$2" = "$3" ]; then echo "$ts PASS: $1"; PASS=$((PASS+1)); else echo "$ts FAIL: $1 (want '$3', got '$2')" >&2; FAIL=$((FAIL+1)); fi
 }
 check_ne() { # check_ne <desc> <actual> <not-want>
-  if [ "$2" != "$3" ]; then pass "$1"; else fail "$1 (got the unwanted '$3')"; fi
+  ts=$(date +%H:%M:%S)
+  if [ "$2" != "$3" ]; then echo "$ts PASS: $1"; PASS=$((PASS+1)); else echo "$ts FAIL: $1 (got the unwanted '$3')" >&2; FAIL=$((FAIL+1)); fi
 }
-section() { echo; echo "== $*"; }
+# section(): start a new labeled section. Automatically records the elapsed
+# time of the PREVIOUS section so the verdict summary needs no manual calls.
+section() {
+  if [ -n "${CUR_SECTION:-}" ]; then
+    SECTION_TIMINGS[$CUR_SECTION]=$((SECONDS - SECTION_START))
+  fi
+  CUR_SECTION="$1"
+  SECTION_START=$SECONDS
+  LAST_SECTION="$1"
+  echo; echo "== $(date +%H:%M:%S) $*"
+}
 
 # dc — every compose call: root for the docker socket, internal issuer so
 # the run mints certificates deterministically and never touches ACME.
-dc() { sudo env GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$API" docker compose -f "$COMPOSE" --profile poller "$@"; }
+# GP_EDGE_RELOAD_COOLDOWN=5s and GP_EDGE_POLL_INTERVAL=1s collapse the
+# production pacing (60s reload + 5s poll + 60s backoff cap) so the
+# acceptance run converges in seconds, not minutes.
+dc() { sudo env GP_EDGE_ISSUER=internal GP_EDGE_API_BASE="$API" GP_EDGE_RELOAD_COOLDOWN=5s GP_EDGE_POLL_INTERVAL=1s GP_EDGE_BACKOFF_CAP=10s docker compose -f "$COMPOSE" --profile poller "$@"; }
 
 # until_ok <timeout-s> <what> <shell-condition>: evaluated in THIS shell
 # (dc is a function) until it succeeds; a FAIL line on timeout.
@@ -546,5 +578,10 @@ check "k) audit log mode is 0644 (no shared-volume 0666)" \
   "$(dc exec edge sh -c 'stat -c %a /data/logs/waf_audit.log 2>/dev/null || echo missing')" "644"
 
 section "verdict"
+FINISHED=1
+echo "--- section timing ---"
+for s in $(echo "${!SECTION_TIMINGS[@]}" | tr ' ' '\n' | sort); do
+  printf '  %-50s %3ds\n' "$s" "${SECTION_TIMINGS[$s]}"
+done
 echo "=== edge acceptance: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

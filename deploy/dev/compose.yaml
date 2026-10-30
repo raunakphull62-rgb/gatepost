@@ -104,6 +104,12 @@ services:
       GP_EDGE_WAF_AUDIT_LOG: ${GP_EDGE_WAF_AUDIT_LOG:-/data/logs/waf_audit.log}
       GP_EDGE_WAF_BODY_LIMIT_MB: ${GP_EDGE_WAF_BODY_LIMIT_MB:-10}
       GP_EDGE_WAF_PARANOIA: ${GP_EDGE_WAF_PARANOIA:-1}
+      # Poller knobs. GP_EDGE_POLL_INTERVAL defaults to 5s; the
+      # reload cooldown defaults to 60s (production pacing) — the
+      # acceptance script overrides it to 5s via this env var.
+      GP_EDGE_RELOAD_COOLDOWN: ${GP_EDGE_RELOAD_COOLDOWN:-60s}
+      GP_EDGE_POLL_INTERVAL: ${GP_EDGE_POLL_INTERVAL:-5s}
+      GP_EDGE_BACKOFF_CAP: ${GP_EDGE_BACKOFF_CAP:-60s}
     volumes:
       - ${GP_EDGE_SECRETS_DIR:-./secrets}:/run/secrets:ro
       - poller_state:/state
