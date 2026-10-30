@@ -2,6 +2,9 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -87,5 +90,49 @@ func TestSnapshotDomainWAF(t *testing.T) {
 		if got := snapshotDomainWAF(d); got != tc.want {
 			t.Errorf("mode %q: got %q, want %q", tc.mode, got, tc.want)
 		}
+	}
+}
+
+// TestPutWAFNilExclusions — a PUT body without excluded_rule_ids decodes to
+// a nil slice; the handler must coerce it to an empty array before the NOT NULL
+// column, otherwise the UPDATE fails with 500.
+func TestPutWAFNilExclusions(t *testing.T) {
+	pool := testPool(t)
+	c, _ := newTestServer(t, pool)
+	signupOn(t, pool, c, "waf-nil@x.test")
+	dom := claimRow(t, c, "waf-nil.example.com")
+
+	// mode only, no excluded_rule_ids in the body → nil slice
+	code, body := c.do("PUT", "/v1/domains/"+dom.ID+"/waf", `{"mode":"blocking"}`)
+	if code != http.StatusOK {
+		t.Fatalf("WAF PUT (nil exclusions): want 200, got %d: %s", code, body)
+	}
+	// the stored value must be an empty array, not NULL
+	var resp struct {
+		Domain domainRow `json:"domain"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("response json: %v: %s", err, body)
+	}
+	if resp.Domain.ExcludedRuleIDs == nil || len(resp.Domain.ExcludedRuleIDs) != 0 {
+		t.Fatalf("excluded_rule_ids should be empty, got %v", resp.Domain.ExcludedRuleIDs)
+	}
+	if resp.Domain.WAFMode != "blocking" {
+		t.Fatalf("waf_mode should be blocking, got %q", resp.Domain.WAFMode)
+	}
+
+	// verify via direct DB read too
+	var wafMode string
+	var ids []int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT waf_mode, excluded_rule_ids FROM domains WHERE id::text = $1`, dom.ID).
+		Scan(&wafMode, &ids); err != nil {
+		t.Fatal(err)
+	}
+	if wafMode != "blocking" {
+		t.Errorf("DB waf_mode = %q, want blocking", wafMode)
+	}
+	if ids == nil || len(ids) != 0 {
+		t.Errorf("DB excluded_rule_ids = %v, want empty", ids)
 	}
 }

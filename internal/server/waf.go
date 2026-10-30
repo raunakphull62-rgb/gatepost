@@ -58,6 +58,10 @@ func (s *Server) putDomainWAF(w http.ResponseWriter, r *http.Request, p *Princip
 	if mode == "" {
 		mode = "detection"
 	}
+	// nil slice → NULL → NOT NULL column violation; coerce to empty.
+	if b.ExcludedRuleIDs == nil {
+		b.ExcludedRuleIDs = []int{}
+	}
 	oldMode := d.WAFMode
 	if oldMode == "" {
 		oldMode = "detection"
@@ -68,10 +72,10 @@ func (s *Server) putDomainWAF(w http.ResponseWriter, r *http.Request, p *Princip
 	}
 	var _id string
 	if err := s.pool.QueryRow(r.Context(), `UPDATE domains SET
-		waf_mode = $2, excluded_rule_ids = $3
-		WHERE id::text = $4 AND owner_user_id = $5
+		waf_mode = $1, excluded_rule_ids = $2
+		WHERE id::text = $3 AND owner_user_id = $4
 		RETURNING id::text`,
-		d.ID, mode, b.ExcludedRuleIDs, d.ID, p.UserID).Scan(&_id); err != nil {
+		mode, b.ExcludedRuleIDs, d.ID, p.UserID).Scan(&_id); err != nil {
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
