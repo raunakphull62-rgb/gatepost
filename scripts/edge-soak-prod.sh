@@ -5,8 +5,11 @@
 #   - zero non-200 responses from the edge during the window
 #   - no "apply loop silent" and no health errors in the poller log
 #
+# SOAK_NEGATIVE=1: negative control — stops the edge for ~3s mid-soak,
+# then asserts that non-200 responses WERE counted (verdict must FAIL).
+#
 # Run:  scripts/edge-soak-prod.sh 2>&1 | tee /tmp/edge-soak-prod.log
-# Takes ~6 minutes (5 min soak + setup/teardown).
+# Takes ~6 minutes (5 min soak + setup/teardown), or ~2 min for negative.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -240,9 +243,19 @@ API_PID=""
 
 # === 5-minute soak with the API down ===
 SOAK_END=$(( $(date +%s) + 300 ))
+NEGATIVE_HIT=0
 while [ "$(date +%s)" -lt "$SOAK_END" ]; do
   REMAIN=$(( (SOAK_END - $(date +%s)) / 60 ))
   echo "[soak] API down soak: ${REMAIN}m remaining ($(date +%H:%M:%S))"
+  # Negative control: stop the edge for ~3s mid-soak (only in SOAK_NEGATIVE mode).
+  if [ "${SOAK_NEGATIVE:-0}" = "1" ] && [ "$NEGATIVE_HIT" -eq 0 ] && [ "$REMAIN" -eq 2 ]; then
+    echo "[soak] NEGATIVE CONTROL: stopping the edge for 3s at $(date +%H:%M:%S)"
+    sudo docker compose -f "$COMPOSE" stop edge >/dev/null 2>&1
+    sleep 3
+    sudo docker compose -f "$COMPOSE" start edge >/dev/null 2>&1
+    echo "[soak] edge restarted at $(date +%H:%M:%S)"
+    NEGATIVE_HIT=1
+  fi
   sleep 60
 done
 echo "[soak] 5-minute soak complete at $(date +%H:%M:%S)"
@@ -302,8 +315,15 @@ kill "$TRAFFIC_PID" 2>/dev/null
 wait "$TRAFFIC_PID" 2>/dev/null
 
 echo
-SOAK_VERDICT=$([ "$EDGE_BEFORE_RC" = "$EDGE_AFTER_RC" ] && [ "$POLLER_BEFORE_RC" = "$POLLER_AFTER_RC" ] && [ "$NON200" -eq 0 ] && [ "$SILENT" -eq 0 ] && [ "$HEALTH_ERR" -eq 0 ] && echo PASSED || echo FAILED)
-echo "=== soak verdict: $SOAK_VERDICT ==="
+if [ "${SOAK_NEGATIVE:-0}" = "1" ]; then
+  # Negative control: non-200 MUST be > 0 (the edge was stopped).
+  SOAK_VERDICT=$([ "$EDGE_BEFORE_RC" = "$EDGE_AFTER_RC" ] && [ "$POLLER_BEFORE_RC" = "$POLLER_AFTER_RC" ] && [ "$NON200" -gt 0 ] && [ "$SILENT" -eq 0 ] && [ "$HEALTH_ERR" -eq 0 ] && echo PASSED || echo FAILED)
+  echo "=== soak verdict: $SOAK_VERDICT ==="
+  echo "=== (negative control: expected non-200 responses from the 3s edge stop ==="
+else
+  SOAK_VERDICT=$([ "$EDGE_BEFORE_RC" = "$EDGE_AFTER_RC" ] && [ "$POLLER_BEFORE_RC" = "$POLLER_AFTER_RC" ] && [ "$NON200" -eq 0 ] && [ "$SILENT" -eq 0 ] && [ "$HEALTH_ERR" -eq 0 ] && echo PASSED || echo FAILED)
+  echo "=== soak verdict: $SOAK_VERDICT ==="
+fi
 
 # Tear down.
 sudo docker compose -f "$COMPOSE" --profile poller down >/dev/null 2>&1
