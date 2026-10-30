@@ -752,7 +752,7 @@ WITH uid AS (SELECT id FROM users WHERE email = '$U' LIMIT 1),
      d AS (
        INSERT INTO domains (owner_user_id, hostname, status, verify_token, setup_type, verified_at, waf_mode, excluded_rule_ids)
        SELECT uid.id, 'rss-' || gs::text || '-$TS.example.test', 'verified', 'tok-' || gs::text || '-$TS',
-              'http', now(), 'detection', '{}'::int[]
+              'cname', now(), 'detection', '{}'::int[]
        FROM uid, generate_series(1, 8) gs
        RETURNING id
      )
@@ -772,7 +772,7 @@ WITH uid AS (SELECT id FROM users WHERE email = '$U' LIMIT 1),
      d AS (
        INSERT INTO domains (owner_user_id, hostname, status, verify_token, setup_type, verified_at, waf_mode, excluded_rule_ids)
        SELECT uid.id, 'rss100-' || gs::text || '-$TS.example.test', 'verified', 'tok100-' || gs::text || '-$TS',
-              'http', now(), 'detection', '{}'::int[]
+              'cname', now(), 'detection', '{}'::int[]
        FROM uid, generate_series(1, 90) gs
        RETURNING id
      )
