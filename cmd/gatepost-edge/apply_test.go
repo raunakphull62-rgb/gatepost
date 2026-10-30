@@ -401,6 +401,68 @@ func TestApplyAdminNotUpRetriesFast(t *testing.T) {
 	}
 }
 
+// Leading-edge cooldown: a first content change that arrives AFTER a quiet
+// period (cooldown has elapsed since the last /load) must apply at the next
+// poll — NOT wait another full cooldown. Only bursts (changes arriving inside
+// the cooldown window) coalesce. The user-observable guarantee: a change after
+// silence reaches the edge in ~one poll interval, not ~one cooldown.
+func TestApplyCooldownLeadingEdge(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-leading"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(newAdminDoc(1, "a.test"))
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "a.test"))
+
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 100 * time.Millisecond
+	// Poll on a short interval so "next poll" is sub-second.
+	cfg.Interval = 10 * time.Millisecond
+	startPollerRaw(t, cfg)
+
+	until(t, 5*time.Second, "boot /load", func() bool { return al.count() == 1 })
+
+	// Wait well past the cooldown — this is the "quiet period".
+	time.Sleep(250 * time.Millisecond)
+
+	// Publish a new document and measure the latency to the SECOND /load.
+	fake.publishDoc(newAdminDoc(2, "a.test", "b.test"))
+	t0 := time.Now()
+	until(t, 3*time.Second, "second /load (first change after quiet period)", func() bool {
+		return al.count() == 2
+	})
+	elapsed := time.Since(t0)
+
+	// Leading-edge: the change applies at the next poll (~10ms), not after
+	// waiting another 100ms cooldown. Allow a generous margin.
+	if elapsed > 90*time.Millisecond {
+		t.Fatalf("first change after quiet period took %v — want ~one poll interval (~10ms), not a full cooldown (%v)",
+			elapsed, cfg.ReloadCooldown)
+	}
+	t.Logf("leading-edge latency: %v (poll interval %v, cooldown %v)", elapsed, cfg.Interval, cfg.ReloadCooldown)
+
+	// Contrast: a change INSIDE the cooldown window must coalesce (wait).
+	fake.publishDoc(newAdminDoc(3, "a.test", "c.test"))
+	t1 := time.Now()
+	until(t, 3*time.Second, "third /load (burst, post-cooldown)", func() bool {
+		return al.count() == 3
+	})
+	burstElapsed := time.Since(t1)
+	// 3rd load was right after the 2nd (which reset lastLoad), so it should
+	// take roughly one cooldown to land — much longer than the quiet-period case.
+	if burstElapsed < 80*time.Millisecond {
+		t.Fatalf("burst change applied in %v — expected coalescing (wait ≈ %v)", burstElapsed, cfg.ReloadCooldown)
+	}
+}
+
 // A→B→A plus B, all inside one cooldown: arrivals collapse into the newest
 // pending document; content whose fingerprint equals the RUNNING config
 // never reconciles — burst does not touch caddy a second time.
