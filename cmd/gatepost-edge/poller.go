@@ -482,10 +482,23 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 // Staleness limits before /health reports the poller stalled. The apply
 // loop wakes at least every adminProbeEvery (5s); the poll loop's backoff
 // is capped at BackoffCap (60s), so 90s allows one full backoff cycle.
-const (
+// applyStallLimit is a var (not const) so tests can shrink it and the
+// derived healthTickInterval to keep soak tests sub-second.
+var (
 	applyStallLimit = 30 * time.Second
 	pollStallLimit  = 90 * time.Second
 )
+
+// healthTickInterval is how often applyTick is refreshed during long waits
+// (cooldown + retry). Set to applyStallLimit/6 so the health check never
+// false-positives on a deliberate pause — 5s in production.
+func healthTickInterval() time.Duration {
+	d := applyStallLimit / 6
+	if d < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	return d
+}
 
 // serveHealth is the liveness endpoint the compose healthcheck polls. A
 // frozen (SIGSTOP'd) or deadlocked poller stops answering or answers 500,

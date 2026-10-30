@@ -203,6 +203,7 @@ func (p *Poller) adminTouch(ok bool) error {
 // caddy comes up. Transport errors that outlive AdminGrace are fatal:
 // (false, errAdminGone), delivered to Run via adminFail.
 func (p *Poller) stepApply(ctx context.Context) (bool, error) {
+	p.applyTick.Store(p.cfg.Now().UnixNano()) // liveness: /health checks this — refresh even while waiting on cooldown
 	p.mu.Lock()
 	pend, hash := p.pending, p.pendingHash
 	applied, last := p.appliedHash, p.lastLoad
@@ -214,10 +215,19 @@ func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 		return false, nil // already running this content (dropped while we waited)
 	}
 	if wait := p.cfg.ReloadCooldown - time.Since(last); wait > 0 {
+		// Keep applyTick fresh while we wait for the cooldown so /health
+		// does not false-positive on a normal cooldown wait (the loop is
+		// healthy, not stalled, when it is deliberately pacing reloads).
+		ticker := time.NewTicker(healthTickInterval())
 		select {
 		case <-ctx.Done():
+			ticker.Stop()
 			return false, nil
+		case <-ticker.C:
+			p.applyTick.Store(p.cfg.Now().UnixNano())
+			return true, nil // re-check: the pending set may have changed
 		case <-time.After(wait):
+			ticker.Stop()
 			return true, nil // re-check: the pending set may have changed while we waited
 		}
 	}
@@ -253,12 +263,23 @@ func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 	if strings.HasPrefix(err.Error(), "caddy /load:") {
 		retryAfter = p.cfg.ReloadCooldown
 	}
-	select {
-	case <-ctx.Done():
-		return false, nil
-	case <-time.After(retryAfter):
+	// Refresh applyTick during the retry wait so /health does not flag a
+	// cooldown-paced retry as a stalled loop. A 60s retry would otherwise
+	// cross the 30s applyStallLimit twice over.
+	ticker := time.NewTicker(healthTickInterval())
+	defer ticker.Stop()
+	deadline := time.NewTimer(retryAfter)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, nil
+		case <-ticker.C:
+			p.applyTick.Store(p.cfg.Now().UnixNano())
+		case <-deadline.C:
+			return true, nil
+		}
 	}
-	return true, nil
 }
 
 // applyCaddy: swap forwarder ports FIRST, generate, POST /load.

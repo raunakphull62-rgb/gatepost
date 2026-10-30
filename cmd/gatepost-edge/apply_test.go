@@ -725,3 +725,115 @@ func TestServeHealthReportsStalls(t *testing.T) {
 		t.Fatalf("egress recovered: /health = %d %q, want 200", r.Code, r.Body.String())
 	}
 }
+
+// Soak test for issue B: with the API unreachable and caddy rejecting configs,
+// the apply loop stays inside a cooldown wait or a retry wait that EXCEEDS
+// applyStallLimit (30s in production, 200ms here). Before the fix, those waits
+// blocked for up to ReloadCooldown (60s) without touching applyTick, so /health
+// logged "apply loop silent for 30s" and flipped to 503 — four times at boot
+// when the API was down. The healthTickInterval ticker now refreshes applyTick
+// every 5s (100ms here), so /health stays 200 with zero health errors.
+//
+// Live equivalent: a 5-minute soak with GP_EDGE_RELOAD_COOLDOWN=60s and the API
+// stopped should show RestartCount and StartedAt unchanged, zero non-200 /health
+// responses, and no "apply loop silent" lines. This test proves the mechanism
+// at 200ms scale.
+func TestHealthSoakAPIUnreachableRetryWindow(t *testing.T) {
+	// Shrink stall + tick to sub-second; production derives 5s ticks from
+	// the 30s stall limit (applyStallLimit/6).
+	oldStall := applyStallLimit
+	applyStallLimit = 200 * time.Millisecond
+	t.Cleanup(func() { applyStallLimit = oldStall })
+
+	key := makeKey(t)
+	token := "node-token-soak-retry"
+	fake := newFakeAPI(t, key, token) // no docs published: polls 503 → backoff
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	al.rejectNext(http.StatusBadRequest) // first /load rejected → retry = ReloadCooldown (300ms)
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "soak.example.com"))
+
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 300 * time.Millisecond // > 200ms stall limit: retry window crosses the old threshold
+	ask := startPoller(t, cfg)
+
+	// Boot apply happens, then the retry window opens (caddy rejected 400).
+	until(t, 3*time.Second, "first /load (rejected)", func() bool { return al.count() == 1 })
+	until(t, 3*time.Second, "loud failure logged", func() bool {
+		return hook.count("caddy apply FAILED — keeping the last-good config") >= 1
+	})
+
+	// We are now inside the 300ms retry wait. At 250ms we are past the
+	// 200ms stall limit — without the tick fix /health would flip to 503.
+	time.Sleep(250 * time.Millisecond)
+
+	// /health must stay 200 during the retry window, even though the
+	// apply loop is blocked in the retry wait.
+	if code := askGet(t, ask, "/health"); code != http.StatusOK {
+		t.Fatalf("health during retry wait = %d, want 200", code)
+	}
+	// Steady traffic: the ask gate still serves the in-memory snapshot.
+	if code := askGet(t, ask, "/check?domain=soak.example.com"); code != http.StatusOK {
+		t.Fatalf("ask during retry wait = %d, want 200", code)
+	}
+	// No health false-positive.
+	if n := hook.count("apply loop silent"); n != 0 {
+		t.Fatalf("health error logged during retry: %d line(s)\n%s", n, hook.all())
+	}
+
+	// The retry eventually succeeds (rejectNext is one-shot; next is 200).
+	until(t, 3*time.Second, "retry /load accepted", func() bool { return al.count() == 2 })
+}
+
+// Same soak, but through the COOLDOWN path (not the retry path): a second
+// content change enters stepApply's 300ms cooldown wait. /health must stay
+// green the entire time.
+func TestHealthSoakCooldownWindow(t *testing.T) {
+	oldStall := applyStallLimit
+	applyStallLimit = 200 * time.Millisecond
+	t.Cleanup(func() { applyStallLimit = oldStall })
+
+	key := makeKey(t)
+	token := "node-token-soak-cooldown"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(newAdminDoc(1, "cooldown.example.com"))
+	base := fake.serve().URL
+
+	al := &adminLoad{}
+	adminSrv := al.serve()
+	t.Cleanup(adminSrv.Close)
+
+	hook := &logHook{}
+	dir := t.TempDir()
+	seedArtifact(t, dir, key, newAdminDoc(1, "cooldown.example.com"))
+
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg = withAdmin(t, cfg, adminSrv)
+	cfg.ReloadCooldown = 300 * time.Millisecond
+	ask := startPoller(t, cfg)
+
+	// Boot loads successfully; lastLoad is now set so the next change
+	// enters the 300ms cooldown wait (no rejection).
+	until(t, 3*time.Second, "boot /load", func() bool { return al.count() == 1 })
+
+	// Queue new content → enters cooldown wait.
+	fake.publishDoc(newAdminDoc(2, "cooldown.example.com", "extra.example.com"))
+	time.Sleep(250 * time.Millisecond) // deep in the cooldown wait, past stall limit
+
+	if code := askGet(t, ask, "/health"); code != http.StatusOK {
+		t.Fatalf("health during cooldown = %d, want 200", code)
+	}
+	if n := hook.count("apply loop silent"); n != 0 {
+		t.Fatalf("health error logged during cooldown: %d line(s)\n%s", n, hook.all())
+	}
+
+	// After cooldown, the second /load lands.
+	until(t, 3*time.Second, "post-cooldown /load", func() bool { return al.count() == 2 })
+}
