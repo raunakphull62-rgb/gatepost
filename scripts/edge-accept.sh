@@ -560,9 +560,11 @@ until_ok ${PROPAGATE_TIMEOUT} "the edge recovers: the change propagates again" \
 echo "     recovery: the post-restart change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
 OUT=$(cb -X POST "$API/v1/nodes/$NID/revoke")
 check "node revoked (idempotent route)" "$(codeof "$OUT")" "200"
-sleep 8  # a few poll ticks against the 30s log-throttle gap
+sleep 15  # wait for the poller to poll with the revoked token (backoff
+          # streak from the API-downtime phase may delay the first 401), past
+          # the first poll tick so logThrottled emits the "401" brand
 check "i) the poller logged the 401 (once, loudly)" \
-  "$(dc logs --since 1m poller 2>/dev/null | grep -c '401 from API')" "1"
+  "$(dc logs --since 2m poller 2>/dev/null | grep -c '401 from API')" "1"
 check "i) the revoked node keeps serving the last-good config" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
