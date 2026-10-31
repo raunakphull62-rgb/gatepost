@@ -1,29 +1,14 @@
-== 15:22:56 a) cold start with the API down and a saved snapshot
-== 15:23:14 b) cold start with NO snapshot: 421 for every host
-== 15:23:30 c) tampered snapshot rejected; the last-good config keeps serving
-== 15:24:32 d) an API origin change reaches the edge (timed)
-== 15:25:32 e) spoofed X-Forwarded-For is replaced with the real client IP
-== 15:25:32 f) private and metadata origins are refused, never reached
-== 15:25:32 f2) an origin hostname that later resolves to a metadata address is refused at dial time
-== 15:26:46 g) unknown host: 421 and no certificate attempt
-== 15:26:46 h) allowed host gets a certificate (internal issuer); denied host does not
-== 15:26:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
-== 15:27:37 j) the whole run's access log: no secrets, no query strings
-== 15:27:37 k) B3c WAF audit redaction (detection-only, in-process, no values)
-== 15:27:40 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
-== 15:30:40 m) edge RSS with 1/10/100 served hosts
-== 15:32:38 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
-15:32:41 PASS: n) old-style node boot-applied the crafted last-good
-15:32:41 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
-15:32:41 PASS: n) old-style edge keeps serving accept-a-1793460147-23856.example.test (last-good held)
-15:32:42 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
-15:32:43 PASS: n) real poller cold-started from the API schema-2 snapshot
-15:32:43 PASS: n) schema-2 WAF directives restored on the edge
-15:32:47 PASS: n) poller applied the schema-1 snapshot
-15:32:50 PASS: n) edge serves accept-a-1793460147-23856.example.test from origin-test (schema-1 backward compat)
-15:32:50 PASS: n) edge serves accept-wb-1793460147-23856.example.test from origin-test (schema-1 backward compat)
-15:32:50 PASS: n) directives default to DetectionOnly for schema-1 domains
-15:32:52 PASS: n) poller refetched the schema-2 snapshot from the API
-15:32:54 PASS: n) schema-2 config applied to edge
+== 16:37:17 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
+16:37:20 PASS: n) old-style node boot-applied the crafted last-good
+16:37:20 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
+16:37:20 PASS: n) old-style edge keeps serving accept-a-1793464024-26600.example.test (last-good held)
+16:37:20 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
+16:37:22 PASS: n) real poller cold-started from the API schema-2 snapshot
+16:37:22 PASS: n) schema-2 WAF directives restored on the edge
+16:37:26 PASS: n) poller applied the schema-1 snapshot
+16:37:29 PASS: n) edge serves accept-a-1793464024-26600.example.test from origin-test (schema-1 backward compat)
+16:37:29 PASS: n) edge serves accept-wb-1793464024-26600.example.test from origin-test (schema-1 backward compat)
+16:37:29 PASS: n) directives default to DetectionOnly for schema-1 domains
+16:37:31 PASS: n) poller refetched the schema-2 snapshot from the API
+16:37:31 PASS: n) schema-2 config applied to edge
 
-== 15:32:54 o) PROD_TIMING: origin change after 60s silence (leading-edge)

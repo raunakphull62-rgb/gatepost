@@ -1,42 +1,42 @@
 === edge live soak: production pacing, API down 5 min ===
-DELETE 101
-DELETE 102
-DELETE 2
+DELETE 1
+DELETE 1
+DELETE 1
 [soak] stale test data cleaned from database
 [soak] DNS stub up on :5344
-[soak] API up at 15:34:46
+[soak] API up at 16:46:41
 [soak] edge + origin-test up (production pacing: 60s cooldown, 5s poll, 60s backoff)
 [soak] signup: HTTP 200
 [soak] verify: HTTP 200
 [soak] node minted
-[soak] domain claimed: soak-1793460885.example.test
+[soak] domain claimed: soak-1793465200.example.test
 [soak] domain verify: HTTP 200
-[soak] origin set: http://192.88.99.10:9001 at 15:34:49
-[soak] poller up at 15:35:10
-[soak] snapshot applied at 15:35:10
-[soak] edge serves origin-test at 15:35:11
+[soak] origin set: http://192.88.99.10:9001 at 16:46:45
+[soak] poller up at 16:47:04
+[soak] snapshot applied at 16:47:04
+[soak] edge serves origin-test at 16:47:05
 
 [soak] docker inspect BEFORE:
-  edge:    0 2026-10-31T15:34:47.521643288Z
-  poller:  0 2026-10-31T15:35:10.603765138Z
-[soak] traffic generator started (PID 939739) at 15:35:11
-[soak] stopping the API for 5 minutes at 15:35:16
-[soak] API down soak: 5m remaining (15:35:16)
-[soak] API down soak: 3m remaining (15:36:17)
-[soak] API down soak: 2m remaining (15:37:17)
-[soak] API down soak: 1m remaining (15:38:17)
-[soak] API down soak: 0m remaining (15:39:17)
-[soak] 5-minute soak complete at 15:40:17
+  edge:    0 2026-10-31T16:46:42.894520533Z
+  poller:  0 2026-10-31T16:47:04.713071936Z
+[soak] traffic generator started (PID 1054291) at 16:47:06
+[soak] stopping the API for 5 minutes at 16:47:11
+[soak] API down soak: 5m remaining (16:47:11)
+[soak] API down soak: 4m remaining (16:48:11)
+[soak] API down soak: 3m remaining (16:49:11)
+[soak] API down soak: 2m remaining (16:50:11)
+[soak] API down soak: 1m remaining (16:51:11)
+[soak] 5-minute soak complete at 16:52:11
 
 === EVIDENCE ===
 
 --- docker inspect AFTER (RestartCount StartedAt): ---
-  edge:    0 2026-10-31T15:34:47.521643288Z
-  poller:  0 2026-10-31T15:35:10.603765138Z
+  edge:    0 2026-10-31T16:46:42.894520533Z
+  poller:  0 2026-10-31T16:47:04.713071936Z
 
 --- docker inspect BEFORE (for comparison): ---
-  edge:    0 2026-10-31T15:34:47.521643288Z
-  poller:  0 2026-10-31T15:35:10.603765138Z
+  edge:    0 2026-10-31T16:46:42.894520533Z
+  poller:  0 2026-10-31T16:47:04.713071936Z
 
 --- RestartCount comparison: ---
   edge:    before=0 after=0
@@ -57,14 +57,14 @@ PASS: no apply loop silent
 PASS: no health errors
 
 --- poller log (last 50 lines): ---
-poller-1  | 2026/10/31 15:35:10 gatepost-edge starting: api=http://172.17.0.1:8090 state=/state ask=127.0.0.1:8099 admin=127.0.0.1:2019 issuer=internal cert_cap=50/h access_log=/data/logs/access.json
-poller-1  | 2026/10/31 15:35:10 applied snapshot generation 599: 1 domain(s), 1 allowed hostname(s)
-poller-1  | 2026/10/31 15:35:21 ERROR poll failed (streak 1): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
-poller-1  | 2026/10/31 15:35:51 ERROR poll failed (streak 3): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
-poller-1  | 2026/10/31 15:36:30 ERROR poll failed (streak 4): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
-poller-1  | 2026/10/31 15:36:30 WARNING poll failure streak 4 — backoff ladder capped at 1m0s; the last good config keeps serving
-poller-1  | 2026/10/31 15:37:28 ERROR poll failed (streak 5): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
-poller-1  | 2026/10/31 15:38:25 ERROR poll failed (streak 6): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
-poller-1  | 2026/10/31 15:39:24 ERROR poll failed (streak 7): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 16:47:04 gatepost-edge starting: api=http://172.17.0.1:8090 state=/state ask=127.0.0.1:8099 admin=127.0.0.1:2019 issuer=internal cert_cap=50/h access_log=/data/logs/access.json
+poller-1  | 2026/10/31 16:47:04 applied snapshot generation 614: 1 domain(s), 1 allowed hostname(s)
+poller-1  | 2026/10/31 16:47:14 ERROR poll failed (streak 1): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 16:48:21 ERROR poll failed (streak 4): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 16:48:21 WARNING poll failure streak 4 — backoff ladder capped at 1m0s; the last good config keeps serving
+poller-1  | 2026/10/31 16:49:24 ERROR poll failed (streak 5): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 16:50:24 ERROR poll failed (streak 6): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 16:51:20 ERROR poll failed (streak 7): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
 
 === soak verdict: PASSED ===
+[soak] this run's soak-* test data cleaned from database

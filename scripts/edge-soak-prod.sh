@@ -330,8 +330,18 @@ else
   echo "=== soak verdict: $SOAK_VERDICT ==="
 fi
 
-# Tear down.
+# Tear down. rm -f SUPERVISE_OFF re-enables the supervisor timer here: the
+# EXIT trap that normally did this was disabled above (so it wouldn't echo the
+# verdict a second time), but a clean exit reaches this block, so we restore
+# the timer ourselves. The DB wipe below removes THIS run's soak-* rows (the
+# pre-run wipe only clears leftovers; rows created here would otherwise persist
+# and trip the DNS-lookup-timeout guard on the next run). Mirrors accept.sh.
 sudo docker compose -f "$COMPOSE" --profile poller down >/dev/null 2>&1
-rm -f "$STUB_PY" "$STUB_TOK" "$JAR"
+rm -f "$STUB_PY" "$STUB_TOK" "$JAR" "$SUPERVISE_OFF"
+if [ -n "${DB_URL:-}" ] && command -v psql >/dev/null 2>&1; then
+  psql "$DB_URL" -c \
+    "DELETE FROM origins WHERE domain_id IN (SELECT id FROM domains WHERE hostname LIKE 'soak-%'); DELETE FROM domains WHERE hostname LIKE 'soak-%'; DELETE FROM nodes WHERE name LIKE 'soak-%';" >/dev/null 2>&1
+  echo "[soak] this run's soak-* test data cleaned from database"
+fi
 trap '' EXIT
 trap '' INT TERM

@@ -1,51 +1,36 @@
-== 15:22:56 a) cold start with the API down and a saved snapshot
-== 15:23:14 b) cold start with NO snapshot: 421 for every host
-== 15:23:30 c) tampered snapshot rejected; the last-good config keeps serving
-== 15:24:32 d) an API origin change reaches the edge (timed)
-== 15:25:32 e) spoofed X-Forwarded-For is replaced with the real client IP
-== 15:25:32 f) private and metadata origins are refused, never reached
-== 15:25:32 f2) an origin hostname that later resolves to a metadata address is refused at dial time
-== 15:26:46 g) unknown host: 421 and no certificate attempt
-== 15:26:46 h) allowed host gets a certificate (internal issuer); denied host does not
-== 15:26:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
-== 15:27:37 j) the whole run's access log: no secrets, no query strings
-== 15:27:37 k) B3c WAF audit redaction (detection-only, in-process, no values)
-== 15:27:40 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
-15:27:40 PASS: l) claim accept-wb-1793460147-23856.example.test
-15:27:40 PASS: l) verify accept-wb-1793460147-23856.example.test
-15:27:40 PASS: l) origin set for accept-wb-1793460147-23856.example.test
-15:28:38 PASS: l) edge serves accept-wb-1793460147-23856.example.test from origin-test
-15:28:38 PASS: l) detection baseline: SQLi passes through (accept-a-1793460147-23856.example.test)
-15:28:39 PASS: l) detection gives events in audit log
-15:28:39 PASS: l) detection baseline: SQLi passes through (accept-wb-1793460147-23856.example.test)
-15:28:39 PASS: l) set accept-a-1793460147-23856.example.test to blocking
-15:28:39 PASS: l) set accept-wb-1793460147-23856.example.test to off
-15:29:38 PASS: l) WAF modes propagated to edge
-     l) WAF mode change reached the edge in 59s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
-15:29:40 PASS: l) blocking host: SQLi attack returns 403
-15:29:40 PASS: l) blocking host: normal corpus returns 200
-15:29:40 PASS: l) off host: SQLi passes through (host isolation)
-15:29:41 PASS: l) off host: gives no WAF events in audit log
-15:29:41 PASS: l) 403 body has no SQLi payload
-15:29:41 PASS: l) 403 body has no query string
-15:29:41 PASS: l) 403 body has no host name
-15:29:41 PASS: l) set accept-wb-1793460147-23856.example.test to detection while accept-a-1793460147-23856.example.test is blocking
-15:29:41 PASS: l) WAF_B detection propagated
-15:29:43 PASS: l) isolation: accept-a-1793460147-23856.example.test in blocking still returns 403
-15:29:43 PASS: l) isolation: accept-wb-1793460147-23856.example.test in detection passes through (200)
-15:29:43 PASS: l) set accept-a-1793460147-23856.example.test to blocking with 942100 excluded
-15:29:43 PASS: l) set accept-wb-1793460147-23856.example.test to blocking (no exclusions)
-15:30:38 PASS: l) WAF exclusion propagated
+== 16:32:19 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
+16:32:19 PASS: l) claim accept-wb-1793464024-26600.example.test
+16:32:19 PASS: l) verify accept-wb-1793464024-26600.example.test
+16:32:19 PASS: l) origin set for accept-wb-1793464024-26600.example.test
+16:33:17 PASS: l) edge serves accept-wb-1793464024-26600.example.test from origin-test
+16:33:17 PASS: l) detection baseline: SQLi passes through (accept-a-1793464024-26600.example.test)
+16:33:18 PASS: l) detection gives events in audit log
+16:33:18 PASS: l) detection baseline: SQLi passes through (accept-wb-1793464024-26600.example.test)
+16:33:18 PASS: l) set accept-a-1793464024-26600.example.test to blocking
+16:33:18 PASS: l) set accept-wb-1793464024-26600.example.test to off
+16:34:16 PASS: l) WAF modes propagated to edge
+     l) WAF mode change reached the edge in 58s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
+16:34:19 PASS: l) blocking host: SQLi attack returns 403
+16:34:19 PASS: l) blocking host: normal corpus returns 200
+16:34:19 PASS: l) off host: SQLi passes through (host isolation)
+16:34:20 PASS: l) off host: gives no WAF events in audit log
+16:34:20 PASS: l) 403 body has no SQLi payload
+16:34:20 PASS: l) 403 body has no query string
+16:34:20 PASS: l) 403 body has no host name
+16:34:20 PASS: l) set accept-wb-1793464024-26600.example.test to detection while accept-a-1793464024-26600.example.test is blocking
+16:34:20 PASS: l) WAF_B detection propagated
+16:34:22 PASS: l) isolation: accept-a-1793464024-26600.example.test in blocking still returns 403
+16:34:22 PASS: l) isolation: accept-wb-1793464024-26600.example.test in detection passes through (200)
+16:34:22 PASS: l) set accept-a-1793464024-26600.example.test to blocking with 942100 excluded
+16:34:22 PASS: l) set accept-wb-1793464024-26600.example.test to blocking (no exclusions)
+16:35:17 PASS: l) WAF exclusion propagated
      l) exclusion change reached the edge in 55s
-15:30:40 PASS: l) excluded rule 942100: SQLi passes through for accept-a-1793460147-23856.example.test (200)
-15:30:40 PASS: l) non-excluded rule 913100: scanner UA still blocked on accept-a-1793460147-23856.example.test (403)
-15:30:40 PASS: l) excluded rule stops firing for that host ONLY: accept-wb-1793460147-23856.example.test still blocks (403)
-15:30:40 PASS: l) set accept-a-1793460147-23856.example.test to detection (mode change)
-15:30:40 PASS: l) mode change propagated
+16:35:19 PASS: l) excluded rule 942100: SQLi passes through for accept-a-1793464024-26600.example.test (200)
+16:35:19 PASS: l) non-excluded rule 913100: scanner UA still blocked on accept-a-1793464024-26600.example.test (403)
+16:35:19 PASS: l) excluded rule stops firing for that host ONLY: accept-wb-1793464024-26600.example.test still blocks (403)
+16:35:19 PASS: l) set accept-a-1793464024-26600.example.test to detection (mode change)
+16:35:19 PASS: l) mode change propagated
      l) mode change (blocking→detection) reached the edge in 0s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
-15:30:40 PASS: l) host isolation: accept-wb-1793460147-23856.example.test still blocks while accept-a-1793460147-23856.example.test is detection
-15:30:40 PASS: l) ordering: host-scoped ctl rules precede CRS includes
+16:35:19 PASS: l) host isolation: accept-wb-1793464024-26600.example.test still blocks while accept-a-1793464024-26600.example.test is detection
+16:35:19 PASS: l) ordering: host-scoped ctl rules precede CRS includes
 
-== 15:30:40 m) edge RSS with 1/10/100 served hosts
-== 15:32:38 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
-== 15:32:54 o) PROD_TIMING: origin change after 60s silence (leading-edge)
