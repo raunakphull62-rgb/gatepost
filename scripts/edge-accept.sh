@@ -69,7 +69,7 @@ print_verdict() {
   fi
   echo "=== edge acceptance: $PASS passed, $FAIL failed, exit=$code, last_section=$LAST_SECTION, status=$status ==="
 }
-trap 'print_verdict; kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
+trap 'print_verdict; kill ${API_PID:-0} ${STUB_PID:-0} 2>/dev/null; sudo docker rm -f accept-old-poller >/dev/null 2>&1; rm -f "$STUB_PY" "$STUB_TOK" "$STUB_A" "$JAR" "$SUPERVISE_OFF"' EXIT
 trap 'echo "=== edge acceptance: interrupted (SIGINT/SIGTERM); exiting ===" >&2; exit 130' INT TERM
 
 [ -f .env ] || { echo "no .env at repo root (create it yourself; never paste it here)" >&2; exit 2; }
@@ -217,6 +217,11 @@ for v in caddy_data caddy_config poller_state; do sudo docker volume rm "gatepos
 # NAT for the host-publish 8080 would intercept 172.17.0.1:8080).
 OLD_PID=$(sudo ss -ltnp 'sport = :8090' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 if [ -n "$OLD_PID" ]; then sudo kill "$OLD_PID" 2>/dev/null; sleep 1; fi
+# A previous run aborted between `dc run` and the stop of the section-n
+# one-off old-node container would leave it holding the poller_state volume
+# — the volume rm below would silently fail and the poller would boot with
+# the PREVIOUS run's snapshot (wrong hostnames, 421 cascade). Remove it first.
+sudo docker rm -f accept-old-poller >/dev/null 2>&1 || true
 # a previous run's stub can survive a killed script (it has no parent to
 # clean it up); the port is ours for this run
 STUB_PID=$(sudo ss -ltnup 'sport = :5344' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
