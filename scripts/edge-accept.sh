@@ -564,11 +564,19 @@ until_ok ${PROPAGATE_TIMEOUT} "the edge recovers: the change propagates again" \
 echo "     recovery: the post-restart change reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
 OUT=$(cb -X POST "$API/v1/nodes/$NID/revoke")
 check "node revoked (idempotent route)" "$(codeof "$OUT")" "200"
-sleep 15  # wait for the poller to poll with the revoked token (backoff
-          # streak from the API-downtime phase may delay the first 401), past
-          # the first poll tick so logThrottled emits the "401" brand
-check "i) the poller logged the 401 (once, loudly)" \
-  "$(dc logs --since 2m poller 2>/dev/null | grep -c '401 from API')" "1"
+# Deterministic: poll for the 401 line instead of sleeping a fixed 15s.
+# The backoff streak from the API-downtime phase can delay the first poll
+# with the revoked token by up to the backoff cap (60s in production), so
+# the bound is the same PROPAGATE_TIMEOUT used for propagation. Full
+# container logs (no --since): this poller container was created by this
+# run and the token is revoked exactly once, so "401 from API" can only
+# come from this revocation — no time window to get wrong.
+until_ok ${PROPAGATE_TIMEOUT} "i) the poller logged the 401 (bounded poll, no fixed sleep)" \
+  'dc logs poller 2>/dev/null | grep -q "401 from API"'
+# Checked immediately after the first sighting (<=1s): logThrottled emits
+# one line per 30s per brand, so the count here is deterministically 1.
+check "i) the 401 was logged once (throttled), not once per poll tick" \
+  "$(dc logs poller 2>/dev/null | grep -c '401 from API')" "1"
 check "i) the revoked node keeps serving the last-good config" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
