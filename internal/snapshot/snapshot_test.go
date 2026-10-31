@@ -1,7 +1,6 @@
 package snapshot
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -165,17 +164,19 @@ func TestSizeLimitBothSides(t *testing.T) {
 	}
 }
 
-// TestSchema1EdgeReadsSchema2Snapshot proves that code compiled with the schema-1
-// Document shape (which only has Hostname, SetupType, Origin — no WAFMode or ExcludedRuleIDs)
-// safely unmarshals and verifies a schema-2 snapshot without errors or crashes.
-// Unknown fields are cleanly ignored, and the schema-1 code keeps serving.
-func TestSchema1EdgeReadsSchema2Snapshot(t *testing.T) {
+// TestSchemaGateRefusals — the schema gate (B3c item 2b): a snapshot whose
+// signed required_features name something the verifier does not know, or
+// whose schema_version is newer than this build, is REFUSED. The old
+// "unknown fields are ignored" behavior would silently drop the WAF behind
+// the feature; the gate keeps the last good snapshot instead. Older schemas
+// and feature-less snapshots stay accepted (backward compatibility).
+func TestSchemaGateRefusals(t *testing.T) {
 	key := []byte("test-key-32-bytes-long-minimum!")
-	// Create a schema-2 document
-	doc2 := Document{
-		SchemaVersion: 2,
-		Generation:    10,
-		BuiltAt:       time.Now().UTC(),
+	current := Document{
+		SchemaVersion:    SchemaVersion,
+		RequiredFeatures: []string{FeatureWAF},
+		Generation:       10,
+		BuiltAt:          time.Now().UTC(),
 		Domains: []Domain{
 			{
 				Hostname:        "example.com",
@@ -187,40 +188,51 @@ func TestSchema1EdgeReadsSchema2Snapshot(t *testing.T) {
 		},
 		AllowedHostnames: []string{"example.com"},
 	}
-	env, err := Sign(key, doc2)
+	env, err := Sign(key, current)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
 
-	// Now simulate schema-1 consumer unmarshaling:
-	type schema1Domain struct {
-		Hostname  string `json:"hostname"`
-		SetupType string `json:"setup_type"`
-		Origin    Origin `json:"origin"`
-	}
-	type schema1Doc struct {
-		SchemaVersion    int             `json:"schema_version"`
-		Generation       int64           `json:"generation"`
-		BuiltAt          time.Time       `json:"built_at"`
-		Domains          []schema1Domain `json:"domains"`
-		AllowedHostnames []string        `json:"allowed_hostnames"`
-	}
-
-	// Verify using standard snapshot.Verify
-	verifiedDoc, err := Verify(key, env, 9)
+	// The current edge (full knowledge) accepts the current snapshot.
+	d, err := Verify(key, env, 9)
 	if err != nil {
-		t.Fatalf("Verify failed on schema-2 envelope: %v", err)
+		t.Fatalf("current build must accept the current snapshot: %v", err)
 	}
-	if verifiedDoc.SchemaVersion != 2 {
-		t.Fatalf("expected SchemaVersion 2, got %d", verifiedDoc.SchemaVersion)
+	if d.SchemaVersion != SchemaVersion || len(d.Domains) != 1 || d.Domains[0].WAFMode != "blocking" {
+		t.Fatalf("wrong document: %+v", d)
 	}
 
-	// Schema-1 unmarshal of the verified payload
-	var d1 schema1Doc
-	if err := json.Unmarshal([]byte(env.Payload), &d1); err != nil {
-		t.Fatalf("schema-1 unmarshal crashed or failed: %v", err)
+	// An old-style verifier (knows no features) refuses it — the WAF fields
+	// would otherwise be silently dropped.
+	if _, err := VerifyWith(key, env, 9, nil); !errors.Is(err, ErrUnknownFeature) {
+		t.Fatalf("old-style verifier must refuse a required feature, got %v", err)
 	}
-	if len(d1.Domains) != 1 || d1.Domains[0].Hostname != "example.com" {
-		t.Fatalf("schema-1 unmarshal lost domain: %#v", d1)
+
+	// A newer schema_version is refused even with full knowledge.
+	newer := current
+	newer.SchemaVersion = SchemaVersion + 1
+	newer.Generation = 11
+	env3, err := Sign(key, newer)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if _, err := Verify(key, env3, 9); !errors.Is(err, ErrNewerSchema) {
+		t.Fatalf("newer schema must be refused, got %v", err)
+	}
+
+	// An OLDER schema stays accepted: schema-1 shape, no required_features.
+	oldStyle := Document{
+		SchemaVersion:    1,
+		Generation:       12,
+		BuiltAt:          time.Now().UTC(),
+		Domains:          []Domain{{Hostname: "example.com", SetupType: "cname", Origin: Origin{Scheme: "http", Address: "1.2.3.4", Port: 80}}},
+		AllowedHostnames: []string{"example.com"},
+	}
+	env1, err := Sign(key, oldStyle)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if _, err := Verify(key, env1, 9); err != nil {
+		t.Fatalf("older schema must stay accepted: %v", err)
 	}
 }

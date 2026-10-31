@@ -11,12 +11,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"gatepost/internal/envfile"
+	"gatepost/internal/snapshot"
 )
 
 func main() {
@@ -97,7 +99,36 @@ func loadConfig() Config {
 		// sets GP_EDGE_WAF_MODE=detection, which injects the coraza.waf
 		// handler with CRS loaded and audit to a bounded native-format file.
 		WAF: wafEnv(),
+
+		// B3c schema gate: the features this build implements.
+		Features: featuresEnv(),
 	}
+}
+
+// featuresEnv: the snapshot gate's feature list. The default is this build's
+// full knowledge; "none" (the sentinel — Go cannot tell an unset env from an
+// empty one) selects the old-style empty set that refuses any snapshot with
+// required features. Unknown names are fatal at boot (fail-loud style).
+func featuresEnv() []string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GP_EDGE_FEATURES")))
+	switch v {
+	case "":
+		return snapshot.KnownFeatures
+	case "none":
+		return nil
+	}
+	var out []string
+	for _, name := range strings.Split(v, ",") {
+		if name = strings.TrimSpace(name); name == "" {
+			continue
+		}
+		if !slices.Contains(snapshot.KnownFeatures, name) {
+			log.Fatalf("GP_EDGE_FEATURES: unknown feature %q (this build knows %s)",
+				name, strings.Join(snapshot.KnownFeatures, ","))
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 // issuerBootGuard: the boot-time refusal around the production issuer.

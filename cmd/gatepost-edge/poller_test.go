@@ -575,6 +575,128 @@ func TestUnknownKeySkipped(t *testing.T) {
 	}
 }
 
+// The schema gate (B3c item 2b), wire path: an OLD-STYLE node (empty feature
+// set) refuses a snapshot that requires a feature it does not implement —
+// the last good config keeps serving, the refusal logs ONCE per throttle gap
+// (not once per poll), and the heartbeat never advances past the applied
+// generation.
+func TestUnknownFeatureKeepsLastGood(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-features"
+	fake := newFakeAPI(t, key, token)
+	fake.publish(1, "old.example.com") // the old-style artifact: no required_features
+	base := fake.serve().URL
+
+	dir := t.TempDir()
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, dir, base, token, key)
+	cfg.Features = nil // old-style node: knows no features
+	ask := startPoller(t, cfg)
+	until(t, 3*time.Second, "apply gen1", func() bool { return hook.count("applied snapshot") == 1 })
+
+	// The API moves to the current shape: the artifact now requires "waf".
+	fake.publishDoc(snapshot.Document{
+		SchemaVersion:    snapshot.SchemaVersion,
+		RequiredFeatures: []string{snapshot.FeatureWAF},
+		Generation:       2,
+		BuiltAt:          time.Now().UTC(),
+		Domains: []snapshot.Domain{{
+			Hostname:  "new.example.com",
+			SetupType: "cname",
+			Origin:    snapshot.Origin{Scheme: "http", Address: "93.184.216.34", Port: 80},
+		}},
+		AllowedHostnames: []string{"new.example.com"},
+		Defaults:         snapshot.Defaults{FirewallMode: "log_only", Cache: true},
+	})
+
+	until(t, 3*time.Second, "feature refusal", func() bool {
+		return hook.count("does not implement") >= 1
+	})
+	// Many more polls run inside the same throttle gap — still one line.
+	time.Sleep(100 * time.Millisecond)
+	if n := hook.count("does not implement"); n != 1 {
+		t.Fatalf("feature-refusal lines = %d, want 1 per gap", n)
+	}
+	if got := hook.count("applied snapshot"); got != 1 {
+		t.Fatalf("applied lines = %d, want 1 (gen2 never applied)", got)
+	}
+	if gen := savedGeneration(t, dir, key); gen != 1 {
+		t.Fatalf("persisted generation = %d, want 1 (last good kept)", gen)
+	}
+	if code := askGet(t, ask, "/check?domain=new.example.com"); code != http.StatusMisdirectedRequest {
+		t.Fatalf("new host ask = %d, want 421 (last good still serving)", code)
+	}
+	if hb := fake.heartbeatLog(); len(hb) == 0 || hb[len(hb)-1] != 1 {
+		t.Fatalf("heartbeats = %v, want only the applied 1", hb)
+	}
+}
+
+// The current edge accepts the current snapshot: a required_features list it
+// implements verifies and applies like any other.
+func TestCurrentEdgeAcceptsRequiredFeatures(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-gate-ok"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(snapshot.Document{
+		SchemaVersion:    snapshot.SchemaVersion,
+		RequiredFeatures: []string{snapshot.FeatureWAF},
+		Generation:       1,
+		BuiltAt:          time.Now().UTC(),
+		Domains: []snapshot.Domain{{
+			Hostname:  "gated.example.com",
+			SetupType: "cname",
+			Origin:    snapshot.Origin{Scheme: "http", Address: "93.184.216.34", Port: 80},
+		}},
+		AllowedHostnames: []string{"gated.example.com"},
+		Defaults:         snapshot.Defaults{FirewallMode: "log_only", Cache: true},
+	})
+	base := fake.serve().URL
+
+	hook := &logHook{}
+	cfg := newTestCfg(t, hook, t.TempDir(), base, token, key)
+	cfg.Features = []string{snapshot.FeatureWAF} // the current build's knowledge
+	startPoller(t, cfg)
+	until(t, 3*time.Second, "apply gen1", func() bool { return hook.count("applied snapshot") == 1 })
+	if hook.count("refused") != 0 {
+		t.Fatalf("current snapshot must not be refused:\n%s", hook.all())
+	}
+}
+
+// A snapshot with a NEWER schema_version than this build understands is
+// refused on the wire path — loudly, once per throttle gap, never applied.
+func TestNewerSchemaRefusedLogsOnce(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-schema"
+	fake := newFakeAPI(t, key, token)
+	fake.publishDoc(snapshot.Document{
+		SchemaVersion: snapshot.SchemaVersion + 1,
+		Generation:    1,
+		BuiltAt:       time.Now().UTC(),
+		Domains: []snapshot.Domain{{
+			Hostname:  "future.example.com",
+			SetupType: "cname",
+			Origin:    snapshot.Origin{Scheme: "http", Address: "93.184.216.34", Port: 80},
+		}},
+		AllowedHostnames: []string{"future.example.com"},
+		Defaults:         snapshot.Defaults{FirewallMode: "log_only", Cache: true},
+	})
+	base := fake.serve().URL
+
+	hook := &logHook{}
+	startPoller(t, newTestCfg(t, hook, t.TempDir(), base, token, key))
+	until(t, 3*time.Second, "schema refusal", func() bool {
+		return hook.count("newer than this build understands") >= 1
+	})
+	// Many more polls run inside the same throttle gap — still one line.
+	time.Sleep(100 * time.Millisecond)
+	if n := hook.count("newer than this build understands"); n != 1 {
+		t.Fatalf("schema-refusal lines = %d, want 1 per gap", n)
+	}
+	if got := hook.count("applied snapshot"); got != 0 {
+		t.Fatalf("applied lines = %d, want 0 (unknown schema never applied)", got)
+	}
+}
+
 // A generation that is not strictly newer than the applied one is refused
 // (the A→B→A rule: content may repeat, generations may not).
 func TestBackwardsGenerationRefused(t *testing.T) {

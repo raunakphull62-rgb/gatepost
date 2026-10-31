@@ -66,7 +66,11 @@ type Config struct {
 	APIBase    string        // e.g. http://api:8080 (no trailing slash)
 	Token      string        // node token, sent as Authorization: Bearer …
 	Key        []byte        // snapshot signing key (must match the API's)
-	StateDir   string        // the mounted volume; snapshot.json lives here
+	// Features — capability names this build implements for the snapshot
+	// gate (snapshot.VerifyWith). nil = an old-style node: it refuses any
+	// snapshot whose signed required_features name anything at all.
+	Features []string
+	StateDir string // the mounted volume; snapshot.json lives here
 	AskAddr    string        // ask check listener; "" disables it
 	AskURL     string        // Caddy's permission endpoint ("" → derived from AskAddr/AskLn)
 	AskLn      net.Listener  // test hook; used instead of AskAddr when set
@@ -284,7 +288,7 @@ func (p *Poller) consider(ctx context.Context, env snapshot.Envelope) {
 // verify wraps snapshot.Verify for logging: it maps each refusal to its one
 // distinctive message and returns the sentinel-tagged outcome.
 func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, error) {
-	d, err := snapshot.Verify(p.cfg.Key, env, prev)
+	d, err := snapshot.VerifyWith(p.cfg.Key, env, prev, p.cfg.Features)
 	switch {
 	case err == nil:
 		return d, nil
@@ -298,6 +302,12 @@ func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, e
 		return snapshot.Document{}, err
 	case errors.Is(err, snapshot.ErrTooLarge):
 		p.logThrottled("warn", "size", "snapshot refused: payload over the %d cap", snapshot.MaxBytes)
+		return snapshot.Document{}, err
+	case errors.Is(err, snapshot.ErrNewerSchema):
+		p.logThrottled("error", "schema", "snapshot refused: %v — keeping the last good config", err)
+		return snapshot.Document{}, err
+	case errors.Is(err, snapshot.ErrUnknownFeature):
+		p.logThrottled("error", "feature", "snapshot refused: %v — keeping the last good config", err)
 		return snapshot.Document{}, err
 	case errors.Is(err, snapshot.ErrBackwards):
 		// HISTORIC: generation refuses any generation <= last applied.

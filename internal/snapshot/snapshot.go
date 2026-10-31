@@ -13,6 +13,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -25,6 +28,7 @@ const MaxBytes = 256 << 10
 // to the same content.
 type Content struct {
 	SchemaVersion    int      `json:"schema_version"`
+	RequiredFeatures []string `json:"required_features,omitempty"` // signed capability gate (schema gate)
 	Domains          []Domain `json:"domains"`
 	AllowedHostnames []string `json:"allowed_hostnames"`
 	Defaults         Defaults `json:"defaults"`
@@ -34,6 +38,7 @@ type Content struct {
 // the signature covers.
 type Document struct {
 	SchemaVersion    int       `json:"schema_version"`
+	RequiredFeatures []string  `json:"required_features,omitempty"` // signed capability gate (schema gate)
 	Generation       int64     `json:"generation"`
 	BuiltAt          time.Time `json:"built_at"`
 	Domains          []Domain  `json:"domains"`
@@ -45,6 +50,7 @@ type Document struct {
 func (d Document) ToContent() Content {
 	return Content{
 		SchemaVersion:    d.SchemaVersion,
+		RequiredFeatures: d.RequiredFeatures,
 		Domains:          d.Domains,
 		AllowedHostnames: d.AllowedHostnames,
 		Defaults:         d.Defaults,
@@ -54,6 +60,15 @@ func (d Document) ToContent() Content {
 // SchemaVersion — bump when the snapshot shape changes meaningfully;
 // consumers pin to one.
 const SchemaVersion = 2
+
+// FeatureWAF gates the per-host WAF fields (waf_mode, excluded_rule_ids) —
+// the first entry of required_features. A node that does not know a required
+// feature must refuse the snapshot, never silently drop the fields behind it.
+const FeatureWAF = "waf"
+
+// KnownFeatures is everything THIS schema version's consumers implement;
+// Verify (the full-knowledge form) gates against it.
+var KnownFeatures = []string{FeatureWAF}
 
 // Defaults carries the fixed site posture of this version.
 type Defaults struct {
@@ -90,6 +105,12 @@ var (
 	ErrBackwards = errors.New("snapshot: generation must not go backwards")
 	// ErrTooLarge — payload above MaxBytes, refused before anything parses.
 	ErrTooLarge = errors.New("snapshot: exceeds the size limit")
+	// ErrNewerSchema — the schema_version is newer than this build
+	// understands: keep the last good snapshot, never apply (schema gate).
+	ErrNewerSchema = errors.New("snapshot: schema_version is newer than this build understands")
+	// ErrUnknownFeature — the signed required_features name something this
+	// build does not implement: keep the last good snapshot, never apply.
+	ErrUnknownFeature = errors.New("snapshot: requires a feature this build does not implement")
 )
 
 // Envelope is what the API serves and the poller fetches: the canonical
@@ -158,8 +179,19 @@ func Sign(key []byte, d Document) (Envelope, error) {
 // Verify authenticates the envelope, then enforces the "must not go
 // backwards" rule: the generation has to be strictly beyond prevGeneration
 // (0 = fresh start). Real content that repeats earlier content still carries
-// a HIGHER generation (A→B→A is 1, 2, 3) and therefore verifies.
+// a HIGHER generation (A→B→A is 1, 2, 3) and therefore verifies. It gates
+// against the full feature knowledge of this build.
 func Verify(key []byte, env Envelope, prevGeneration int64) (Document, error) {
+	return VerifyWith(key, env, prevGeneration, KnownFeatures)
+}
+
+// VerifyWith is Verify with the caller's feature knowledge: a node refuses
+// any snapshot whose signed required_features go beyond `known` (and any
+// schema_version beyond SchemaVersion) — the last good snapshot keeps
+// serving, the new one is never applied. An OLDER schema_version is still
+// accepted (backward compatibility); a nil/empty `known` is the old-style
+// node that refuses any snapshot requiring any feature at all.
+func VerifyWith(key []byte, env Envelope, prevGeneration int64, known []string) (Document, error) {
 	if len(env.Payload) > MaxBytes {
 		return Document{}, ErrTooLarge
 	}
@@ -179,8 +211,26 @@ func Verify(key []byte, env Envelope, prevGeneration int64) (Document, error) {
 	if err := json.Unmarshal([]byte(env.Payload), &d); err != nil {
 		return Document{}, ErrTampered // can only be wrong if we signed junk
 	}
+	if d.SchemaVersion > SchemaVersion {
+		return Document{}, fmt.Errorf("%w: got %d, this build understands up to %d",
+			ErrNewerSchema, d.SchemaVersion, SchemaVersion)
+	}
+	if missing := unknownFeatures(d.RequiredFeatures, known); len(missing) > 0 {
+		return Document{}, fmt.Errorf("%w: %s", ErrUnknownFeature, strings.Join(missing, " "))
+	}
 	if d.Generation <= prevGeneration {
 		return Document{}, ErrBackwards
 	}
 	return d, nil
+}
+
+// unknownFeatures returns the required features absent from known.
+func unknownFeatures(required, known []string) []string {
+	var missing []string
+	for _, f := range required {
+		if !slices.Contains(known, f) {
+			missing = append(missing, f)
+		}
+	}
+	return missing
 }
