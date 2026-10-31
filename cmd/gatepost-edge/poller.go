@@ -780,8 +780,16 @@ func (p *Poller) enterDegraded() {
 
 func (p *Poller) leaveDegraded() {
 	p.mu.Lock()
+	wasDegraded := !p.degradedSince.IsZero()
 	p.degradedSince = time.Time{}
 	p.mu.Unlock()
+	if wasDegraded {
+		// One line on the transition out of degrade — the observable signal
+		// that a refilled token restored polling within one poll cycle (the
+		// next tick fires this, then the token-read succeeds). Logged, not
+		// throttled: a flapping token would just repeat this once per flap.
+		p.log("info", "resumed polling: node token restored (was degraded)")
+	}
 }
 
 func (p *Poller) degradedFor() time.Duration {
