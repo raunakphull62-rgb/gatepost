@@ -884,9 +884,9 @@ if git archive v0.4-edge | tar -x -C "$OLD_DIR" \
   # edge, same secrets/state volumes, same env) running the OLD binary.
   if dc run -d --rm --name accept-old-poller --entrypoint /old/old-edge \
       -v "$OLD_BIN:/old/old-edge:ro" poller >/dev/null 2>&1; then
+    # 2>&1 (not 2>/dev/null): the poller logs to stderr and docker logs
+    # routes container stderr to its own — discarding it hides every line.
     until_ok ${PROPAGATE_TIMEOUT} "n) OLD node applied the on-disk schema-2 snapshot" \
-      # 2>&1 (not 2>/dev/null): the poller logs to stderr and docker logs
-      # routes container stderr to its own — discarding it hides every line.
       'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "applied snapshot generation"'
     check "n) old-code edge keeps serving $HOST (schema-2 read by schema-1 code)" \
       "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
