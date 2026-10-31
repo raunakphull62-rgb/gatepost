@@ -101,34 +101,49 @@ func loadConfig() Config {
 		WAF: wafEnv(),
 
 		// B3c schema gate: the features this build implements.
-		Features: featuresEnv(),
+		Features: mustFeatures(),
 	}
+}
+
+// mustFeatures wraps featuresEnv for loadConfig — an unknown feature is a
+// boot-time fatal (this build refuses to claim a capability it does not have).
+func mustFeatures() []string {
+	f, err := featuresEnv()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	return f
 }
 
 // featuresEnv: the snapshot gate's feature list. The default is this build's
 // full knowledge; "none" (the sentinel — Go cannot tell an unset env from an
 // empty one) selects the old-style empty set that refuses any snapshot with
-// required features. Unknown names are fatal at boot (fail-loud style).
-func featuresEnv() []string {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("GP_EDGE_FEATURES")))
-	switch v {
-	case "":
-		return snapshot.KnownFeatures
-	case "none":
-		return nil
+// required features. The knob can only NARROW the compiled-in set — it can
+// never claim a capability the binary does not implement: an unknown name is
+// an error returned to loadConfig (which fails loud at boot). Fail-loud, not
+// fail-soft, so an operator typo can never silently drop the WAF gate.
+func featuresEnv() ([]string, error) {
+	if v := os.Getenv("GP_EDGE_FEATURES"); v == "" || v == "none" {
+		if v == "none" {
+			return nil, nil // old-style node: refuses any snapshot with required features
+		}
+		return snapshot.KnownFeatures, nil
 	}
 	var out []string
-	for _, name := range strings.Split(v, ",") {
+	for _, name := range strings.Split(os.Getenv("GP_EDGE_FEATURES"), ",") {
 		if name = strings.TrimSpace(name); name == "" {
 			continue
 		}
+		name = strings.ToLower(name)
 		if !slices.Contains(snapshot.KnownFeatures, name) {
-			log.Fatalf("GP_EDGE_FEATURES: unknown feature %q (this build knows %s)",
+			return nil, fmt.Errorf("GP_EDGE_FEATURES: unknown feature %q (this build knows %s)",
 				name, strings.Join(snapshot.KnownFeatures, ","))
 		}
-		out = append(out, name)
+		if !slices.Contains(out, name) {
+			out = append(out, name)
+		}
 	}
-	return out
+	return out, nil
 }
 
 // issuerBootGuard: the boot-time refusal around the production issuer.
