@@ -132,7 +132,11 @@ dc() {
   if [ "${PROD_TIMING:-0}" != "1" ]; then
     env_args+=("GP_EDGE_RELOAD_COOLDOWN=${POLL_COOLDOWN}s" "GP_EDGE_POLL_INTERVAL=${POLL_INTERVAL}s" "GP_EDGE_BACKOFF_CAP=${BACKOFF_CAP}s")
   fi
-  sudo env "${env_args[@]}" docker compose -f "$COMPOSE" --profile poller "$@"
+  local cmd_args=("$@")
+  if [ "${1:-}" = "exec" ]; then
+    cmd_args=("exec" "-T" "${@:2}")
+  fi
+  sudo env "${env_args[@]}" docker compose -f "$COMPOSE" --profile poller "${cmd_args[@]}"
 }
 
 # until_ok <timeout-s> <what> <shell-condition>: evaluated in THIS shell
@@ -678,11 +682,16 @@ until_ok ${PROPAGATE_TIMEOUT} "l) edge serves $WAF_B from origin-test" \
   'curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -q "port 9001"'
 # SQLi in query triggers CRS 942100; scanner UA triggers 913100.
 SQLI_ATTACK="ok?id=%27%20OR%20%271%27%3D%271"
-# Baseline: both at detection (default) — SQLi passes through.
+# Baseline: both at detection (default) — SQLi passes through and logs events without blocking.
+dc exec edge sh -c "truncate -s 0 /data/logs/waf_audit.log" 2>/dev/null
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) detection baseline: SQLi passes through ($HOST)" "$C" "200"
+sleep 1
+AUDIT_DET=$(dc exec edge cat /data/logs/waf_audit.log 2>/dev/null)
+check_ne "l) detection gives events in audit log" "$(printf '%s' "$AUDIT_DET" | grep -c '942100')" "0"
 C=$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) detection baseline: SQLi passes through ($WAF_B)" "$C" "200"
+
 # Set HOST=blocking, WAF_B=off — global default stays detection.
 T0=$SECONDS
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"blocking"}')
@@ -696,29 +705,57 @@ echo "     l) WAF mode change reached the edge in $((SECONDS - T0))s ($PACE_LABE
 # loaded, but Caddy's coraza module needs a moment to bind the new directives
 # before requests are evaluated against them.
 sleep 2
-# blocking host: SQLi blocked (403). off host: SQLi passes (200) — host isolation.
+
+# blocking host: SQLi blocked (403), normal corpus returns 200.
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) blocking host: SQLi attack returns 403" "$C" "403"
+C_NORM=$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")
+check "l) blocking host: normal corpus returns 200" "$C_NORM" "200"
+
+# off host: SQLi passes (200) and produces NO WAF events in audit log.
+dc exec edge sh -c "truncate -s 0 /data/logs/waf_audit.log" 2>/dev/null
 C=$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) off host: SQLi passes through (host isolation)" "$C" "200"
+sleep 1
+AUDIT_OFF=$(dc exec edge cat /data/logs/waf_audit.log 2>/dev/null)
+check "l) off host: gives no WAF events in audit log" "$(printf '%s' "$AUDIT_OFF" | grep -c '942100')" "0"
+
 # Generic 403 body: no attack payload, no host name, no query string.
 B=$(curl -s -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
 check "l) 403 body has no SQLi payload" "$(printf '%s' "$B" | grep -c "OR.*1.*1")" "0"
 check "l) 403 body has no query string" "$(printf '%s' "$B" | grep -c '?')" "0"
 check "l) 403 body has no host name" "$(printf '%s' "$B" | grep -c "$HOST")" "0"
-# Exclusions: exclude 942100 on HOST — SQLi passes, scanner UA stays blocked.
+
+# One host in blocking does not affect another in detection.
+OUT=$(cb -X PUT "$API/v1/domains/$WAF_DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}')
+check "l) set $WAF_B to detection while $HOST is blocking" "$(codeof "$OUT")" "200"
+until_ok ${PROPAGATE_TIMEOUT} "l) WAF_B detection propagated" \
+  'curl -s -H "Host: $WAF_B" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
+sleep 2
+check "l) isolation: $HOST in blocking still returns 403" \
+  "$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")" "403"
+check "l) isolation: $WAF_B in detection passes through (200)" \
+  "$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")" "200"
+
+# Exclusions: exclude 942100 on HOST only — SQLi passes on HOST, scanner UA stays blocked.
+# And set WAF_B to blocking without exclusions: SQLi must still block on WAF_B.
 T0=$SECONDS
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' \
   -d '{"mode":"blocking","excluded_rule_ids":[942100]}')
 check "l) set $HOST to blocking with 942100 excluded" "$(codeof "$OUT")" "200"
+OUT=$(cb -X PUT "$API/v1/domains/$WAF_DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"blocking"}')
+check "l) set $WAF_B to blocking (no exclusions)" "$(codeof "$OUT")" "200"
 until_ok ${PROPAGATE_TIMEOUT} "l) WAF exclusion propagated" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
 echo "     l) exclusion change reached the edge in $((SECONDS - T0))s"
 sleep 2
 C=$(code_of -H "Host: $HOST" "$EDGE_HTTP/$SQLI_ATTACK")
-check "l) excluded rule 942100: SQLi passes through (200)" "$C" "200"
+check "l) excluded rule 942100: SQLi passes through for $HOST (200)" "$C" "200"
 C=$(code_of -H "Host: $HOST" -A "sqlmap/1.6" "$EDGE_HTTP/ok")
-check "l) non-excluded rule 913100: scanner UA still blocked (403)" "$C" "403"
+check "l) non-excluded rule 913100: scanner UA still blocked on $HOST (403)" "$C" "403"
+C_WAFB=$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")
+check "l) excluded rule stops firing for that host ONLY: $WAF_B still blocks (403)" "$C_WAFB" "403"
+
 # Mode-change timing: blocking → detection (should pass through again).
 T0=$SECONDS
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}')
@@ -726,9 +763,9 @@ check "l) set $HOST to detection (mode change)" "$(codeof "$OUT")" "200"
 until_ok ${PROPAGATE_TIMEOUT} "l) mode change propagated" \
   'curl -s -H "Host: $HOST" $EDGE_HTTP/$SQLI_ATTACK | grep -q "port 9001"'
 echo "     l) mode change (blocking→detection) reached the edge in $((SECONDS - T0))s ($PACE_LABEL)"
-# Host isolation: WAF_B still off while HOST changed.
-check "l) host isolation: $WAF_B unaffected by $HOST mode change" \
-  "$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")" "200"
+# Host isolation: WAF_B still blocking while HOST changed to detection.
+check "l) host isolation: $WAF_B still blocks while $HOST is detection" \
+  "$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")" "403"
 # Ordering proof: live Caddy config must place host-scoped ctl rules BEFORE CRS includes.
 ORDERING=$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | python3 -c '
 import json, sys
