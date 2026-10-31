@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -161,5 +162,65 @@ func TestSizeLimitBothSides(t *testing.T) {
 	over := Envelope{Payload: strings.Repeat(" ", MaxBytes+1), Signature: "00"}
 	if _, err := Verify(key, over, 0); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("oversized Verify must be ErrTooLarge before any parsing, got %v", err)
+	}
+}
+
+// TestSchema1EdgeReadsSchema2Snapshot proves that code compiled with the schema-1
+// Document shape (which only has Hostname, SetupType, Origin — no WAFMode or ExcludedRuleIDs)
+// safely unmarshals and verifies a schema-2 snapshot without errors or crashes.
+// Unknown fields are cleanly ignored, and the schema-1 code keeps serving.
+func TestSchema1EdgeReadsSchema2Snapshot(t *testing.T) {
+	key := []byte("test-key-32-bytes-long-minimum!")
+	// Create a schema-2 document
+	doc2 := Document{
+		SchemaVersion: 2,
+		Generation:    10,
+		BuiltAt:       time.Now().UTC(),
+		Domains: []Domain{
+			{
+				Hostname:        "example.com",
+				SetupType:       "cname",
+				Origin:          Origin{Scheme: "http", Address: "1.2.3.4", Port: 80},
+				WAFMode:         "blocking",
+				ExcludedRuleIDs: []int{942100},
+			},
+		},
+		AllowedHostnames: []string{"example.com"},
+	}
+	env, err := Sign(key, doc2)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	// Now simulate schema-1 consumer unmarshaling:
+	type schema1Domain struct {
+		Hostname  string `json:"hostname"`
+		SetupType string `json:"setup_type"`
+		Origin    Origin `json:"origin"`
+	}
+	type schema1Doc struct {
+		SchemaVersion    int             `json:"schema_version"`
+		Generation       int64           `json:"generation"`
+		BuiltAt          time.Time       `json:"built_at"`
+		Domains          []schema1Domain `json:"domains"`
+		AllowedHostnames []string        `json:"allowed_hostnames"`
+	}
+
+	// Verify using standard snapshot.Verify
+	verifiedDoc, err := Verify(key, env, 9)
+	if err != nil {
+		t.Fatalf("Verify failed on schema-2 envelope: %v", err)
+	}
+	if verifiedDoc.SchemaVersion != 2 {
+		t.Fatalf("expected SchemaVersion 2, got %d", verifiedDoc.SchemaVersion)
+	}
+
+	// Schema-1 unmarshal of the verified payload
+	var d1 schema1Doc
+	if err := json.Unmarshal([]byte(env.Payload), &d1); err != nil {
+		t.Fatalf("schema-1 unmarshal crashed or failed: %v", err)
+	}
+	if len(d1.Domains) != 1 || d1.Domains[0].Hostname != "example.com" {
+		t.Fatalf("schema-1 unmarshal lost domain: %#v", d1)
 	}
 }
