@@ -1083,16 +1083,18 @@ section "p) empty token → degrade serves last-good → restore resumes, no res
 # under :ro, so the poller sees the emptied content on its next file read.
 TOKEN_BAK="$(cat "$SECRETS/token" 2>/dev/null)"
 check_ne "p) saved the live node token before emptying" "$TOKEN_BAK" ""
-P_START=$(date -u +%Y-%m-%dT%H:%M:%S)
+P_START=$(date +%s)
+P_START_ISO=$(date -u +%Y-%m-%dT%H:%M:%S)
+P_START_EPOCH=$(date +%s)
 # Non-200 counter: steady traffic through the degrade restart. The edge (Caddy)
 # is a SEPARATE container — only the poller restarts — so its last-good JSON
-# stays live. Expected: 0 non-200s (snapshot loads at boot, no deny-all push).
+# stays live. Expected: 0 non-200s (snapshot loads at boot, not deny-all push).
 NON200=0
 : > "$SECRETS/token"  # empty the token file on the host (live :ro bind mount)
 P_RESTART=$(date +%s)
 dc up -d --build --force-recreate poller >/dev/null 2>&1
 P_UP=$(date +%s)
-echo "     p) poller restarted with empty token (live: $P_START, rebuild: $((P_UP - P_START))s from file-empty to container-up)"
+echo "     p) poller restarted with empty token (live: $P_START, rebuild: $((P_UP - P_START_EPOCH))s from file-empty to container-up)"
 # Wait for the boot-degrade log line: this is the item 2c signal that a missing
 # token degraded instead of fataling.
 until_ok 20 "p) poller booted DEGRADED: no node token, serving last-good (not polling)" \
