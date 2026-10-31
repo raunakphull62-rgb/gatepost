@@ -290,10 +290,12 @@ func TestSnapshotCacheOneBuild(t *testing.T) {
 
 	f.ipCalls.Store(0) // setup traffic (claim verification, origin create) out of the count
 
-	// first poll: a miss → one build, generation 1
+	// first poll: a miss → exactly one build (the create-time size gate has
+	// already built during setup, so the absolute generation moved; one DNS
+	// lookup per poll-build is the invariant here)
 	code, body, etag := pollConfig(t, n, "GET", "/node/v1/config", tok, "", "")
-	if code != http.StatusOK || strings.Trim(etag, `"`) != "1" {
-		t.Fatalf("first poll: want 200 gen 1, got %d %s (etag %q)", code, body, etag)
+	if code != http.StatusOK || strings.Trim(etag, `"`) == "" {
+		t.Fatalf("first poll: want 200 with a generation etag, got %d %s (etag %q)", code, body, etag)
 	}
 
 	// 99 more rapid polls, If-None-Match along: all served from the cache
@@ -307,28 +309,35 @@ func TestSnapshotCacheOneBuild(t *testing.T) {
 		t.Fatalf("100 polls in a row must cost exactly 1 build (1 lookup), got %d", got)
 	}
 
-	// a write invalidates: the very next poll rebuilds with new content.
-	// The counter then reads 3 — the loop's build (1) + the PUT's own
-	// origin validation (1) + the changed-content rebuild (1).
+	// a write invalidates: the very next poll rebuilds with new content —
+	// one generation past the first poll (the absolute numbers moved during
+	// setup: the create-time size gate builds too). The counter then reads
+	// 3 — the loop's build (1) + the PUT's own origin validation (1) + the
+	// changed-content rebuild (1).
+	g1, err := strconv.Atoi(strings.Trim(etag, `"`))
+	if err != nil {
+		t.Fatalf("first poll etag %q is not a generation", etag)
+	}
 	if code, body := a.do("PUT", "/v1/domains/"+row.ID+"/origin",
 		`{"scheme":"https","address":"cache.example.com","port":443}`); code != http.StatusOK {
 		t.Fatalf("origin update: %d %s", code, body)
 	}
 	code, body, etag2 := pollConfig(t, n, "GET", "/node/v1/config", tok, "", "")
-	if code != http.StatusOK || strings.Trim(etag2, `"`) != "2" {
-		t.Fatalf("after a write the next poll must rebuild to gen 2, got %d %s (etag %q)", code, body, etag2)
+	if code != http.StatusOK || strings.Trim(etag2, `"`) != strconv.Itoa(g1+1) {
+		t.Fatalf("after a write the next poll must rebuild to gen %d, got %d %s (etag %q)", g1+1, code, body, etag2)
 	}
 	if got := f.ipCalls.Load(); got != 3 {
 		t.Fatalf("one post-write rebuild expected (3 = 1 + PUT check + rebuild), got %d", got)
 	}
 
 	// and the TTL expiry path rebuilds even for identical content: wind the
-	// cache timestamp back and watch one more build — generation stays 2
+	// cache timestamp back and watch one more build — unchanged content
+	// keeps the ETag
 	s.snapMu.Lock()
 	s.snapCache.built = s.snapCache.built.Add(-time.Hour)
 	s.snapMu.Unlock()
 	code, _, etag3 := pollConfig(t, n, "GET", "/node/v1/config", tok, "", etag2)
-	if code != http.StatusNotModified || strings.Trim(etag3, `"`) != "2" {
+	if code != http.StatusNotModified || etag3 != etag2 {
 		t.Fatalf("expired cache: one rebuild but unchanged content keeps the ETag, got %d (etag %q)", code, etag3)
 	}
 	if got := f.ipCalls.Load(); got != 4 {

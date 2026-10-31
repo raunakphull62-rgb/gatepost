@@ -14,10 +14,15 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"gatepost/internal/domains"
+	"gatepost/internal/snapshot"
 	"gatepost/internal/token"
 )
 
 const claimTTL = 7 * 24 * time.Hour
+
+// snapshotClaimMargin — headroom for one more domain entry (~240B measured,
+// 1KB is generous) when the create-time gate measures the current artifact.
+const snapshotClaimMargin = 1 << 10
 
 // domainRow is the JSON shape every domain endpoint replies with. The
 // verification token never appears here — only the instructions endpoint
@@ -157,6 +162,23 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request, p *Principal)
 			"pending claim cap reached (max pending "+strconv.Itoa(s.cfg.DomainMaxPending)+")")
 		return
 	}
+
+	// Snapshot size gate: the artifact has a hard cap (snapshot.MaxBytes,
+	// enforced again at Sign and on every poller's wire read). A claim only
+	// reaches the snapshot once verified WITH an origin, but a full or
+	// failing artifact means the claim could never be served — refuse it
+	// now, with the reason, instead of after the verify step.
+	if env, _, err := s.currentSnapshot(ctx); errors.Is(err, snapshot.ErrTooLarge) {
+		fail(w, http.StatusUnprocessableEntity,
+			"the config snapshot is over its size cap — no new domains until it shrinks")
+		return
+	} else if err == nil && len(env.Payload)+snapshotClaimMargin > snapshot.MaxBytes {
+		fail(w, http.StatusUnprocessableEntity,
+			"the config snapshot is within "+strconv.Itoa(snapshotClaimMargin)+
+				" bytes of its size cap — no new domains until it shrinks")
+		return
+	} // any other build error: the alert path logged it; the insert below
+	// fails on a broken database anyway
 
 	// another user already verified this hostname: the name is taken.
 	var taken bool

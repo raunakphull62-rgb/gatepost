@@ -52,8 +52,8 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(d1.Domains) != 2 || d1.Generation != 1 {
-		t.Fatalf("first build: want 2 entries gen 1, got %d entries gen %d", len(d1.Domains), d1.Generation)
+	if len(d1.Domains) != 2 || d1.Generation < 1 {
+		t.Fatalf("first build: want 2 entries, got %d entries gen %d", len(d1.Domains), d1.Generation)
 	}
 
 	var buf bytes.Buffer
@@ -73,8 +73,8 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	if len(d2.Domains) != 1 || d2.Domains[0].Hostname != "transient.example.com" {
 		t.Fatalf("unsafe must drop, transient must stay: %+v", d2.Domains)
 	}
-	if d2.Generation != 2 {
-		t.Fatalf("content changed (one entry dropped), generation must bump: %d", d2.Generation)
+	if d2.Generation != d1.Generation+1 {
+		t.Fatalf("content changed (one entry dropped), generation must bump: %d → %d", d1.Generation, d2.Generation)
 	}
 	if out := buf.String(); !strings.Contains(out, "dropped unsafe.example.com") ||
 		!strings.Contains(out, "169.254.169.254") ||
@@ -90,7 +90,7 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d3.Generation != 2 || len(d3.Domains) != 1 {
+	if d3.Generation != d2.Generation || len(d3.Domains) != 1 {
 		t.Fatalf("unchanged bad state must keep content and generation: %+v", d3.Domains)
 	}
 	if n := countRows(t, pool, "operator_alerts", "kind = 'origin_unsafe'"); n != 1 {
@@ -98,16 +98,16 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	}
 
 	// recovery: the unsafe name answers with the good IP again — content is
-	// back to the FIRST build's shape (A→B→A), so the next generation (3)
-	// is taken, never version 1's number reused
+	// back to the FIRST build's shape (A→B→A), so the NEXT number is taken,
+	// never an earlier version's number reused
 	setResolvers(s, f)
 	f.ips["unsafe.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
 	d4, _, err := s.buildSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(d4.Domains) != 2 || d4.Generation != 3 {
-		t.Fatalf("recovered build: want 2 entries gen 3, got %d entries gen %d", len(d4.Domains), d4.Generation)
+	if len(d4.Domains) != 2 || d4.Generation != d2.Generation+1 {
+		t.Fatalf("recovered build: want 2 entries gen %d, got %d entries gen %d", d2.Generation+1, len(d4.Domains), d4.Generation)
 	}
 
 	// NXDOMAIN class (zero answers after previously answering): NOT a drop
@@ -116,7 +116,7 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(d5.Domains) != 2 || d5.Generation != 3 {
+	if len(d5.Domains) != 2 || d5.Generation != d4.Generation {
 		t.Fatalf("NXDOMAIN must keep the entry and the generation: %d entries gen %d", len(d5.Domains), d5.Generation)
 	}
 
@@ -128,7 +128,7 @@ func TestBuildRecheckUnsafeAndTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(d6.Domains) != 2 || d6.Generation != 3 {
+	if len(d6.Domains) != 2 || d6.Generation != d4.Generation {
 		t.Fatalf("timeout must keep the entry and the generation: %d entries gen %d", len(d6.Domains), d6.Generation)
 	}
 	if n := countRows(t, pool, "operator_alerts", "kind = 'origin_unsafe'"); n != 1 {

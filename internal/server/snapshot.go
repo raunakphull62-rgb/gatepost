@@ -121,9 +121,14 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 		allowed = append(allowed, d.Hostname)
 	}
 	defaults := snapshot.Defaults{FirewallMode: "log_only", Cache: true}
+	// The signed capability gate: this artifact requires the WAF feature —
+	// an edge that predates it refuses the whole snapshot instead of
+	// silently dropping the WAF fields.
+	features := []string{snapshot.FeatureWAF}
 
 	h, err := snapshot.Hash(snapshot.Content{
 		SchemaVersion:    snapshot.SchemaVersion,
+		RequiredFeatures: features,
 		Domains:          domainsOut,
 		AllowedHostnames: allowed,
 		Defaults:         defaults,
@@ -137,6 +142,7 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 	}
 	doc := snapshot.Document{
 		SchemaVersion:    snapshot.SchemaVersion,
+		RequiredFeatures: features,
 		Generation:       gen,
 		BuiltAt:          time.Now().UTC(),
 		Domains:          domainsOut,
@@ -218,8 +224,14 @@ func (s *Server) currentSnapshot(ctx context.Context) (snapshot.Envelope, int64,
 
 	doc, env, err := s.buildSnapshot(ctx)
 	if err != nil {
+		// A failed build leaves the pollers on their last good artifact —
+		// but never silently: one line per failure and an open operator
+		// alert that the next successful build auto-resolves.
+		log.Printf("snapshot build FAILED: %v", err)
+		s.recordAlert(ctx, "snapshot_build_failed", "snapshot", err.Error())
 		return snapshot.Envelope{}, 0, err
 	}
+	s.resolveAlert(ctx, "snapshot_build_failed", "snapshot")
 	s.snapMu.Lock()
 	s.snapCache = &snapCache{env: env, gen: doc.Generation, built: time.Now()}
 	s.snapMu.Unlock()

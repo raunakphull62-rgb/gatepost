@@ -101,7 +101,10 @@ func TestBuildSnapshotInclusions(t *testing.T) {
 	if doc.Defaults.FirewallMode != "log_only" || !doc.Defaults.Cache {
 		t.Fatalf("defaults wrong: %+v", doc.Defaults)
 	}
-	if doc.SchemaVersion != snapshot.SchemaVersion || doc.Generation != 1 {
+	// (the absolute generation moved during setup: every domain create now
+	// runs the size gate, which builds — same content still records the
+	// same generation, proven in TestBuildSnapshotVersionBumps)
+	if doc.SchemaVersion != snapshot.SchemaVersion || doc.Generation < 1 {
 		t.Fatalf("bookkeeping wrong: %+v", doc)
 	}
 	if got := strings.Join(doc.AllowedHostnames, ","); got != "literal.example.com,orig.example.com" {
@@ -175,5 +178,62 @@ func TestBuildSnapshotVersionBumps(t *testing.T) {
 	}
 	if h2, h3 := contentHashOf(t, d2), contentHashOf(t, d3); h2 != h3 {
 		t.Fatal("unchanged rebuild must hash equal")
+	}
+}
+
+// TestDomainCreateSnapshotCapGate — B3c item 2b: when the artifact cannot
+// build (here: over the size cap at Sign), domain creation is refused with a
+// clear 4xx, the failure is logged, and an open operator alert fires that the
+// next successful build auto-resolves.
+func TestDomainCreateSnapshotCapGate(t *testing.T) {
+	pool, a, _, s := snapshotSetup(t)
+	ctx := context.Background()
+
+	// Bulk-insert verified domains with IP-literal origins for a SECOND user
+	// (their own server, same pool): the per-user claim caps must not fire
+	// before the snapshot gate. Direct SQL: the HTTP claim path would
+	// rate-limit; this is setup, not the test. ~240B per entry measured —
+	// 1200 entries ≈ 285KB, over the 256KB cap.
+	b, _ := newTestServer(t, pool)
+	signupOn(t, pool, b, "bulk@x.test")
+	var uid string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM users WHERE email = 'bulk@x.test'`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO domains
+		(owner_user_id, hostname, status, verify_token, verified_at, waf_mode)
+		SELECT $1::uuid, 'cap-' || g || '.loadcap.example', 'verified', 'tok-' || g, now(), 'detection'
+		FROM generate_series(1, 1200) g`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO origins (domain_id, scheme, address, port)
+		SELECT id, 'http', '93.184.216.34', 80 FROM domains WHERE hostname LIKE 'cap-%'`); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	// The build fails the cap at Sign; the create is refused 422, loudly.
+	if code, body := a.do("POST", "/v1/domains", `{"hostname":"fresh.example.com"}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("create at cap: want 422, got %d: %s", code, body)
+	}
+	if !strings.Contains(buf.String(), "snapshot build FAILED") {
+		t.Fatalf("build failure not logged:\n%s", buf.String())
+	}
+	if n := countRows(t, pool, "operator_alerts", "kind = 'snapshot_build_failed' AND resolved_at IS NULL"); n != 1 {
+		t.Fatalf("open snapshot_build_failed alerts = %d, want 1", n)
+	}
+
+	// Shrinking the artifact heals it: the next build succeeds, the alert
+	// auto-resolves, and creation works again.
+	if _, err := pool.Exec(ctx, `DELETE FROM domains WHERE hostname LIKE 'cap-%'`); err != nil {
+		t.Fatal(err)
+	}
+	s.invalidateSnapshot() // raw SQL writes bypass the write hooks
+	a.must("POST", "/v1/domains", `{"hostname":"fresh.example.com"}`, http.StatusCreated)
+	if n := countRows(t, pool, "operator_alerts", "kind = 'snapshot_build_failed' AND resolved_at IS NULL"); n != 0 {
+		t.Fatalf("snapshot_build_failed alert must auto-resolve, %d still open", n)
 	}
 }

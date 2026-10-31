@@ -27,7 +27,9 @@
 #      only; host isolation; mode-change propagation timing; generic 403
 #      body; live ordering proof (host-scoped ctl rules before CRS includes)
 #   m) edge RSS with 1/10/100 served hosts (shared WAF instance, sub-linear)
-#   n) schema-1 snapshot (pre-WAF bump): backward-compat, defaults to detection
+#   n) schema gate: an old-style edge (empty feature set) REFUSES a snapshot
+#      requiring an unknown feature and keeps its last good config; a schema-1
+#      snapshot is still accepted (backward compat, defaults to detection)
 #   o) [PROD_TIMING=1] origin change after 60s silence reaches the edge in ~10s
 #
 # Secrets stay in deploy/dev/secrets/ (gitignored) and .env; nothing
@@ -865,57 +867,96 @@ else
 fi
 
 # --- n) schema versions, BOTH directions -------------------------------------
-# Direction 1 — OLD code on a NEW snapshot: the v0.4-edge binary (schema-1,
-# pre-WAF) reads the current schema-2 snapshot. The old Verify has no schema
-# gate and encoding/json ignores unknown fields, so the honest expectation
-# is NOT a refusal: the old poller APPLIES the snapshot (adopting every
-# domain, silently dropping the WAF fields) and traffic keeps flowing. This
-# pins the safety property — serving continuity — and the new poller is
-# proven to heal the WAF-less config on its next boot.
+# Direction 1 — OLD-STYLE node on a NEW snapshot: the schema gate. A node that
+# does not know a signed required feature must REFUSE the snapshot and keep
+# its last good config — never silently drop the WAF fields behind it (the
+# v0.4 behavior this replaces). The "old-style edge" here is the CURRENT
+# poller binary with GP_EDGE_FEATURES=none (the empty feature set; Go cannot
+# tell an unset env from an empty one). Choreography: craft a schema-1-style
+# last-good (strip required_features, clear the WAF fields, bump the
+# generation past the API's), boot a one-off poller with the empty feature
+# set so it applies it, then let it poll the LIVE API: its schema-2 artifact
+# requires "waf" → refused once per throttle gap, the crafted last-good keeps
+# serving. The discriminator: the crafted config has no host-scoped WAF rules
+# (waf_mode cleared → DetectionOnly), the API's artifact would put WAF_B's
+# ctl:ruleEngine=On back — its absence proves the refusal held.
 # Direction 2 — NEW code on an OLD snapshot: a snapshot signed with the SAME
 # key but schema_version=1 (no waf_mode field). The current edge must accept
 # it and default WAFMode to "detection" via snapshotDomainWAF — the schema
 # bump is backward-compatible.
-section "n) schema versions both directions (old node on schema-2; new node on schema-1)"
-OLD_DIR=$(mktemp -d /tmp/opencode/oldnode-XXXXXX)
-OLD_BIN="$OLD_DIR/old-edge"
-if git archive v0.4-edge | tar -x -C "$OLD_DIR" \
-   && (cd "$OLD_DIR" && CGO_ENABLED=0 go build -o old-edge ./cmd/gatepost-edge) \
-   && [ -x "$OLD_BIN" ]; then
-  pass "n) old node binary (v0.4-edge tag, schema-1 code) built from git"
-  dc stop poller >/dev/null 2>&1
-  N_OLD=$(date -u +%Y-%m-%dT%H:%M:%S)
-  # One-off container from the poller service definition (same netns as the
-  # edge, same secrets/state volumes, same env) running the OLD binary.
-  if dc run -d --rm --name accept-old-poller --entrypoint /old/old-edge \
-      -v "$OLD_BIN:/old/old-edge:ro" poller >/dev/null 2>&1; then
+section "n) schema gate both directions (old-style node refuses; new node accepts schema-1)"
+sudo docker rm -f accept-old-poller >/dev/null 2>&1 || true
+if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+  CUR_SNAPSHOT=$(dc exec poller cat /state/snapshot.json 2>/dev/null)
+  if [ -n "$CUR_SNAPSHOT" ]; then
+    # Craft the old-style last-good from the current artifact: strip
+    # required_features, clear the WAF fields, bump the generation past the
+    # API's current one. Pipe CUR_SNAPSHOT through stdin (it's 140KB+ —
+    # exceeds ARG_MAX). Use python3 -c (not a heredoc) so stdin carries the
+    # snapshot data.
+    OLDGOOD=$(printf '%s' "$CUR_SNAPSHOT" | python3 -c '
+import sys, json, hmac, hashlib
+key = sys.argv[1].strip()
+env = json.load(sys.stdin)
+doc = json.loads(env["payload"])
+doc.pop("required_features", None)
+doc["schema_version"] = 1
+for d in doc.get("domains", []):
+    d["waf_mode"] = ""
+    d["excluded_rule_ids"] = []
+doc["generation"] = int(doc.get("generation", 0)) + 1
+payload = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+key_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
+' "$KEY")
+    dc stop poller >/dev/null 2>&1
+    sleep 1  # let the prior poller fully stop before we rewrite its state
+    printf '%s' "$OLDGOOD" | sudo docker run --rm -i -v gatepost-edge-dev_poller_state:/state alpine sh -c 'cat > /state/snapshot.json'
+    sleep 1  # let the volume sync finish before the one-off reads
+    N_OLD=$(date -u +%Y-%m-%dT%H:%M:%S)
+    # One-off container from the poller service definition (same netns as
+    # the edge, same secrets/state volumes, same env) with the EMPTY feature
+    # set: the old-style node of the schema gate.
     # 2>&1 (not 2>/dev/null): the poller logs to stderr and docker logs
     # routes container stderr to its own — discarding it hides every line.
-    until_ok ${PROPAGATE_TIMEOUT} "n) OLD node applied the on-disk schema-2 snapshot" \
-      'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "applied snapshot generation"'
-    check "n) old-code edge keeps serving $HOST (schema-2 read by schema-1 code)" \
-      "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
-    check "n) old-code edge keeps serving $WAF_B" \
-      "$(curl -s -H "Host: $WAF_B" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
-    echo "     n) note: old code drops the WAF fields (no schema gate in v0.4 Verify) — WAF directives now: $(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRule') (expected 0)"
+    if dc run -d --rm --name accept-old-poller -e GP_EDGE_FEATURES=none poller >/dev/null 2>&1; then
+      until_ok ${PROPAGATE_TIMEOUT} "n) old-style node boot-applied the crafted last-good" \
+        'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "applied snapshot generation"'
+      until_ok ${PROPAGATE_TIMEOUT} "n) old-style node REFUSED the API snapshot (required feature unknown)" \
+        'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "does not implement"'
+      check "n) old-style edge keeps serving $HOST (last-good held)" \
+        "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+      check "n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)" \
+        "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'ctl:ruleEngine=On')" "0"
+    else
+      fail "n) old-style one-off poller did not start"
+    fi
+    sudo docker stop -t 5 accept-old-poller >/dev/null 2>&1
+    # Reset the generation trap: the crafted last-good sits one generation
+    # ABOVE the API's current snapshot, so the API's artifact would look
+    # "backwards" to the real poller forever. Deleting the on-disk snapshot
+    # (poller stopped) is the documented cold-start reset.
+    sudo docker run --rm -v gatepost-edge-dev_poller_state:/state alpine sh -c 'rm -f /state/snapshot.json' 2>/dev/null
+    dc start poller >/dev/null 2>&1
+    N_START=$(date -u +%Y-%m-%dT%H:%M:%S)
+    until_ok ${PROPAGATE_TIMEOUT} "n) real poller cold-started from the API schema-2 snapshot" \
+      'dc logs --since "$N_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
+    until_ok ${PROPAGATE_TIMEOUT} "n) schema-2 WAF directives restored on the edge" \
+      'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=On"'
   else
-    fail "n) old-node container did not start"
+    fail "n) no on-disk snapshot found in poller volume"
   fi
-  sudo docker stop -t 5 accept-old-poller >/dev/null 2>&1
-  # Heal: the NEW poller re-applies the on-disk schema-2 snapshot at boot —
-  # with the WAF directives the old code had dropped.
-  dc start poller >/dev/null 2>&1
-  until_ok ${PROPAGATE_TIMEOUT} "n) new poller re-applied schema-2 with WAF directives restored" \
-    'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=On"'
-  rm -rf "$OLD_DIR"
 else
-  fail "n) could not build the old node binary from v0.4-edge (direction-1 test skipped)"
+  fail "n) psql not available — skipping schema-gate test"
 fi
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
   # Read the on-disk snapshot from the poller volume.
   CUR_SNAPSHOT=$(dc exec poller cat /state/snapshot.json 2>/dev/null)
   if [ -n "$CUR_SNAPSHOT" ]; then
     # Craft a schema-1 snapshot: bump generation, clear waf_mode, re-sign.
+    # required_features is stripped too — a schema-1 artifact predates the
+    # field (the current edge accepts the feature-less shape unchanged).
     # Pipe CUR_SNAPSHOT through stdin (it's 140KB+ — exceeds ARG_MAX).
     # Use python3 -c (not a heredoc) so stdin carries the snapshot data.
     SCHEMA1=$(printf '%s' "$CUR_SNAPSHOT" | python3 -c '
@@ -923,6 +964,7 @@ import sys, json, hmac, hashlib
 key = sys.argv[1].strip()
 env = json.load(sys.stdin)
 doc = json.loads(env["payload"])
+doc.pop("required_features", None)
 doc["schema_version"] = 1
 for d in doc.get("domains", []):
     d["waf_mode"] = ""
