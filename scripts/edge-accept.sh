@@ -1067,6 +1067,8 @@ if [ "${PROD_TIMING:-0}" = "1" ]; then
   OUT=$(cb -X PUT "$API/v1/domains/$DOM/origin" -H 'Content-Type: application/json' \
     -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}")
   check "o) origin RESTORED (9003 -> 9001)" "$(codeof "$OUT")" "200"
+  until_ok ${PROPAGATE_TIMEOUT} "o) restored origin (9001) reached the edge" \
+    'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
 fi
 
 # --- p) empty token degrades to last-good; restore resumes one cycle ------------
@@ -1087,8 +1089,10 @@ P_START=$(date -u +%Y-%m-%dT%H:%M:%S)
 # stays live. Expected: 0 non-200s (snapshot loads at boot, no deny-all push).
 NON200=0
 : > "$SECRETS/token"  # empty the token file on the host (live :ro bind mount)
-dc restart poller >/dev/null 2>&1
-echo "     p) poller restarted with empty token (live: $P_START)"
+P_RESTART=$(date +%s)
+dc up -d --build --force-recreate poller >/dev/null 2>&1
+P_UP=$(date +%s)
+echo "     p) poller restarted with empty token (live: $P_START, rebuild: $((P_UP - P_START))s from file-empty to container-up)"
 # Wait for the boot-degrade log line: this is the item 2c signal that a missing
 # token degraded instead of fataling.
 until_ok 20 "p) poller booted DEGRADED: no node token, serving last-good (not polling)" \
