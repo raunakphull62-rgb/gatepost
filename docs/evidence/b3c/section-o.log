@@ -1,0 +1,26 @@
+== 14:46:13 setup
+== 14:46:49 origin-test fixture through the edge
+== 14:46:51 a) cold start with the API down and a saved snapshot
+== 14:47:09 b) cold start with NO snapshot: 421 for every host
+== 14:47:25 c) tampered snapshot rejected; the last-good config keeps serv14:414:47:34 PASS: the poller refetches a good config after the no-snapshot boot
+== 14:56:15 e) spoofed X-Forwarded-For is replaced with the real client IP
+== 14:56:16 f) private and metadata origins are refused, never reached
+== 14:56:16 f2) an origin hostname that later resolves to a metadata address is refused at dial time
+== 14:58:45 g) unknown host: 421 and no certificate attempt
+== 14:58:46 h) allowed host gets a certificate (internal issuer); denied host does not
+== 14:58:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
+== 15:05:15 j) the whole run's access log: no secrets, no query strings
+== 15:05:22 j) the whole run's access log: no secrets, no query strings
+== 15:05:23 k) B3c WAF audit redac15:05:24 PASS: k) WAF audit has no value 'S-Q-Q' (q/body/path/cookie/auth)
+== 15:05:25 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
+== 14:53:54 m) edge RSS with 1/10/100 served hosts
+== 14:55:53 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
+== 14:56:11 o) PROD_TIMING: origin change after 60s silence (leading-edge)
+     o) waiting 60s for the reload cooldown to elapse (no reloads)...
+14:57:11 PASS: o) origin PUT (9001 -> 9003)
+14:57:17 PASS: o) new origin reached the edge
+     o) origin change after 60s silence reached the edge in 6s (target: < 10s)
+14:57:17 PASS: o) latency 6s — leading-edge cooldown (applied at next poll)
+14:57:17 PASS: o) origin RESTORED (9003 -> 9001)
+
+== 14:57:17 verdict

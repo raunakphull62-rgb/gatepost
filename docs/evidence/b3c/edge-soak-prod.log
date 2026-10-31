@@ -1,0 +1,70 @@
+=== edge live soak: production pacing, API down 5 min ===
+DELETE 1
+DELETE 1
+DELETE 1
+[soak] stale test data cleaned from database
+[soak] DNS stub up on :5344
+[soak] API up at 15:04:54
+[soak] edge + origin-test up (production pacing: 60s cooldown, 5s poll, 60s backoff)
+[soak] signup: HTTP 200
+[soak] verify: HTTP 200
+[soak] node minted
+[soak] domain claimed: soak-1793459093.example.test
+[soak] domain verify: HTTP 200
+[soak] origin set: http://192.88.99.10:9001 at 15:04:58
+[soak] poller up at 15:05:22
+[soak] snapshot applied at 15:05:22
+[soak] edge serves origin-test at 15:05:23
+
+[soak] docker inspect BEFORE:
+  edge:    0 2026-10-31T15:04:56.359985061Z
+  poller:  0 2026-10-31T15:05:21.948514508Z
+[soak] traffic generator started (PID 870589) at 15:05:23
+[soak] stopping the API for 5 minutes at 15:05:28
+[soak] API down soak: 5m remaining (15:05:28)
+[soak] API down soak: 4m remaining (15:06:28)
+[soak] API down soak: 3m remaining (15:07:28)
+[soak] API down soak: 2m remaining (15:08:28)
+[soak] API down soak: 1m remaining (15:09:28)
+[soak] 5-minute soak complete at 15:10:28
+
+=== EVIDENCE ===
+
+--- docker inspect AFTER (RestartCount StartedAt): ---
+  edge:    0 2026-10-31T15:04:56.359985061Z
+  poller:  0 2026-10-31T15:05:21.948514508Z
+
+--- docker inspect BEFORE (for comparison): ---
+  edge:    0 2026-10-31T15:04:56.359985061Z
+  poller:  0 2026-10-31T15:05:21.948514508Z
+
+--- RestartCount comparison: ---
+  edge:    before=0 after=0
+  poller:  before=0 after=0
+PASS: edge RestartCount unchanged
+PASS: poller RestartCount unchanged
+
+--- non-200 response count during soak window: ---
+  total responses sampled: 591
+  non-200 responses: 0
+  connection failures (000): 0
+PASS: zero non-200 responses
+
+--- poller log: health error scan: ---
+  'apply loop silent' lines: 0
+  'health:' error lines: 0
+PASS: no apply loop silent
+PASS: no health errors
+
+--- poller log (last 50 lines): ---
+poller-1  | 2026/10/31 15:05:22 gatepost-edge starting: api=http://172.17.0.1:8090 state=/state ask=127.0.0.1:8099 admin=127.0.0.1:2019 issuer=internal cert_cap=50/h access_log=/data/logs/access.json
+poller-1  | 2026/10/31 15:05:22 applied snapshot generation 585: 1 domain(s), 1 allowed hostname(s)
+poller-1  | 2026/10/31 15:05:32 ERROR poll failed (streak 1): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 15:06:03 ERROR poll failed (streak 3): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 15:06:46 ERROR poll failed (streak 4): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 15:06:46 WARNING poll failure streak 4 — backoff ladder capped at 1m0s; the last good config keeps serving
+poller-1  | 2026/10/31 15:07:40 ERROR poll failed (streak 5): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 15:08:36 ERROR poll failed (streak 6): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+poller-1  | 2026/10/31 15:09:30 ERROR poll failed (streak 7): Get "http://172.17.0.1:8090/node/v1/config": dial tcp 172.17.0.1:8090: connect: connection refused
+
+=== soak verdict: PASSED ===
