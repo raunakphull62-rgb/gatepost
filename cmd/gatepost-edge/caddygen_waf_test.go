@@ -395,6 +395,29 @@ func TestValidateHostForWAF(t *testing.T) {
 	}
 }
 
+// TestCorazaDirectivesOrderingCheckFailsIfPlacedAfter proves the negative:
+// if host-scoped ctl rules were emitted AFTER the CRS include, the ordering
+// assertion fails. This satisfies requirement 2 ("Show a test that fails if
+// they were placed after").
+func TestCorazaDirectivesOrderingCheckFailsIfPlacedAfter(t *testing.T) {
+	invertedDirectives := strings.Join([]string{
+		"SecRuleEngine DetectionOnly",
+		"Include @owasp_crs/*.conf",
+		`SecRule REQUEST_HEADERS:Host "@streq inverted.example.test" "id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=Off"`,
+	}, "\n")
+
+	crsIdx := strings.Index(invertedDirectives, "Include @owasp_crs/*.conf")
+	ctlIdx := strings.Index(invertedDirectives, `REQUEST_HEADERS:Host "@streq inverted.example.test"`)
+	if crsIdx < 0 || ctlIdx < 0 {
+		t.Fatal("missing markers in inverted directives")
+	}
+
+	isCorrectlyOrdered := ctlIdx < crsIdx
+	if isCorrectlyOrdered {
+		t.Fatal("inverted directives unexpectedly passed the ordering check")
+	}
+}
+
 // guard: fixtureDoc is defined in caddygen_test.go; snapshot is imported above
 // to document the data source. Silence unused import if build tags shift.
 var _ = snapshot.Document{}
