@@ -859,11 +859,51 @@ else
   fail "m) psql not available — skipping RSS test (DB_URL empty or psql missing)"
 fi
 
-# --- n) schema-1 snapshot backward-compat (old edge artifact) --------------------
-# An "old edge" artifact: a snapshot signed with the SAME key but schema_version=1
-# (no waf_mode field). The current edge must accept it and default WAFMode to
-# "detection" via snapshotDomainWAF — the schema bump is backward-compatible.
-section "n) schema-1 snapshot backward-compat (old edge artifact)"
+# --- n) schema versions, BOTH directions -------------------------------------
+# Direction 1 — OLD code on a NEW snapshot: the v0.4-edge binary (schema-1,
+# pre-WAF) reads the current schema-2 snapshot. The old Verify has no schema
+# gate and encoding/json ignores unknown fields, so the honest expectation
+# is NOT a refusal: the old poller APPLIES the snapshot (adopting every
+# domain, silently dropping the WAF fields) and traffic keeps flowing. This
+# pins the safety property — serving continuity — and the new poller is
+# proven to heal the WAF-less config on its next boot.
+# Direction 2 — NEW code on an OLD snapshot: a snapshot signed with the SAME
+# key but schema_version=1 (no waf_mode field). The current edge must accept
+# it and default WAFMode to "detection" via snapshotDomainWAF — the schema
+# bump is backward-compatible.
+section "n) schema versions both directions (old node on schema-2; new node on schema-1)"
+OLD_DIR=$(mktemp -d /tmp/opencode/oldnode-XXXXXX)
+OLD_BIN="$OLD_DIR/old-edge"
+if git archive v0.4-edge | tar -x -C "$OLD_DIR" \
+   && (cd "$OLD_DIR" && CGO_ENABLED=0 go build -o old-edge ./cmd/gatepost-edge) \
+   && [ -x "$OLD_BIN" ]; then
+  pass "n) old node binary (v0.4-edge tag, schema-1 code) built from git"
+  dc stop poller >/dev/null 2>&1
+  N_OLD=$(date -u +%Y-%m-%dT%H:%M:%S)
+  # One-off container from the poller service definition (same netns as the
+  # edge, same secrets/state volumes, same env) running the OLD binary.
+  if dc run -d --rm --name accept-old-poller --entrypoint /old/old-edge \
+      -v "$OLD_BIN:/old/old-edge:ro" poller >/dev/null 2>&1; then
+    until_ok ${PROPAGATE_TIMEOUT} "n) OLD node applied the on-disk schema-2 snapshot" \
+      'sudo docker logs --since "$N_OLD" accept-old-poller 2>/dev/null | grep -q "applied snapshot generation"'
+    check "n) old-code edge keeps serving $HOST (schema-2 read by schema-1 code)" \
+      "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+    check "n) old-code edge keeps serving $WAF_B" \
+      "$(curl -s -H "Host: $WAF_B" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+    echo "     n) note: old code drops the WAF fields (no schema gate in v0.4 Verify) — WAF directives now: $(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRule') (expected 0)"
+  else
+    fail "n) old-node container did not start"
+  fi
+  sudo docker stop -t 5 accept-old-poller >/dev/null 2>&1
+  # Heal: the NEW poller re-applies the on-disk schema-2 snapshot at boot —
+  # with the WAF directives the old code had dropped.
+  dc start poller >/dev/null 2>&1
+  until_ok ${PROPAGATE_TIMEOUT} "n) new poller re-applied schema-2 with WAF directives restored" \
+    'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=On"'
+  rm -rf "$OLD_DIR"
+else
+  fail "n) could not build the old node binary from v0.4-edge (direction-1 test skipped)"
+fi
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
   # Read the on-disk snapshot from the poller volume.
   CUR_SNAPSHOT=$(dc exec poller cat /state/snapshot.json 2>/dev/null)
