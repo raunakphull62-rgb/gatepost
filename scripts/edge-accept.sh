@@ -31,6 +31,8 @@
 #      requiring an unknown feature and keeps its last good config; a schema-1
 #      snapshot is still accepted (backward compat, defaults to detection)
 #   o) [PROD_TIMING=1] origin change after 60s silence reaches the edge in ~10s
+#   p) empty token → restart → degraded serves last-good → restore resumes
+#      polling in one cycle, no restart; non-200 blip counted (expect 0)
 #
 # Secrets stay in deploy/dev/secrets/ (gitignored) and .env; nothing
 # secret is printed. Exits nonzero on any failure.
@@ -1066,6 +1068,61 @@ if [ "${PROD_TIMING:-0}" = "1" ]; then
     -d "{\"scheme\":\"http\",\"address\":\"$ORIGIN_IP\",\"port\":9001,\"tls_verify\":false}")
   check "o) origin RESTORED (9003 -> 9001)" "$(codeof "$OUT")" "200"
 fi
+
+# --- p) empty token degrades to last-good; restore resumes one cycle ------------
+# Item 2c: a boot with an empty node token must NOT crash-loop. The poller loads
+# the saved snapshot (Caddy's live JSON is untouched), enters degraded mode,
+# and keeps serving last-good. Because the token file (a live :ro bind mount)
+# is re-read every poll tick, restoring the secret on the host resumes polling
+# within one cycle — no second restart. The /health endpoint stays 200 with the
+# degraded reason in the body, so the supervisor does NOT thrash the container.
+section "p) empty token → degrade serves last-good → restore resumes, no restart"
+# Save the live token, then empty it on the host. The bind mount is live even
+# under :ro, so the poller sees the emptied content on its next file read.
+TOKEN_BAK="$(cat "$SECRETS/token" 2>/dev/null)"
+check_ne "p) saved the live node token before emptying" "$TOKEN_BAK" ""
+P_START=$(date -u +%Y-%m-%dT%H:%M:%S)
+# Non-200 counter: steady traffic through the degrade restart. The edge (Caddy)
+# is a SEPARATE container — only the poller restarts — so its last-good JSON
+# stays live. Expected: 0 non-200s (snapshot loads at boot, no deny-all push).
+NON200=0
+: > "$SECRETS/token"  # empty the token file on the host (live :ro bind mount)
+dc restart poller >/dev/null 2>&1
+echo "     p) poller restarted with empty token (live: $P_START)"
+# Wait for the boot-degrade log line: this is the item 2c signal that a missing
+# token degraded instead of fataling.
+until_ok 20 "p) poller booted DEGRADED: no node token, serving last-good (not polling)" \
+  'dc logs --since "$P_START" poller 2>/dev/null | grep -q "no node token: serving last-good config, not polling"'
+# Count non-200s over ~15s of steady traffic (covers restart blip + a few ticks).
+for _ in $(seq 1 15); do
+  c=$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")
+  [ "$c" != "200" ] && NON200=$((NON200+1))
+  sleep 1
+done
+# /health must be 200 even in degraded mode, with the reason in the body.
+HEALTH_CODE=$(dc exec poller wget -S -O /dev/null 'http://127.0.0.1:8099/health' 2>&1 | grep -c 'HTTP/1.1 200')
+check "p) /health is 200 in degraded mode" "$HEALTH_CODE" "1"
+HEALTH_BODY=$(dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/null || true)
+check "p) /health body names the degraded reason" \
+  "$(printf '%s' "$HEALTH_BODY" | grep -c 'degraded')" "1"
+# Degraded 200 service: the edge keeps serving last-good from Caddy's live JSON.
+check "p) degraded: edge serves 200 from last-good (steady traffic)" \
+  "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+# The restart blip: non-200 count must be 0 (last-good loads at boot, not deny-all).
+check "p) non-200 count during degrade restart blip = 0 (last-good at boot)" "$NON200" "0"
+# Restore the token — NO second restart. The poller re-reads the file on its
+# next tick and resumes polling within one cycle, signaled by the leaveDegraded
+# "resumed polling" log line.
+printf '%s' "$TOKEN_BAK" > "$SECRETS/token" && chmod 644 "$SECRETS/token"
+echo "     p) token restored at $(date +%H:%M:%S), waiting for resume (no restart)"
+until_ok 20 "p) poller resumed polling: one cycle, no restart" \
+  'dc logs --since "$P_START" poller 2>/dev/null | grep -q "resumed polling: node token restored (was degraded)"'
+# Exactly one transition line: no flood, no flapping.
+check "p) resumed polling logged once (transition, not flood)" \
+  "$(dc logs --since "$P_START" poller 2>/dev/null | grep -c 'resumed polling: node token restored')" "1"
+# Edge still serves 200 — the resume path has no blip of its own.
+check "p) edge still serves 200 after token restore (no restart)" \
+  "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
 section "verdict"
 FINISHED=1
