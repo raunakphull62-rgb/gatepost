@@ -14,22 +14,13 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-type fakeWAFHandler struct {
-	panicVal any
-	sleepFor time.Duration
-}
+type fakeWAFHandler struct{}
 
 func (f *fakeWAFHandler) Provision(ctx caddy.Context) error { return nil }
 func (f *fakeWAFHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{ID: "test.fakeWAF", New: func() caddy.Module { return new(fakeWAFHandler) }}
 }
 func (f *fakeWAFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if f.sleepFor > 0 {
-		time.Sleep(f.sleepFor)
-	}
-	if f.panicVal != nil {
-		panic(f.panicVal)
-	}
 	return next.ServeHTTP(w, r)
 }
 
@@ -54,7 +45,7 @@ func (a *handlerAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
-func newTestHandler(t *testing.T, mode string, panicVal any, sleepFor time.Duration) (*FailOpenHandler, *fakeReverseProxy) {
+func newTestHandler(t *testing.T, mode string, fault *FaultConfig) (*FailOpenHandler, *fakeReverseProxy) {
 	t.Helper()
 	rfp := &fakeReverseProxy{}
 	h := &FailOpenHandler{
@@ -62,7 +53,8 @@ func newTestHandler(t *testing.T, mode string, panicVal any, sleepFor time.Durat
 		ConcurrentEvaluations: 1,
 		ConcurrencyWait:       "50ms",
 		Mode:                  mode,
-		WAF:                   &fakeWAFHandler{panicVal: panicVal, sleepFor: sleepFor},
+		WAF:                   &fakeWAFHandler{},
+		Fault:                 fault,
 	}
 	if err := h.parseConfig(); err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -73,7 +65,7 @@ func newTestHandler(t *testing.T, mode string, panicVal any, sleepFor time.Durat
 }
 
 func TestPanicFailClosedInBlockingMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", "nil-deref", 0)
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Panic: "nil-deref"})
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("panic propagated to caller: %v", r)
@@ -101,7 +93,7 @@ func TestPanicFailClosedInBlockingMode(t *testing.T) {
 }
 
 func TestPanicFailOpenInDetectionMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "detection", "nil-deref", 0)
+	h, rfp := newTestHandler(t, "detection", &FaultConfig{Panic: "nil-deref"})
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("panic propagated: %v", r)
@@ -125,7 +117,7 @@ func TestPanicFailOpenInDetectionMode(t *testing.T) {
 }
 
 func TestTimeoutFailClosedInBlockingMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", nil, 500*time.Millisecond)
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: 500 * time.Millisecond})
 	req := httptest.NewRequest("GET", "http://block.example.test/foo", nil)
 	rec := httptest.NewRecorder()
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +137,7 @@ func TestTimeoutFailClosedInBlockingMode(t *testing.T) {
 }
 
 func TestTimeoutFailOpenInDetectionMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "detection", nil, 500*time.Millisecond)
+	h, rfp := newTestHandler(t, "detection", &FaultConfig{Sleep: 500 * time.Millisecond})
 	req := httptest.NewRequest("GET", "http://det.example.test/foo", nil)
 	rec := httptest.NewRecorder()
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +156,7 @@ func TestTimeoutFailOpenInDetectionMode(t *testing.T) {
 }
 
 func TestSaturationFailClosedInBlockingMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", nil, 200*time.Millisecond)
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: 200 * time.Millisecond})
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rfp.ServeHTTP(w, r)
 	})}
@@ -221,7 +213,7 @@ func TestStatsEndpoint(t *testing.T) {
 }
 
 func TestFailOpenNoPayloadEcho(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", "panic", 0)
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Panic: "panic"})
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rfp.ServeHTTP(w, r)
 	})}
