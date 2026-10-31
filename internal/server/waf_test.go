@@ -136,3 +136,47 @@ func TestPutWAFNilExclusions(t *testing.T) {
 		t.Errorf("DB excluded_rule_ids = %v, want empty", ids)
 	}
 }
+
+// TestPutWAFValidationAndIsolation tests the API requirements from item 4:
+// - another user's domain gives 404
+// - bad mode gives 400
+// - rule id outside 1..999999 gives 400
+func TestPutWAFValidationAndIsolation(t *testing.T) {
+	pool := testPool(t)
+	c1, _ := newTestServer(t, pool)
+	signupOn(t, pool, c1, "waf-user1@x.test")
+	dom1 := claimRow(t, c1, "waf-user1.example.com")
+
+	c2, _ := newTestServer(t, pool)
+	signupOn(t, pool, c2, "waf-user2@x.test")
+
+	// 1. Another user's domain gives 404 (tenant isolation)
+	code, body := c2.do("PUT", "/v1/domains/"+dom1.ID+"/waf", `{"mode":"blocking"}`)
+	if code != http.StatusNotFound {
+		t.Fatalf("another user's domain: want 404, got %d: %s", code, body)
+	}
+
+	// 2. Bad mode gives 400
+	code, body = c1.do("PUT", "/v1/domains/"+dom1.ID+"/waf", `{"mode":"invalid_mode"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("bad mode: want 400, got %d: %s", code, body)
+	}
+
+	// 3. Rule ID outside 1..999999 gives 400
+	for _, badID := range []int{0, -1, 1000000} {
+		payload, _ := json.Marshal(map[string]any{
+			"mode":              "blocking",
+			"excluded_rule_ids": []int{badID},
+		})
+		code, body = c1.do("PUT", "/v1/domains/"+dom1.ID+"/waf", string(payload))
+		if code != http.StatusBadRequest {
+			t.Fatalf("rule ID %d: want 400, got %d: %s", badID, code, body)
+		}
+	}
+
+	// 4. Valid mode and rules give 200
+	code, body = c1.do("PUT", "/v1/domains/"+dom1.ID+"/waf", `{"mode":"blocking","excluded_rule_ids":[942100]}`)
+	if code != http.StatusOK {
+		t.Fatalf("valid WAF PUT: want 200, got %d: %s", code, body)
+	}
+}

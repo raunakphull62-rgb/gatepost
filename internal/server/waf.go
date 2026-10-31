@@ -51,7 +51,7 @@ func (s *Server) putDomainWAF(w http.ResponseWriter, r *http.Request, p *Princip
 		return
 	}
 	if msg := checkWAF(b); msg != "" {
-		fail(w, http.StatusUnprocessableEntity, msg)
+		fail(w, http.StatusBadRequest, msg)
 		return
 	}
 	mode := b.Mode
