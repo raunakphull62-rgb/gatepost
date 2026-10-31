@@ -885,7 +885,9 @@ if git archive v0.4-edge | tar -x -C "$OLD_DIR" \
   if dc run -d --rm --name accept-old-poller --entrypoint /old/old-edge \
       -v "$OLD_BIN:/old/old-edge:ro" poller >/dev/null 2>&1; then
     until_ok ${PROPAGATE_TIMEOUT} "n) OLD node applied the on-disk schema-2 snapshot" \
-      'sudo docker logs --since "$N_OLD" accept-old-poller 2>/dev/null | grep -q "applied snapshot generation"'
+      # 2>&1 (not 2>/dev/null): the poller logs to stderr and docker logs
+      # routes container stderr to its own — discarding it hides every line.
+      'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "applied snapshot generation"'
     check "n) old-code edge keeps serving $HOST (schema-2 read by schema-1 code)" \
       "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
     check "n) old-code edge keeps serving $WAF_B" \
@@ -962,13 +964,14 @@ print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
     N_START2=$(date -u +%Y-%m-%dT%H:%M:%S)
     until_ok ${PROPAGATE_TIMEOUT} "n) poller refetched the schema-2 snapshot from the API" \
       'dc logs --since "$N_START2" poller 2>/dev/null | grep -q "applied snapshot generation"'
-    # The schema-2 refetch's content differs from schema-1 (WAF_B has
-    # waf_mode="off" → ctl:ruleEngine=Off appears; schema-1 has waf_mode="" →
-    # defaults to detection, no host-scoped Off). Checking only "port 9001"
-    # would be a false positive: the edge was already serving 9001 from schema-1.
-    # We confirm the schema-2 reload by checking for the host-scoped Off rule.
+    # The schema-2 refetch's content differs from schema-1 (WAF_B ends
+    # section l in BLOCKING → ctl:ruleEngine=On appears; schema-1 has
+    # waf_mode="" → defaults to detection, no host-scoped ctl rules).
+    # Checking only "port 9001" would be a false positive: the edge was
+    # already serving 9001 from schema-1. We confirm the schema-2 reload
+    # by checking for the host-scoped On rule.
     until_ok ${PROPAGATE_TIMEOUT} "n) schema-2 config applied to edge" \
-      'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001" && dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=Off"'
+      'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001" && dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "ctl:ruleEngine=On"'
   else
     fail "n) no on-disk snapshot found in poller volume"
   fi
