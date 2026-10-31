@@ -1,234 +1,244 @@
 
-== 14:46:13 setup
+== 15:22:27 setup
   pacing: production pacing (poll 5s + reload cooldown 60s + backoff cap 60s)
-DELETE 1
-DELETE 2
-DELETE 1
-14:46:13 PASS: PROD_TIMING: stale test data cleaned from database
-14:46:25 PASS: snapshot key material is non-empty
-14:46:25 PASS: no host route squats the origin fixture's range (192.88.99.0/24)
-14:46:26 PASS: DNS stub up on 127.0.0.1:5344 (TXT verify + A answers)
-14:46:26 PASS: API up on http://172.17.0.1:8090
-14:46:28 PASS: compose stack rebuilt: edge + origin-test (fresh volumes)
-14:46:28 PASS: operator signup
-14:46:28 PASS: operator verified (mail loop)
-14:46:28 PASS: node minted (201)
-14:46:28 PASS: node token material is non-empty
-14:46:28 PASS: claim accept-a-1793457973-16383.example.test
-14:46:28 PASS: verify accept-a-1793457973-16383.example.test against the TXT stub
-14:46:28 PASS: origin set: http://192.88.99.10:9001 (public-range fixture)
-14:46:28 PASS: claim accept-d-1793457973-16383.example.test (left UNVERIFIED on purpose)
-14:46:48 PASS: poller up (node token from deploy/dev/secrets/token)
-14:46:48 PASS: poller applied the snapshot
-14:46:49 PASS: edge serves accept-a-1793457973-16383.example.test from origin-test
-14:46:49 PASS: snapshot fetched and the edge serves the origin through the tunnel
+DELETE 0
+DELETE 0
+DELETE 0
+15:22:28 PASS: PROD_TIMING: stale test data cleaned from database
+15:22:30 PASS: snapshot key material is non-empty
+15:22:30 PASS: no host route squats the origin fixture's range (192.88.99.0/24)
+15:22:30 PASS: DNS stub up on 127.0.0.1:5344 (TXT verify + A answers)
+15:22:31 PASS: API up on http://172.17.0.1:8090
+15:22:33 PASS: compose stack rebuilt: edge + origin-test (fresh volumes)
+15:22:33 PASS: operator signup
+15:22:33 PASS: operator verified (mail loop)
+15:22:33 PASS: node minted (201)
+15:22:33 PASS: node token material is non-empty
+15:22:33 PASS: claim accept-a-1793460147-23856.example.test
+15:22:33 PASS: verify accept-a-1793460147-23856.example.test against the TXT stub
+15:22:33 PASS: origin set: http://192.88.99.10:9001 (public-range fixture)
+15:22:33 PASS: claim accept-d-1793460147-23856.example.test (left UNVERIFIED on purpose)
+15:22:54 PASS: poller up (node token from deploy/dev/secrets/token)
+15:22:54 PASS: poller applied the snapshot
+15:22:54 PASS: edge serves accept-a-1793460147-23856.example.test from origin-test
+15:22:54 PASS: snapshot fetched and the edge serves the origin through the tunnel
 
-== 14:46:49 origin-test fixture through the edge
-14:46:51 PASS: /slow: delayed body, >= 2s (took 2.044524s)
-14:46:51 PASS: /big: 5 MiB streamed body
-14:46:51 PASS: /redirect: edge passes the 302 through (does not follow)
-14:46:51 PASS: /redirect: Location header survives
-14:46:51 PASS: /redirect: a following client lands on /ok
-14:46:51 PASS: /cookie: Set-Cookie passes through
-14:46:51 PASS: /status/503: status code passes through
-14:46:51 PASS: /chunked: chunked transfer to the client
-14:46:51 PASS: /chunked: all three chunks arrived
+== 15:22:54 origin-test fixture through the edge
+15:22:56 PASS: /slow: delayed body, >= 2s (took 2.043351s)
+15:22:56 PASS: /big: 5 MiB streamed body
+15:22:56 PASS: /redirect: edge passes the 302 through (does not follow)
+15:22:56 PASS: /redirect: Location header survives
+15:22:56 PASS: /redirect: a following client lands on /ok
+15:22:56 PASS: /cookie: Set-Cookie passes through
+15:22:56 PASS: /status/503: status code passes through
+15:22:56 PASS: /chunked: chunked transfer to the client
+15:22:56 PASS: /chunked: all three chunks arrived
 
-== 14:46:51 a) cold start with the API down and a saved snapshot
-14:46:52 PASS: API is down
-14:47:09 PASS: the cold-started edge serves from the SAVED snapshot
-14:47:09 PASS: a) https serves the snapshot (on-demand internal cert)
-14:47:09 PASS: a) https serves too (ask answers from the snapshot, internal cert)
+== 15:22:56 a) cold start with the API down and a saved snapshot
+15:22:57 PASS: API is down
+15:23:14 PASS: the cold-started edge serves from the SAVED snapshot
+15:23:14 PASS: a) https serves the snapshot (on-demand internal cert)
+15:23:14 PASS: a) https serves too (ask answers from the snapshot, internal cert)
 
-== 14:47:09 b) cold start with NO snapshot: 421 for every host
-14:47:25 PASS: the no-snapshot edge takes the deny-all posture
-14:47:25 PASS: b) known host over http = 421
-14:47:25 PASS: b) denied host over http = 421
-14:47:25 PASS: b) unknown host over http = 421
-14:47:25 PASS: b) known host over https = 421 (fallback cert, no ask answer)
-14:47:25 PASS: b) denied host over https = 421 (fallback cert, no ask answer)
-14:47:25 PASS: b) unknown host over https = 421 (fallback cert, no ask answer)
+== 15:23:14 b) cold start with NO snapshot: 421 for every host
+15:23:30 PASS: the no-snapshot edge takes the deny-all posture
+15:23:30 PASS: b) known host over http = 421
+15:23:30 PASS: b) denied host over http = 421
+15:23:30 PASS: b) unknown host over http = 421
+15:23:30 PASS: b) known host over https = 421 (fallback cert, no ask answer)
+15:23:30 PASS: b) denied host over https = 421 (fallback cert, no ask answer)
+15:23:30 PASS: b) unknown host over https = 421 (fallback cert, no ask answer)
 
-== 14:47:25 c) tampered snapshot rejected; the last-good config keeps serv14:414:47:34 PASS: the poller refetches a good config after the no-snapshot boot
-14:47:34 PASS: c) edge serves while the on-disk snapshot is tampered (caddy untouched)
-1414:49:44 FAIL: the poller refetches a good config after the no-snapshot boot did not happen within 180s
-14:49:45 FAIL: c) edge serves while the on-disk snapshot is tampered (c14:50:35 FAIL: c) the last-good config kept serving across the poller restart did not happen within 180s
-14:50:35 FAIL: c) the tampered bytes w14:53:15 FAIL: c) the last-good config kept serving across the poller restart did not happen within 180s
-14:53:15 FAIL: c) the tampered bytes were never applied (still origin 9001) (want '1', got '0')
+== 15:23:30 c) tampered snapshot rejected; the last-good config keeps serving
+15:24:31 PASS: the poller refetches a good config after the no-snapshot boot
+15:24:31 PASS: c) edge serves while the on-disk snapshot is tampered (caddy untouched)
+15:24:32 PASS: the restarted poller REJECTS the tampered snapshot (log line)
+15:24:32 PASS: c) the last-good config kept serving across the poller restart
+15:24:32 PASS: c) the tampered bytes were never applied (still origin 9001)
 
-=14:53:35 FAIL: the new origin reaches the edge did not happen within 180s
-     origin change reached the edge in 180s (production pacing (poll 14:56:15 FAIL: the new origin reaches the edge did not happen within 180s
-     origin change reached the edge in 180s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
-14:56:15 FAIL: d) the edge now serves the new origin (want '1', got '0')
+== 15:24:32 d) an API origin change reaches the edge (timed)
+15:24:32 PASS: origin replaced via PUT (port 9001 -> 9002)
+15:25:32 PASS: the new origin reaches the edge
+     origin change reached the edge in 60s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
+15:25:32 PASS: d) the edge now serves the new origin
 
-== 14:56:15 e) spoofed X-Forwarded-For is replaced with the real client IP
-14:56:16 FAIL: e) the origin sees the public hostname as Host (want 'accept-a-1793457910-6733.example.test', got '')
-14:56:16 PASS: e) spoofed XFF replaced with the real client IP ()
-14:56:16 PASS: e) the spoofed value 1.2.3.4 never reached the origin
+== 15:25:32 e) spoofed X-Forwarded-For is replaced with the real client IP
+15:25:32 PASS: e) the origin sees the public hostname as Host
+15:25:32 PASS: e) spoofed XFF replaced with the real client IP (172.28.0.1)
+15:25:32 PASS: e) the spoofed value 1.2.3.4 never reached the origin
 
-== 14:56:16 f) private and metadata origins are refused, never reached
-14:56:16 FAIL: f) origin metadata refused at set time (422) (want '422', got '404')
-14:56:16 FAIL: f) origin private-rfc1918 refused at set time (422) (want '422', got '404')
-14:56:16 FAIL: f) origin loopback refused at set time (422) (want '422', got '404')
-14:56:16 FAIL: f) the edge still serves the last-good origin (want '1', got '0')
+== 15:25:32 f) private and metadata origins are refused, never reached
+15:25:32 PASS: f) origin metadata refused at set time (422)
+15:25:32 PASS: f) origin private-rfc1918 refused at set time (422)
+15:25:32 PASS: f) origin loopback refused at set time (422)
+15:25:32 PASS: f) the edge still serves the last-good origin
 
-== 14:56:16 f2) an origin hostname that later resolves to a metadata address is refused at dial time
-14:56:16 PASS: f2) claim accept-f2-1793457910-6733.example.test
-14:56:16 FAIL: f2) verify accept-f2-1793457910-6733.example.test against the TXT stub (want '200', got '400')
-14:56:16 PASS: f2) hostname origin accepted at set time (resolves public via the stub)
-14:58:16 FAIL: f2) the edge serves the hostname origin (public resolution) did not happen within 120s
-14:58:17 FAIL: f2) the origin saw requests while the resolution was public (0 hit(s)) (got the unwanted '0')
-service "poller" is not running
-14:58:37 FAIL: f2) the edge now 502s the hostname origin (dial-time refusal) did not happen within 20s
-14:58:37 FAIL: f2) refused at dial time: 502, no connection attempted (want '502', got '421')
-14:58:37 FAIL: f2) no dial-time refusal line in the poller log
-14:58:37 FAIL: f2) another request still 502s through a fresh dial (want '502', got '421')
-14:58:45 PASS: f2) the origin listener recorded NO request after the first refusal (0 then, 0 after)
+== 15:25:32 f2) an origin hostname that later resolves to a metadata address is refused at dial time
+15:25:32 PASS: f2) claim accept-f2-1793460147-23856.example.test
+15:25:32 PASS: f2) verify accept-f2-1793460147-23856.example.test against the TXT stub
+15:25:32 PASS: f2) hostname origin accepted at set time (resolves public via the stub)
+15:26:32 PASS: f2) the edge serves the hostname origin (public resolution)
+15:26:32 PASS: f2) the origin saw requests while the resolution was public (1 hit(s))
+15:26:37 PASS: f2) the edge now 502s the hostname origin (dial-time refusal)
+15:26:37 PASS: f2) refused at dial time: 502, no connection attempted
+15:26:37 PASS: f2) the poller logged the dial-time refusal (2 line(s): link-local refused before any dial)
+15:26:38 PASS: f2) another request still 502s through a fresh dial
+15:26:46 PASS: f2) the origin listener recorded NO request after the first refusal (6 then, 6 after)
 
-== 14:58:45 g) unknown host: 421 and no certificate attempt
-14:58:45 PASS: g) unknown host over http = 421
-14:58:45 PASS: g) unknown host over https = 421 (fallback handshake)
-14:58:45 PASS: g) no log line names the stranger (no issuance attempt)
-14:58:46 PASS: g) no certificate file for the stranger
+== 15:26:46 g) unknown host: 421 and no certificate attempt
+15:26:46 PASS: g) unknown host over http = 421
+15:26:46 PASS: g) unknown host over https = 421 (fallback handshake)
+15:26:46 PASS: g) no log line names the stranger (no issuance attempt)
+15:26:46 PASS: g) no certificate file for the stranger
 
-== 14:58:46 h) allowed host gets a certificate (internal issuer); denied host does not
-14:58:46 FAIL: h) the allowed host's certificate carries the hostname (want '1', got '0')
-14:58:46 FAIL: h) the allowed host's certificate is persisted (got the unwanted '0')
-14:58:46 PASS: h) the ask endpoint refuses the denied host (421)
-14:58:46 PASS: h) the denied host completes TLS only on the FALLBACK cert (SAN: edge.invalid)
-14:58:46 PASS: h) the denied host's cert does not name it
-14:58:46 PASS: h) the denied host serves 421
-14:58:46 PASS: h) no certificate file for the denied host
+== 15:26:46 h) allowed host gets a certificate (internal issuer); denied host does not
+15:26:46 PASS: h) the allowed host's certificate carries the hostname
+15:26:46 PASS: h) the allowed host's certificate is persisted
+15:26:46 PASS: h) the ask endpoint refuses the denied host (421)
+15:26:46 PASS: h) the denied host completes TLS only on the FALLBACK cert (SAN: edge.invalid)
+15:26:46 PASS: h) the denied host's cert does not name it
+15:26:46 PASS: h) the denied host serves 421
+15:26:46 PASS: h) no certificate file for the denied host
 
-== 14:58:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
-14:58:47 PASS: i) the API is down
-14:58:47 FAIL: i) the edge keeps serving with the API down (want '1', got '0')
-14:58:55 PASS: i) poll 14:59:14 FAIL: the edge recovers: the change propagates again did not happen within 180s
-     recovery: the post-restart change reached the edge in 180s (production pacing (po15:01:55 FAIL: the edge recovers: the change propagates again did not happen within 180s
-     recovery: the post-restar15:02:14 FAIL: i) the poller logged the 401 (bounded poll, no fixed sleep) did not happen within 180s
-15:02:14 FAIL: i) the 401 was logged once (throttled), not once per poll 15:04:55 FAIL: i) the poller logged the 401 (bounded poll, no fixed sleep) did not happen within 180s
-15:04:55 FAIL: i) the 401 was logged once (throttled), not once per poll tick (want '1', got '0')
-15:04:55 FAIL: i) the revoked node keeps serving the last-good config (want '1', got '0')
-15:04:55 FAIL: i) node re-minted for post-revocation sections (201) (want '201', got '403')
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-    import json,sys; print(json.load(sys.stdin)["token"])
-                           ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
-KeyError: 'token'
-Traceback (most recent call last):
-15:05:15 FAIL: i) poller resumed with fresh node did not happen within 180s
+== 15:26:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
+15:26:47 PASS: i) the API is down
+15:26:47 PASS: i) the edge keeps serving with the API down
+15:26:55 PASS: i) poll failures are throttled in the poller log (1 line(s) in a minute, not one per 5s tick)
+15:26:55 PASS: origin PUT after the API restart (recovery probe)
+15:27:33 PASS: the edge recovers: the change propagates again
+     recovery: the post-restart change reached the edge in 38s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
+15:27:33 PASS: node revoked (idempotent route)
+15:27:36 PASS: i) the poller logged the 401 (bounded poll, no fixed sleep)
+15:27:36 PASS: i) the 401 was logged once (throttled), not once per poll tick
+15:27:36 PASS: i) the revoked node keeps serving the last-good config
+15:27:36 PASS: i) node re-minted for post-revocation sections (201)
+15:27:37 PASS: i) poller resumed with fresh node
 
-== 15:05:15 j) the whole run's access log: no secrets, no query strings
-cat: can't open '/data/log15:05:22 PASS: i) poller resumed with fresh node
+== 15:27:37 j) the whole run's access log: no secrets, no query strings
+15:27:37 PASS: the access log recorded the run (246 requests)
+15:27:37 PASS: j) the access log has no 'SECRET123'
+15:27:37 PASS: j) the access log has no 'code=abc'
+15:27:37 PASS: j) the access log has no 'token='
+15:27:37 PASS: j) the access log has no 'LEAK-AUTH-123'
+15:27:37 PASS: j) the access log has no 'LEAK-COOKIE-456'
+15:27:37 PASS: j) the access log has no 'LEAK-APIKEY-789'
+15:27:37 PASS: j) the access log has no 'LEAK-REF-321'
+15:27:37 PASS: j) the access log has no 'Authorization'
+15:27:37 PASS: j) the access log has no 'Cookie'
+15:27:37 PASS: j) the access log has no 'X-Api-Key'
+15:27:37 PASS: j) the access log has no 'Referer'
+15:27:37 PASS: j) the access log has no 'Set-Cookie'
+15:27:37 PASS: j) the access log has no 'gporigin='
+15:27:37 PASS: j) the access log has no '1.2.3.4'
+15:27:37 PASS: j) the access log has no run secret (sha256 1a454e5c585d)
+15:27:37 PASS: j) the access log has no run secret (sha256 d4bcb1f06885)
+15:27:37 PASS: j) not one question mark anywhere (no query strings at all)
+15:27:37 PASS: j) every line: user_agent present, no uri/headers/resp_headers
+15:27:37 PASS: j) no access entry ever reached the edge container's stderr (docker log)
 
-== 15:05:22 j) the whole run's access log: no secrets, no query strings
-15:05:23 PASS: the access log recorded the run (1 requests)
-15:05:23 PASS: j) the access log has no 'SECRET123'
-15:05:23 PASS: j) the access log has no 'code=abc'
-15:05:23 PASS: j) the access log has no 'token='
-15:05:23 PASS: j) the access log has no 'LEAK-AUTH-123'
-15:05:23 PASS: j) the access log has no 'LEAK-COOKIE-456'
-15:05:23 PASS: j) the access log has no 'LEAK-APIKEY-789'
-15:05:23 PASS: j) the access log has no 'LEAK-REF-321'
-15:05:23 PASS: j) the access log has no 'Authorization'
-15:05:23 PASS: j) the access log has no 'Cookie'
-15:05:23 PASS: j) the access log has no 'X-Api-Key'
-15:05:23 PASS: j) the access log has no 'Referer'
-15:05:23 PASS: j) the access log has no 'Set-Cookie'
-15:05:23 PASS: j) the access log has no 'gporigin='
-15:05:23 FAIL: j) the access log has no '' (want '0', got '1')
-15:05:23 PASS: j) the access log has no 'soak-1793342160-8719ba941b5eededf7fc7b20cd236933'
-15:05:23 PASS: j) the access log has no '1.2.3.4'
-15:05:23 PASS: j) not one question mark anywhere (no query strings at all)
-15:05:23 PASS: j) every line: user_agent present, no uri/headers/resp_headers
-15:05:23 PASS: j) no access entry ever reached the edge container's stderr (docker log)
+== 15:27:37 k) B3c WAF audit redaction (detection-only, in-process, no values)
+15:27:37 PASS: k) coraza handler present in the edge config
+15:27:40 PASS: k) WAF audit has no value 'S-Q-Q' (q/body/path/cookie/auth)
+15:27:40 PASS: k) WAF audit has no value 'S-Q-B' (q/body/path/cookie/auth)
+15:27:40 PASS: k) WAF audit has no value 'S-Q-P' (q/body/path/cookie/auth)
+15:27:40 PASS: k) WAF audit has no value 'S-Q-C' (q/body/path/cookie/auth)
+15:27:40 PASS: k) WAF audit has no value 'S-Q-A' (q/body/path/cookie/auth)
+15:27:40 PASS: k) no '?' anywhere in the WAF audit log (no URI query)
+15:27:40 PASS: k) rule 913100 still logged (detection intact)
+15:27:40 PASS: k) [data] fields blanked by the redacted formatter
+15:27:40 PASS: k) [uri] fields blanked by the redacted formatter
+15:27:40 PASS: k) audit log mode is 0644 (no shared-volume 0666)
 
-== 15:05:23 k) B3c WAF audit redac15:05:24 PASS: k) WAF audit has no value 'S-Q-Q' (q/body/path/cookie/auth)
-15:05:24 PASS: k) WAF audit ha15:05:25 PASS: k) WAF audit has no value 'S-Q-Q' (q/body/path/cookie/auth)
-15:05:25 PASS: k) WAF audit has no value 'S-Q-B' (q/body/path/cookie/auth)
-15:05:25 PASS: k) WAF audit has no value 'S-Q-P' (q/body/path/cookie/auth)
-15:05:25 PASS: k) WAF audit has no value 'S-Q-C' (q/body/path/cookie/auth)
-15:05:25 PASS: k) WAF audit has no value 'S-Q-A' (q/body/path/cookie/auth)
-15:05:25 PASS: k) no '?' anywhere in the WAF audit log (no URI query)
-15:05:25 FAIL: k) rule 913100 still logged (detection intact) (got the unwanted '0')
-15:05:25 FAIL: k) [data] fields blanked by the redacted formatter (got the unwanted '0')
-15:05:25 FAIL: k) [uri] fields blanked by the redacted formatter (got the unwanted '0')
-15:05:25 PASS: k) audit log mode is 0644 (no shared-volume 0666)
+== 15:27:40 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
+15:27:40 PASS: l) claim accept-wb-1793460147-23856.example.test
+15:27:40 PASS: l) verify accept-wb-1793460147-23856.example.test
+15:27:40 PASS: l) origin set for accept-wb-1793460147-23856.example.test
+15:28:38 PASS: l) edge serves accept-wb-1793460147-23856.example.test from origin-test
+15:28:38 PASS: l) detection baseline: SQLi passes through (accept-a-1793460147-23856.example.test)
+15:28:39 PASS: l) detection gives events in audit log
+15:28:39 PASS: l) detection baseline: SQLi passes through (accept-wb-1793460147-23856.example.test)
+15:28:39 PASS: l) set accept-a-1793460147-23856.example.test to blocking
+15:28:39 PASS: l) set accept-wb-1793460147-23856.example.test to off
+15:29:38 PASS: l) WAF modes propagated to edge
+     l) WAF mode change reached the edge in 59s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
+15:29:40 PASS: l) blocking host: SQLi attack returns 403
+15:29:40 PASS: l) blocking host: normal corpus returns 200
+15:29:40 PASS: l) off host: SQLi passes through (host isolation)
+15:29:41 PASS: l) off host: gives no WAF events in audit log
+15:29:41 PASS: l) 403 body has no SQLi payload
+15:29:41 PASS: l) 403 body has no query string
+15:29:41 PASS: l) 403 body has no host name
+15:29:41 PASS: l) set accept-wb-1793460147-23856.example.test to detection while accept-a-1793460147-23856.example.test is blocking
+15:29:41 PASS: l) WAF_B detection propagated
+15:29:43 PASS: l) isolation: accept-a-1793460147-23856.example.test in blocking still returns 403
+15:29:43 PASS: l) isolation: accept-wb-1793460147-23856.example.test in detection passes through (200)
+15:29:43 PASS: l) set accept-a-1793460147-23856.example.test to blocking with 942100 excluded
+15:29:43 PASS: l) set accept-wb-1793460147-23856.example.test to blocking (no exclusions)
+15:30:38 PASS: l) WAF exclusion propagated
+     l) exclusion change reached the edge in 55s
+15:30:40 PASS: l) excluded rule 942100: SQLi passes through for accept-a-1793460147-23856.example.test (200)
+15:30:40 PASS: l) non-excluded rule 913100: scanner UA still blocked on accept-a-1793460147-23856.example.test (403)
+15:30:40 PASS: l) excluded rule stops firing for that host ONLY: accept-wb-1793460147-23856.example.test still blocks (403)
+15:30:40 PASS: l) set accept-a-1793460147-23856.example.test to detection (mode change)
+15:30:40 PASS: l) mode change propagated
+     l) mode change (blocking→detection) reached the edge in 0s (production pacing (poll 5s + reload cooldown 60s + backoff cap 60s))
+15:30:40 PASS: l) host isolation: accept-wb-1793460147-23856.example.test still blocks while accept-a-1793460147-23856.example.test is detection
+15:30:40 PASS: l) ordering: host-scoped ctl rules precede CRS includes
 
-== 15:05:25 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
-15:05:25 PASS: l) claim accept-wb-1793457910-6733.example.test
-15:05:25 FAIL: l) verify accept-wb-1793457910-6733.examTerminated                 sleep 1
-=== edge acceptance: interrupted (SIGINT/SIGTERM); exiting ===
+== 15:30:40 m) edge RSS with 1/10/100 served hosts
+15:30:40 PASS: m) baseline 2 hosts serving
+     m) RSS: 2 hosts = 100044 kB
+15:30:40 PASS: m) edge RSS measurable with 2 hosts
+15:31:38 PASS: m) 10 hosts in snapshot
+     m) RSS: 10 hosts = 100700 kB
+15:31:38 PASS: m) edge RSS measurable with 10 hosts
+15:32:38 PASS: m) 100 hosts in snapshot
+     m) RSS: 100 hosts = 107892 kB
+15:32:38 PASS: m) edge RSS measurable with 100 hosts
+15:32:38 PASS: m) sub-linear: RSS grew 10‰ per host (100 vs 2 hosts)
 
-== ver15:08:26 FAIL: l) edge serves accept-wb-1793457910-6733.example.test from origin-test did not happen within 180s
-15:08:26 FAIL: l) detection baseline: SQLi passes through (accept-a-1793457910-6733.example.test) (want '200', got '421')
-15:08:27 FAIL: l) detection gives events in audit log (got the unwanted '0')
-15:08:27 FAIL: l) detection baseline: SQLi passes through (accept-wb-1793457910-6733.example.test) (want '200', got '421')
-15:08:27 FAIL: l) set accept-a-1793457910-6733.example.test to blocking (want '200', got '000')
-15:08:27 FAIL: l) set accept-wb-1793457910-6733.example.test to off (want '200', got '000')
-Terminated                 sleep 1
-=== edge acceptance: interrupted (SIGINT/SIGTERM); exiting ===
+== 15:32:38 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
+15:32:41 PASS: n) old-style node boot-applied the crafted last-good
+15:32:41 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
+15:32:41 PASS: n) old-style edge keeps serving accept-a-1793460147-23856.example.test (last-good held)
+15:32:42 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
+15:32:43 PASS: n) real poller cold-started from the API schema-2 snapshot
+15:32:43 PASS: n) schema-2 WAF directives restored on the edge
+15:32:47 PASS: n) poller applied the schema-1 snapshot
+15:32:50 PASS: n) edge serves accept-a-1793460147-23856.example.test from origin-test (schema-1 backward compat)
+15:32:50 PASS: n) edge serves accept-wb-1793460147-23856.example.test from origin-test (schema-1 backward compat)
+15:32:50 PASS: n) directives default to DetectionOnly for schema-1 domains
+15:32:52 PASS: n) poller refetched the schema-2 snapshot from the API
+15:32:54 PASS: n) schema-2 config applied to edge
 
-== verdict
-=== edge acceptance: 77 passed, 48 failed, exit=130, last_section=l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing), status=ABORTED ===
-oll 5s + reload cooldown 60s + backoff cap 60s))
-14:53:54 PASS: l) host isolation: accept-wb-1793457973-16383.example.test still blocks while accept-a-1793457973-16383.example.test is detection
-14:53:54 PASS: l) ordering: host-scoped ctl rules precede CRS includes
-
-== 14:53:54 m) edge RSS with 1/10/100 served hosts
-14:53:54 PASS: m) baseline 2 hosts serving
-     m) RSS: 2 hosts = 100488 kB
-14:53:55 PASS: m) edge RSS measurable with 2 hosts
-14:54:52 PASS: m) 10 hosts in snapshot
-     m) RSS: 10 hosts = 101208 kB
-14:54:52 PASS: m) edge RSS measurable with 10 hosts
-14:55:53 PASS: m) 100 hosts in snapshot
-     m) RSS: 100 hosts = 113308 kB
-14:55:53 PASS: m) edge RSS measurable with 100 hosts
-14:55:53 PASS: m) sub-linear: RSS grew 11‰ per host (100 vs 2 hosts)
-
-== 14:55:53 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
-14:55:57 PASS: n) old-style node boot-applied the crafted last-good
-14:55:58 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
-14:55:58 PASS: n) old-style edge keeps serving accept-a-1793457973-16383.example.test (last-good held)
-14:55:58 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
-14:56:00 PASS: n) real poller cold-started from the API schema-2 snapshot
-14:56:00 PASS: n) schema-2 WAF directives restored on the edge
-14:56:05 PASS: n) poller applied the schema-1 snapshot
-14:56:08 PASS: n) edge serves accept-a-1793457973-16383.example.test from origin-test (schema-1 backward compat)
-14:56:08 PASS: n) edge serves accept-wb-1793457973-16383.example.test from origin-test (schema-1 backward compat)
-14:56:08 PASS: n) directives default to DetectionOnly for schema-1 domains
-14:56:10 PASS: n) poller refetched the schema-2 snapshot from the API
-14:56:11 PASS: n) schema-2 config applied to edge
-
-== 14:56:11 o) PROD_TIMING: origin change after 60s silence (leading-edge)
+== 15:32:54 o) PROD_TIMING: origin change after 60s silence (leading-edge)
      o) waiting 60s for the reload cooldown to elapse (no reloads)...
-14:57:11 PASS: o) origin PUT (9001 -> 9003)
-14:57:17 PASS: o) new origin reached the edge
-     o) origin change after 60s silence reached the edge in 6s (target: < 10s)
-14:57:17 PASS: o) latency 6s — leading-edge cooldown (applied at next poll)
-14:57:17 PASS: o) origin RESTORED (9003 -> 9001)
+15:33:54 PASS: o) origin PUT (9001 -> 9003)
+15:33:55 PASS: o) new origin reached the edge
+     o) origin change after 60s silence reached the edge in 1s (target: < 10s)
+15:33:55 PASS: o) latency 1s — leading-edge cooldown (applied at next poll)
+15:33:55 PASS: o) origin RESTORED (9003 -> 9001)
 
-== 14:57:17 verdict
+== 15:33:55 verdict
 --- section timing ---
-  k) B3c WAF audit redaction (detection-only, in-process, no values)   2s
+  k) B3c WAF audit redaction (detection-only, in-process, no values)   3s
   origin-test fixture through the edge                 2s
-  l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing) 179s
-  i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good  63s
-  j) the whole run's access log: no secrets, no query strings   1s
-  d) an API origin change reaches the edge (timed)    61s
+  l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing) 180s
+  i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good  51s
+  j) the whole run's access log: no secrets, no query strings   0s
+  d) an API origin change reaches the edge (timed)    60s
   g) unknown host: 421 and no certificate attempt      0s
-  o) PROD_TIMING: origin change after 60s silence (leading-edge)  66s
-  setup                                               36s
-  n) schema gate both directions (old-style node refuses; new node accepts schema-1)  18s
-  m) edge RSS with 1/10/100 served hosts             119s
+  o) PROD_TIMING: origin change after 60s silence (leading-edge)  61s
+  setup                                               27s
+  n) schema gate both directions (old-style node refuses; new node accepts schema-1)  16s
+  m) edge RSS with 1/10/100 served hosts             118s
   b) cold start with NO snapshot: 421 for every host  16s
-  f2) an origin hostname that later resolves to a metadata address is refused at dial time  73s
+  f2) an origin hostname that later resolves to a metadata address is refused at dial time  74s
   e) spoofed X-Forwarded-For is replaced with the real client IP   0s
   f) private and metadata origins are refused, never reached   0s
   a) cold start with the API down and a saved snapshot  18s
   h) allowed host gets a certificate (internal issuer); denied host does not   0s
-  c) tampered snapshot rejected; the last-good config keeps serving  10s
+  c) tampered snapshot rejected; the last-good config keeps serving  62s
 === edge acceptance: 170 passed, 0 failed ===
 
 == verdict

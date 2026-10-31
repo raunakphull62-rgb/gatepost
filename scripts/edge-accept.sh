@@ -611,9 +611,18 @@ LINES=$(printf '%s\n' "$LOG" | grep -c '"msg":"handled request"')
 if [ "$LINES" -gt 0 ]; then pass "the access log recorded the run ($LINES requests)"; else fail "access log is empty"; fi
 for POISON in "SECRET123" "code=abc" "token=" "LEAK-AUTH-123" "LEAK-COOKIE-456" \
                "LEAK-APIKEY-789" "LEAK-REF-321" "Authorization" "Cookie" "X-Api-Key" \
-               "Referer" "Set-Cookie" "gporigin=" "$NTOK" "$KEY" "1.2.3.4"; do
+               "Referer" "Set-Cookie" "gporigin=" "1.2.3.4"; do
   N=$(printf '%s\n' "$LOG" | grep -c -F -- "$POISON")
   check "j) the access log has no '$POISON'" "$N" "0"
+done
+# the run's own credentials are searched by VALUE (to prove the access log
+# never carries them) but are NEVER printed: only a non-reversible sha256
+# prefix labels each check, so a leaked secret can't re-surface in the log.
+for _V in "$NTOK" "$KEY"; do
+  [ -n "$_V" ] || continue
+  _tag=$(printf '%s' "$_V" | openssl dgst -sha256 | cut -d' ' -f2 | cut -c1-12)
+  _n=$(printf '%s\n' "$LOG" | grep -c -F -- "$_V")
+  check "j) the access log has no run secret (sha256 ${_tag})" "$_n" "0"
 done
 Q=$(printf '%s\n' "$LOG" | grep -c '?')
 check "j) not one question mark anywhere (no query strings at all)" "$Q" "0"

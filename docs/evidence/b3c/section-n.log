@@ -1,32 +1,29 @@
-== 14:46:13 setup
-== 14:46:49 origin-test fixture through the edge
-== 14:46:51 a) cold start with the API down and a saved snapshot
-== 14:47:09 b) cold start with NO snapshot: 421 for every host
-== 14:47:25 c) tampered snapshot rejected; the last-good config keeps serv14:414:47:34 PASS: the poller refetches a good config after the no-snapshot boot
-== 14:56:15 e) spoofed X-Forwarded-For is replaced with the real client IP
-== 14:56:16 f) private and metadata origins are refused, never reached
-== 14:56:16 f2) an origin hostname that later resolves to a metadata address is refused at dial time
-== 14:58:45 g) unknown host: 421 and no certificate attempt
-== 14:58:46 h) allowed host gets a certificate (internal issuer); denied host does not
-== 14:58:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
-== 15:05:15 j) the whole run's access log: no secrets, no query strings
-== 15:05:22 j) the whole run's access log: no secrets, no query strings
-== 15:05:23 k) B3c WAF audit redac15:05:24 PASS: k) WAF audit has no value 'S-Q-Q' (q/body/path/cookie/auth)
-== 15:05:25 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
-== 14:53:54 m) edge RSS with 1/10/100 served hosts
-== 14:55:53 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
-14:55:57 PASS: n) old-style node boot-applied the crafted last-good
-14:55:58 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
-14:55:58 PASS: n) old-style edge keeps serving accept-a-1793457973-16383.example.test (last-good held)
-14:55:58 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
-14:56:00 PASS: n) real poller cold-started from the API schema-2 snapshot
-14:56:00 PASS: n) schema-2 WAF directives restored on the edge
-14:56:05 PASS: n) poller applied the schema-1 snapshot
-14:56:08 PASS: n) edge serves accept-a-1793457973-16383.example.test from origin-test (schema-1 backward compat)
-14:56:08 PASS: n) edge serves accept-wb-1793457973-16383.example.test from origin-test (schema-1 backward compat)
-14:56:08 PASS: n) directives default to DetectionOnly for schema-1 domains
-14:56:10 PASS: n) poller refetched the schema-2 snapshot from the API
-14:56:11 PASS: n) schema-2 config applied to edge
+== 15:22:56 a) cold start with the API down and a saved snapshot
+== 15:23:14 b) cold start with NO snapshot: 421 for every host
+== 15:23:30 c) tampered snapshot rejected; the last-good config keeps serving
+== 15:24:32 d) an API origin change reaches the edge (timed)
+== 15:25:32 e) spoofed X-Forwarded-For is replaced with the real client IP
+== 15:25:32 f) private and metadata origins are refused, never reached
+== 15:25:32 f2) an origin hostname that later resolves to a metadata address is refused at dial time
+== 15:26:46 g) unknown host: 421 and no certificate attempt
+== 15:26:46 h) allowed host gets a certificate (internal issuer); denied host does not
+== 15:26:46 i) API stopped mid-run: keeps serving; restarted: recovers; revoked: last-good
+== 15:27:37 j) the whole run's access log: no secrets, no query strings
+== 15:27:37 k) B3c WAF audit redaction (detection-only, in-process, no values)
+== 15:27:40 l) WAF per-host live tests (off/detection/blocking, exclusions, isolation, timing)
+== 15:30:40 m) edge RSS with 1/10/100 served hosts
+== 15:32:38 n) schema gate both directions (old-style node refuses; new node accepts schema-1)
+15:32:41 PASS: n) old-style node boot-applied the crafted last-good
+15:32:41 PASS: n) old-style node REFUSED the API snapshot (required feature unknown)
+15:32:41 PASS: n) old-style edge keeps serving accept-a-1793460147-23856.example.test (last-good held)
+15:32:42 PASS: n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)
+15:32:43 PASS: n) real poller cold-started from the API schema-2 snapshot
+15:32:43 PASS: n) schema-2 WAF directives restored on the edge
+15:32:47 PASS: n) poller applied the schema-1 snapshot
+15:32:50 PASS: n) edge serves accept-a-1793460147-23856.example.test from origin-test (schema-1 backward compat)
+15:32:50 PASS: n) edge serves accept-wb-1793460147-23856.example.test from origin-test (schema-1 backward compat)
+15:32:50 PASS: n) directives default to DetectionOnly for schema-1 domains
+15:32:52 PASS: n) poller refetched the schema-2 snapshot from the API
+15:32:54 PASS: n) schema-2 config applied to edge
 
-== 14:56:11 o) PROD_TIMING: origin change after 60s silence (leading-edge)
-== 14:57:17 verdict
+== 15:32:54 o) PROD_TIMING: origin change after 60s silence (leading-edge)

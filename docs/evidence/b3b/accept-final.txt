@@ -122,8 +122,8 @@
 02:54:19 PASS: j) the access log has no 'Referer'
 02:54:19 PASS: j) the access log has no 'Set-Cookie'
 02:54:19 PASS: j) the access log has no 'gporigin='
-02:54:19 PASS: j) the access log has no 'OseO49bDdF_iYIBsc_DuDH9Uu0MG7S2HUXwuI1tnXzg'
-02:54:19 PASS: j) the access log has no 'accept-snapshot-key-be9404664098927aac6c99828742099f'
+02:54:19 PASS: j) the access log has no '<redacted> (sha256 a2adaeb22256)'
+02:54:19 PASS: j) the access log has no '<redacted> (sha256 fa8f195afab9)'
 02:54:19 PASS: j) the access log has no '1.2.3.4'
 02:54:19 PASS: j) not one question mark anywhere (no query strings at all)
 02:54:19 PASS: j) every line: user_agent present, no uri/headers/resp_headers
