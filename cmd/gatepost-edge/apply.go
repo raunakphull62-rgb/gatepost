@@ -231,7 +231,7 @@ func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 			return true, nil // re-check: the pending set may have changed while we waited
 		}
 	}
-	err := p.applyCaddy(ctx, pend)
+	err := p.applyConfigWithFallback(ctx, pend)
 	p.mu.Lock()
 	if err == nil {
 		p.pending = nil
@@ -283,7 +283,10 @@ func (p *Poller) stepApply(ctx context.Context) (bool, error) {
 }
 
 // applyCaddy: swap forwarder ports FIRST, generate, POST /load.
-func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document) error {
+// wafCfg controls whether the generated config includes the Coraza WAF
+// handler; the fallback path passes a WAFConfig with Mode=off to retry
+// without the WAF when Caddy rejects the full config.
+func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document, wafCfg WAFConfig) error {
 	ports, err := p.fwd.Swap(d)
 	if err != nil {
 		return fmt.Errorf("egress forwarder swap: %w", err)
@@ -296,12 +299,53 @@ func (p *Poller) applyCaddy(ctx context.Context, d *snapshot.Document) error {
 		AskURL:        p.cfg.AskURL,
 		Issuer:        p.cfg.Issuer,
 		AccessLogPath: p.cfg.CaddyAccessLog,
-		WAF:           p.cfg.WAF,
+		WAF:           wafCfg,
 	})
 	if err != nil {
 		return err
 	}
 	return caddyLoad(ctx, "http://"+p.cfg.CaddyAdmin+"/load", cfgBytes, p.cfg.Client)
+}
+
+// applyConfigWithFallback tries the full WAF config first. If Caddy rejects
+// the config with a 400 (the WAF module's config shape is invalid — e.g. a
+// bad SecAction directive, an undefined rule, or a module version mismatch),
+// it retries WITHOUT the Coraza handler so the edge keeps serving the
+// snapshot's domains, origins and TLS proof. The WAF-off fallback is
+// fail-open at the WAF boundary only: unknown hosts still get 421 via the
+// ask check. When the next snapshot builds a WAF config Caddy accepts, the
+// full config is re-applied and the waf_config_failed alert auto-resolves.
+//
+// The wafFallback atomic is set so the heartbeat reports the fallback to
+// the API server (which records/resolves the operator alert).
+func (p *Poller) applyConfigWithFallback(ctx context.Context, d *snapshot.Document) error {
+	// Try with full WAF config.
+	err := p.applyCaddy(ctx, d, p.cfg.WAF)
+	if err == nil {
+		p.wafFallback.Store(false)
+		return nil
+	}
+
+	// Transport failure (Caddy unreachable): don't retry with WAF-off.
+	if !strings.HasPrefix(err.Error(), "caddy /load:") {
+		return err
+	}
+
+	// Only try the WAF-off fallback when WAF is actually enabled.
+	if p.cfg.WAF.Mode == "off" || p.cfg.WAF.Mode == "" {
+		// WAF is already off — the rejection is a different config issue.
+		return err
+	}
+	p.log("warn", "WAF config rejected by Caddy — retrying without Coraza handler: %v", err)
+	wafOff := p.cfg.WAF
+	wafOff.Mode = "off"
+	err2 := p.applyCaddy(ctx, d, wafOff)
+	if err2 != nil {
+		return fmt.Errorf("waf-off fallback also failed: %w (original: %v)", err2, err)
+	}
+	p.wafFallback.Store(true)
+	p.log("warn", "WAF disabled — serving WAF-off config; waf_config_failed alert raised")
+	return nil
 }
 
 // caddyLoad POSTs the generated JSON to the admin API. 200 means Caddy

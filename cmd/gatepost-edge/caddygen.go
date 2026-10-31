@@ -393,7 +393,20 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 			handle = append(handle, logAppendsOnce(originVar)...)
 		}
 		if waf != nil {
-			handle = append(handle, waf) // B3c: inspect before reverse_proxy; response inspection is off
+			// B3c item 4: wrap the Coraza handler in the fail-open module.
+			// The wrapper sits before reverse_proxy in the handle array;
+			// Caddy chains reverse_proxy as its Next. On a panic/timeout/
+			// saturation the wrapper fails closed (503) for blocking hosts
+			// and fails open (pass through) for detection hosts.
+			handle = append(handle, wafFailOpenHandler{
+				Handler:         "gatepost/waffailopen",
+				WAF:             waf,
+				Timeout:         p.WAF.Timeout,
+				Concurrency:     p.WAF.Concurrency,
+				ConcurrencyWait: p.WAF.ConcurrencyWait,
+				Mode:            p.WAF.Mode,
+				HostModes:       wafHostModeMap(doms, p.WAF.Mode),
+			})
 		}
 		rp := reverseProxyHandler{
 			Handler: "reverse_proxy",
@@ -632,6 +645,16 @@ type WAFConfig struct {
 	AuditLogPath     string // required when Mode != off; redacted Part A+H+Z native-format file (x/wafredactor)
 	RequestBodyLimit int64  // bytes the WAF inspects; 0 = the edge body cap (maxBodyBytes)
 	ParanoiaLevel    int    // CRS paranoia level (1 default)
+
+	// WAFFailOpen: per-request wrapper around the Coraza handler
+	// (B3c item 4). Timeout is the evaluation budget (default 250ms);
+	// Concurrency bounds simultaneous evaluations (default 64);
+	// ConcurrencyWait is how long a request waits for a slot (default 50ms).
+	// Env-configurable via GP_EDGE_WAF_TIMEOUT and
+	// GP_EDGE_WAF_CONCURRENCY.
+	Timeout           string // e.g. "250ms"
+	Concurrency       int
+	ConcurrencyWait   string // e.g. "50ms"
 }
 
 // corazaWAF is the JSON shape of the coraza-caddy handler. load_owasp_crs
@@ -642,6 +665,35 @@ type corazaWAF struct {
 	Handler      string `json:"handler"` // "waf" (short name → http.handlers.waf)
 	LoadOWASPCRS bool   `json:"load_owasp_crs"`
 	Directives   string `json:"directives"` // ModSecurity-style SecActions/rules
+}
+
+// wafFailOpenHandler is the JSON shape of the gatepost/waffailopen Caddy
+// module. It embeds the Coraza WAF handler and adds fail-open controls
+// (B3c item 4): recover, per-request time budget, bounded concurrency.
+type wafFailOpenHandler struct {
+	Handler          string                 `json:"handler"` // "gatepost/waffailopen"
+	WAF              *corazaWAF             `json:"waf,omitempty"`
+	Timeout          string                 `json:"timeout,omitempty"`
+	Concurrency      int                    `json:"concurrency,omitempty"`
+	ConcurrencyWait  string                 `json:"concurrency_wait,omitempty"`
+	Mode             string                 `json:"mode,omitempty"`
+	HostModes        map[string]string      `json:"host_modes,omitempty"`
+}
+
+// wafHostModeMap builds the per-host mode map from the snapshot domains.
+// Only hosts that differ from the global default are included.
+func wafHostModeMap(doms []snapshot.Domain, globalMode string) map[string]string {
+	m := make(map[string]string)
+	for _, dom := range doms {
+		mode := snapshotDomainWAF(dom)
+		if mode != globalMode {
+			m[dom.Hostname] = mode
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // wafHandler validates Mode and builds the handler. nil (no error) means Mode

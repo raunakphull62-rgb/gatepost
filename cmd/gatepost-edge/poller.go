@@ -126,6 +126,12 @@ type Poller struct {
 	applyTick atomic.Int64 // last applyLoop wake (liveness: see serveHealth)
 	pollTick  atomic.Int64 // last poll-loop wake
 
+	// WAF fail-open state (B3c item 4): true when the running config is
+	// WAF-off because Caddy rejected the WAF config. Reported to the API
+	// via the heartbeat so the waf_config_failed operator alert can be
+	// recorded / auto-resolved.
+	wafFallback atomic.Bool
+
 	throttle      *logThrottle // repeated identical failure lines resolve here
 	certWindow    time.Time    // start of the current on-demand cap window
 	certCount     int          // approvals in certWindow
@@ -465,12 +471,17 @@ func (p *Poller) heartbeat(ctx context.Context) {
 	}
 	var body struct {
 		Generation int64 `json:"generation"`
+		// WAFFallback is true when the running config is WAF-off due to
+		// a Caddy rejection of the WAF config. The API server uses this
+		// to record/resolve the waf_config_failed operator alert.
+		WAFFallback bool `json:"waf_fallback,omitempty"`
 	}
 	gen, acked := p.heartbeats()
 	if gen == 0 || gen == acked { // nothing applied, or already acknowledged
 		return
 	}
 	body.Generation = gen
+	body.WAFFallback = p.wafFallback.Load()
 	payload, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.APIBase+"/node/v1/heartbeat", strings.NewReader(string(payload)))
 	if err != nil {
@@ -584,8 +595,51 @@ func (p *Poller) serveHealth(w http.ResponseWriter, _ *http.Request) {
 		if r := p.degradeReason(); r != "" {
 			body = "ok (degraded: " + r + "; serving last-good, not polling)"
 		}
+		if stats := p.fetchWAFStats(); stats != nil {
+			body += fmt.Sprintf("; waf: panics=%d timeouts=%d saturated=%d",
+				stats.Panics, stats.Timeouts, stats.Saturated)
+			if p.wafFallback.Load() {
+				body += " (waf_config_failed: serving WAF-off)"
+			}
+		}
 		fmt.Fprint(w, body)
 	}
+}
+
+// wafStatsSnapshot is the JSON shape from the Caddy admin API /waffailopen/stats.
+type wafStatsSnapshot struct {
+	Panics    uint64 `json:"panics"`
+	Timeouts  uint64 `json:"timeouts"`
+	Saturated uint64 `json:"saturated"`
+}
+
+// fetchWAFStats queries the Caddy admin API for WAF fail-open counters.
+// Uses a short timeout so /health never stalls on a slow Caddy. Returns
+// nil (no stats in the body) if the admin API or the waffailopen module
+// is unavailable.
+func (p *Poller) fetchWAFStats() *wafStatsSnapshot {
+	if p.cfg.CaddyAdmin == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+p.cfg.CaddyAdmin+"/waffailopen/stats", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.cfg.Client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var s wafStatsSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return nil
+	}
+	return &s
 }
 
 // serveAsk: the on-demand permission gate. Answers 200 only for a hostname

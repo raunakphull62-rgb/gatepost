@@ -118,10 +118,13 @@ func TestGenerateEmitsCorazaHandler(t *testing.T) {
 	doc := fixtureDoc("single")
 	params := fixtureParams()
 	params.WAF = WAFConfig{
-		Mode:             "detection",
-		AuditLogPath:     "/tmp/waf.log",
-		RequestBodyLimit: 0, // falls back to maxBodyBytes
-		ParanoiaLevel:    1,
+		Mode:              "detection",
+		AuditLogPath:      "/tmp/waf.log",
+		RequestBodyLimit:  0, // falls back to maxBodyBytes
+		ParanoiaLevel:     1,
+		Timeout:           "250ms",
+		Concurrency:       64,
+		ConcurrencyWait:   "50ms",
 	}
 	b, err := Generate(doc, params)
 	if err != nil {
@@ -131,28 +134,45 @@ func TestGenerateEmitsCorazaHandler(t *testing.T) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		t.Fatalf("unmarshal config: %v", err)
 	}
-	// the single host route must carry the coraza handler, then the body cap,
-	// then the reverse_proxy — inspection before proxying.
+	// the single host route must carry the waffailopen wrapper (which
+	// embeds the coraza handler), then reverse_proxy — inspection before
+	// proxying.
 	var foundCoraza bool
 	for _, rt := range cfg.Apps.HTTP.Servers["edge"].Routes {
 		for _, h := range rt.Handle {
-			if m, ok := h.(map[string]any); ok && m["handler"] == "waf" {
+			if m, ok := h.(map[string]any); ok && m["handler"] == "gatepost/waffailopen" {
 				foundCoraza = true
-				if m["load_owasp_crs"] != true {
-					t.Errorf("load_owasp_crs = %v, want true", m["load_owasp_crs"])
+				wafCfg, ok := m["waf"].(map[string]any)
+				if !ok {
+					t.Fatal("waffailopen handler missing embedded waf config")
 				}
-				dirs, _ := m["directives"].(string)
+				if wafCfg["handler"] != "waf" {
+					t.Errorf("embedded waf handler = %v, want \"waf\"", wafCfg["handler"])
+				}
+				if wafCfg["load_owasp_crs"] != true {
+					t.Errorf("load_owasp_crs = %v, want true", wafCfg["load_owasp_crs"])
+				}
+				dirs, _ := wafCfg["directives"].(string)
 				if !strings.Contains(dirs, "SecRuleEngine DetectionOnly") {
 					t.Errorf("directives missing DetectionOnly:\n%s", dirs)
 				}
 				if !strings.Contains(dirs, "SecAuditLogParts AHZ") {
 					t.Error("directives missing redacted audit parts AHZ")
 				}
+				if m["mode"] != "detection" {
+					t.Errorf("waffailopen mode = %v, want detection", m["mode"])
+				}
+				if m["timeout"] != "250ms" {
+					t.Errorf("waffailopen timeout = %v, want 250ms", m["timeout"])
+				}
+				if m["concurrency"] != float64(64) {
+					t.Errorf("waffailopen concurrency = %v, want 64", m["concurrency"])
+				}
 			}
 		}
 	}
 	if !foundCoraza {
-		t.Fatal("expected an http.handlers.waf handler in the generated routes")
+		t.Fatal("expected a gatepost/waffailopen handler in the generated routes")
 	}
 }
 

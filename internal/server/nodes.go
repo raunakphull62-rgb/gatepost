@@ -193,9 +193,13 @@ func (s *Server) nodeConfig(w http.ResponseWriter, r *http.Request, n nodeRow) {
 // are stamped ONLY after the payload validates: N must be a snapshot
 // generation that exists (a node may honestly report an older one it still
 // runs); a version that does not exist is refused and stamps nothing.
+// The waf_fallback flag (B3c item 4) tells the API whether the node is
+// serving a WAF-off config because Caddy rejected the WAF config. When
+// false, any open waf_config_failed alert for this node auto-resolves.
 func (s *Server) nodeHeartbeat(w http.ResponseWriter, r *http.Request, n nodeRow) {
 	var body struct {
-		Generation int64 `json:"generation"`
+		Generation  int64 `json:"generation"`
+		WAFFallback bool  `json:"waf_fallback,omitempty"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -225,6 +229,18 @@ func (s *Server) nodeHeartbeat(w http.ResponseWriter, r *http.Request, n nodeRow
 	// node_stale alert for this node (Q7a auto-resolve). A refused heartbeat
 	// (bad/unknown generation above) stamps nothing and resolves nothing.
 	s.resolveAlert(r.Context(), "node_stale", n.ID)
+
+	// B3c item 4: record or auto-resolve the waf_config_failed alert based
+	// on whether the node reported a WAF-off fallback. When the node clears
+	// the fallback (Caddy accepted the WAF config again), the alert
+	// auto-resolves. When the fallback is still active, the open alert is
+	// left alone (recordAlert dedupes by kind+subject).
+	if body.WAFFallback {
+		s.recordAlert(r.Context(), "waf_config_failed", n.ID,
+			"node is serving a WAF-off config: Caddy rejected the WAF handler shape; CRS rules are not active on this node")
+	} else {
+		s.resolveAlert(r.Context(), "waf_config_failed", n.ID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied_generation": body.Generation})
 }
 

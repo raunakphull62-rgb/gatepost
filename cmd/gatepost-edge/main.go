@@ -207,7 +207,24 @@ func wafEnv() WAFConfig {
 	if par < 1 || par > 4 {
 		log.Fatalf("GP_EDGE_WAF_PARANOIA=%d (CRS paranoia is 1..4)", par)
 	}
-	return WAFConfig{Mode: mode, AuditLogPath: audit, RequestBodyLimit: limit, ParanoiaLevel: par}
+	// WAFFailOpen wrapper tunables (B3c item 4).
+	timeout := firstNonEmpty(os.Getenv("GP_EDGE_WAF_TIMEOUT"), "250ms")
+	if _, err := time.ParseDuration(timeout); err != nil {
+		log.Fatalf("GP_EDGE_WAF_TIMEOUT=%q: %v", timeout, err)
+	}
+	concurrency := intEnv("GP_EDGE_WAF_CONCURRENCY", 64)
+	if concurrency < 1 {
+		log.Fatalf("GP_EDGE_WAF_CONCURRENCY=%d (must be >= 1)", concurrency)
+	}
+	wait := firstNonEmpty(os.Getenv("GP_EDGE_WAF_CONCURRENCY_WAIT"), "50ms")
+	if _, err := time.ParseDuration(wait); err != nil {
+		log.Fatalf("GP_EDGE_WAF_CONCURRENCY_WAIT=%q: %v", wait, err)
+	}
+	return WAFConfig{
+		Mode: mode, AuditLogPath: audit,
+		RequestBodyLimit: limit, ParanoiaLevel: par,
+		Timeout: timeout, Concurrency: concurrency, ConcurrencyWait: wait,
+	}
 }
 
 // envOrFile: env value first, else the mounted FILE (docker secrets style);
