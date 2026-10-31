@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -49,12 +50,16 @@ func loadConfig() Config {
 	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 		log.Fatalf("GP_EDGE_API_BASE must be http(s), got %q", base)
 	}
-	token := envOrFile("GP_EDGE_TOKEN", "GP_EDGE_TOKEN_FILE", "node token")
-	keyStr := envOrFile("GP_SNAPSHOT_KEY", "GP_SNAPSHOT_KEY_FILE", "snapshot signing key")
-	stateDir := firstNonEmpty(os.Getenv("GP_EDGE_STATE_DIR"), "data/snapshots")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		log.Fatalf("state dir %s: %v", stateDir, err)
+	// The node token is NON-FATAL if absent/empty/unreadable (item 2c): an
+	// edge with a saved snapshot can keep serving while the secret is fixed.
+	// The signing key is the opposite — it MUST be present to verify the
+	// snapshot at boot, so a missing key is fatal and stays on envOrFile.
+	token, tokenFile, tokenReason := bootToken("GP_EDGE_TOKEN", "GP_EDGE_TOKEN_FILE", "node token")
+	if tokenReason != "" {
+		log.Printf("gatepost-edge starting DEGRADED: %s", tokenReason)
 	}
+	keyStr := envOrFile("GP_SNAPSHOT_KEY", "GP_SNAPSHOT_KEY_FILE", "snapshot signing key")
+	stateDir, readOnlyFS := bootStateDir(os.Getenv("GP_EDGE_STATE_DIR"))
 	askAddr := firstNonEmpty(os.Getenv("GP_EDGE_ASK_ADDR"), "127.0.0.1:8099")
 	accessLog := firstNonEmpty(os.Getenv("GP_EDGE_ACCESS_LOG"), "data/logs/access.json")
 
@@ -71,11 +76,14 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		APIBase:  base,
-		Token:    token,
-		Key:      []byte(keyStr),
-		StateDir: stateDir,
-		AskAddr:  askAddr,
+		APIBase:    base,
+		Token:      token,
+		TokenFile:  tokenFile,
+		Degraded:   tokenReason, // "" = healthy; non-empty = the boot degrade reason
+		Key:        []byte(keyStr),
+		StateDir:   stateDir,
+		ReadOnlyFS: readOnlyFS,
+		AskAddr:     askAddr,
 
 		CaddyAdmin: caddyAdminEnv(),
 		CaddyHTTP:  firstNonEmpty(os.Getenv("GP_EDGE_HTTP_ADDR"), ":80"),
@@ -92,6 +100,10 @@ func loadConfig() Config {
 
 		CaddyAccessLog: accessLog,
 		ErrorLogGap:    durEnv("GP_EDGE_ERROR_LOG_GAP", 30*time.Second),
+
+		// B3c item 2c: how long a degraded node serves last-good before a
+		// CRITICAL hourly log fires. Default 24h.
+		StaleLimit: durEnv("GP_EDGE_STALE_LIMIT", 24*time.Hour),
 
 		// B3c: Coraza edge WAF. Detection-only by default on the dev stack
 		// (via deploy/dev compose env); the binary itself defaults OFF so a
@@ -200,6 +212,8 @@ func wafEnv() WAFConfig {
 
 // envOrFile: env value first, else the mounted FILE (docker secrets style);
 // if neither, fatal. File contents may carry a trailing newline — trimmed.
+// Used only for values that MUST be present at boot (the signing key); the
+// node token uses bootToken, which degrades instead of exiting.
 func envOrFile(envName, fileEnv, what string) string {
 	if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
 		return v
@@ -216,6 +230,71 @@ func envOrFile(envName, fileEnv, what string) string {
 	}
 	log.Fatalf("%s or %s must be set (%s)", envName, fileEnv, what)
 	return ""
+}
+
+// bootToken resolves the node token. Unlike envOrFile, absent/empty/unreadable
+// is NOT fatal: the poller boots, serves its LAST-GOOD snapshot, and re-reads
+// the token file every poll cycle (Poller.token) so refilling the secret
+// restores polling with no restart (item 2c). The three failure modes each get
+// a DISTINCT reason so an empty file never looks like a missing one when an
+// operator is hunting a deploy typo. envName takes priority over fileEnv, but
+// the file is re-read at runtime (env values can't change without a restart).
+func bootToken(envName, fileEnv, what string) (token string, file string, reason string) {
+	if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+		return v, "", ""
+	}
+	path := strings.TrimSpace(os.Getenv(fileEnv))
+	if path == "" {
+		return "", "", fmt.Sprintf("%s or %s must be set (%s) — serving last-good, not polling until one is provided", envName, fileEnv, what)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", path, fmt.Sprintf("%s (%s) is unreadable (%v) — serving last-good, not polling until the file is fixed", fileEnv, what, err)
+	}
+	if v := strings.TrimSpace(string(b)); v != "" {
+		return v, "", ""
+	}
+	return "", path, fmt.Sprintf("%s (%s) is empty — serving last-good, not polling until the secret is refilled", fileEnv, what)
+}
+
+// bootStateDir resolves the state directory and classifies its writability.
+// A writable dir (or one MkdirAll can create) returns readOnly=false. A
+// read-only mount that still holds a saved snapshot returns readOnly=true:
+// the poller loads that artifact but never writes it back in memory (the
+// saved bytes ARE the last good). A dir it cannot create AND that has no
+// saved snapshot is fatal — there is nothing to serve and nowhere to start.
+func bootStateDir(dir string) (string, bool) {
+	dir = firstNonEmpty(dir, "data/snapshots")
+	readOnly, fatal, reason := stateDirProbe(dir)
+	if fatal {
+		log.Fatalf("%s", reason)
+	}
+	if readOnly {
+		log.Printf("%s", reason)
+	}
+	return dir, readOnly
+}
+
+// stateDirProbe is bootStateDir's pure classifier, factored out so the
+// read-only / fatal branches are unit-testable without log.Fatalf exiting.
+func stateDirProbe(dir string) (readOnly, fatal bool, reason string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		if _, serr := os.Stat(filepath.Join(dir, snapshotFile)); serr == nil {
+			return true, false, fmt.Sprintf("state dir %s not reachable (%v) — loading the saved snapshot read-only", dir, err)
+		}
+		return false, true, fmt.Sprintf("state dir %s: %v and no saved snapshot to serve", dir, err)
+	}
+	// A read-only mount of an EXISTING dir defeats MkdirAll (it's a no-op);
+	// probe writability directly so we detect it.
+	probe := filepath.Join(dir, ".gp-probe")
+	if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
+		if _, serr := os.Stat(filepath.Join(dir, snapshotFile)); serr == nil {
+			return true, false, fmt.Sprintf("state dir %s not writable (%v) — loading the saved snapshot read-only", dir, err)
+		}
+		return false, true, fmt.Sprintf("state dir %s: not writable (%v) and no saved snapshot to serve", dir, err)
+	}
+	_ = os.Remove(probe)
+	return false, false, ""
 }
 
 // durEnv parses a time.Duration knob; unset → default, garbage → fatal

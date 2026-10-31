@@ -65,12 +65,18 @@ const snapshotFile = "snapshot.json"
 type Config struct {
 	APIBase    string        // e.g. http://api:8080 (no trailing slash)
 	Token      string        // node token, sent as Authorization: Bearer …
+	TokenFile  string        // re-read every poll when Token is empty (item 2c degrade)
+	Degraded   string        // non-empty boot-time reason the node is degraded
 	Key        []byte        // snapshot signing key (must match the API's)
 	// Features — capability names this build implements for the snapshot
 	// gate (snapshot.VerifyWith). nil = an old-style node: it refuses any
 	// snapshot whose signed required_features name anything at all.
 	Features []string
-	StateDir string // the mounted volume; snapshot.json lives here
+	StateDir   string // the mounted volume; snapshot.json lives here
+	ReadOnlyFS bool   // state dir read-only: load the saved snapshot, never write it
+	// StaleLimit: time a degraded node may serve last-good before a CRITICAL
+	// hourly line is logged (item 2c). Default 24h.
+	StaleLimit time.Duration
 	AskAddr    string        // ask check listener; "" disables it
 	AskURL     string        // Caddy's permission endpoint ("" → derived from AskAddr/AskLn)
 	AskLn      net.Listener  // test hook; used instead of AskAddr when set
@@ -124,6 +130,12 @@ type Poller struct {
 	certWindow    time.Time    // start of the current on-demand cap window
 	certCount     int          // approvals in certWindow
 	certCapWarned bool         // the cap-reached warning was already logged this window
+
+	// Degraded-mode state (item 2c): a node with no token serves its saved
+	// snapshot and re-reads the token file every poll. degradedSince (guarded
+	// by mu, alongside the rest of the state) stamps when degradation began;
+	// zero = the node is healthy and polling normally.
+	degradedSince time.Time
 }
 
 // pollOutcome classifies one config poll, so the loop can decide between
@@ -169,6 +181,9 @@ func NewPoller(cfg Config) *Poller {
 	}
 	if cfg.ErrorLogGap <= 0 {
 		cfg.ErrorLogGap = 30 * time.Second // one failure line per gap is the flood cap
+	}
+	if cfg.StaleLimit <= 0 {
+		cfg.StaleLimit = 24 * time.Hour // CRITICAL staleness log after this in degraded mode
 	}
 	if cfg.AdminGrace <= 0 {
 		cfg.AdminGrace = 15 * time.Second // an orphaned namespace never heals; a slow caddy is up long before this
@@ -246,6 +261,23 @@ func (p *Poller) tick(ctx context.Context) {
 			p.bumpStreak()
 		}
 	}()
+	if t := p.token(); t == "" {
+		// Item 2c (degrade): no node token. The node is NOT dead — boot the
+		// saved snapshot and keep serving it. Re-read the token file every
+		// tick so refilling the secret restores polling with no restart.
+		// This is NOT a connection failure: the streak must not climb, the
+		// backoff ladder must not advance, and we simply don't poll (no 401
+		// flood). The ask listener and forwarder keep answering from the
+		// in-memory last-good config, so Caddy's last-good JSON is still live.
+		p.enterDegraded()
+		p.logThrottledGap("error", "nodegrad", degradedLogGap,
+			"no node token: serving last-good config, not polling")
+		p.ensureDenyAll()
+		p.criticalIfStale()
+		return
+	}
+	p.leaveDegraded()
+
 	p.heartbeat(ctx)
 
 	env, outcome := p.poll(ctx)
@@ -323,7 +355,7 @@ func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, e
 // (so a crash between memory and disk leaves the file behind or absent,
 // never half-promoted), swaps memory, and queues the roster heartbeat.
 func (p *Poller) accept(ctx context.Context, d snapshot.Document, env snapshot.Envelope, persist bool) {
-	if persist {
+	if persist && !p.cfg.ReadOnlyFS {
 		b, err := json.Marshal(env)
 		if err != nil {
 			p.log("error", "persist: %v", err)
@@ -380,7 +412,7 @@ func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 		p.logThrottled("error", "poll", "poll request build: %v", err)
 		return nil, pollNetwork
 	}
-	req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	req.Header.Set("Authorization", "Bearer "+p.token())
 	req.Header.Set("User-Agent", "gatepost-edge")
 	if gen := p.appliedGeneration(); gen > 0 {
 		req.Header.Set("If-None-Match", `"`+strconvFormatInt(gen)+`"`)
@@ -427,6 +459,10 @@ func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 // memory, not the last fetched attempt — and only when it is newer than the
 // last acknowledged. It retries on the next tick until the API answers 200.
 func (p *Poller) heartbeat(ctx context.Context) {
+	if p.token() == "" {
+		// Degraded: no token to authenticate a heartbeat — don't 401-spam.
+		return
+	}
 	var body struct {
 		Generation int64 `json:"generation"`
 	}
@@ -441,7 +477,7 @@ func (p *Poller) heartbeat(ctx context.Context) {
 		p.log("error", "heartbeat build: %v", err)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	req.Header.Set("Authorization", "Bearer "+p.token())
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil {
@@ -497,6 +533,13 @@ func (p *Poller) startAskServer(ctx context.Context) *http.Server {
 var (
 	applyStallLimit = 30 * time.Second
 	pollStallLimit  = 90 * time.Second
+	// degradedLogGap: the "no node token" line is loud but not a flood — one
+	// per gap while the node stays degraded (item 2c). Distinct brand from the
+	// API-failure throttle so the two can't mask each other.
+	degradedLogGap = 5 * time.Minute
+	// criticalStalenessGap: a CRITICAL line every hour once a degraded node has
+	// been serving last-good past GP_EDGE_STALE_LIMIT without recovery.
+	criticalStalenessGap = time.Hour
 )
 
 // healthTickInterval is how often applyTick is refreshed during long waits
@@ -531,8 +574,17 @@ func (p *Poller) serveHealth(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, "egress forwarder unhealthy")
 	default:
+		// Status stays 200 in degraded mode: a crash here just restarts the
+		// loop into the SAME empty-token state and takes the edge down again
+		// (the 502-for-everyone case the supervise-off trap exists to avoid
+		// during tests). The degraded reason is in the BODY instead, so an
+		// operator probing /health sees it.
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		body := "ok"
+		if r := p.degradeReason(); r != "" {
+			body = "ok (degraded: " + r + "; serving last-good, not polling)"
+		}
+		fmt.Fprint(w, body)
 	}
 }
 
@@ -697,6 +749,75 @@ func (p *Poller) heartbeats() (gen, acked int64) {
 	return p.generation, p.acked
 }
 
+// token returns the node token for the current poll cycle. The boot-time
+// token (env) is returned directly; when it was absent, a configured TokenFile
+// is re-read every call — so a refilled secret restores polling without a
+// restart (item 2c degrade path). An empty result means degraded.
+func (p *Poller) token() string {
+	if t := p.cfg.Token; t != "" {
+		return t
+	}
+	if p.cfg.TokenFile == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p.cfg.TokenFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// enterDegraded / leaveDegraded track the start (and recovery) of a degraded
+// spell, guarded by mu. Recovery clears the marker so a refilled token resets
+// the staleness clock.
+func (p *Poller) enterDegraded() {
+	p.mu.Lock()
+	if p.degradedSince.IsZero() {
+		p.degradedSince = p.cfg.Now()
+	}
+	p.mu.Unlock()
+}
+
+func (p *Poller) leaveDegraded() {
+	p.mu.Lock()
+	p.degradedSince = time.Time{}
+	p.mu.Unlock()
+}
+
+func (p *Poller) degradedFor() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.degradedSince.IsZero() {
+		return 0
+	}
+	return p.cfg.Now().Sub(p.degradedSince)
+}
+
+// degradeReason is the human-readable reason surfaced in /health ("").
+func (p *Poller) degradeReason() string {
+	if p.cfg.Token != "" {
+		return ""
+	}
+	if p.cfg.TokenFile != "" {
+		return "no node token (secret file empty or unreadable)"
+	}
+	return "no node token (GP_EDGE_TOKEN / GP_EDGE_TOKEN_FILE unset)"
+}
+
+// criticalIfStale: once a degraded node has been serving last-good past
+// StaleLimit, emit a CRITICAL line every criticalStalenessGap until recovery.
+// The node is NOT taken down automatically — last-good keeps serving — but an
+// operator must hear this. See DECISIONS.md for the staleness trade-off.
+func (p *Poller) criticalIfStale() {
+	if d := p.degradedFor(); d > 0 {
+		if d >= p.cfg.StaleLimit {
+			p.logThrottledGap("error", "critical", criticalStalenessGap,
+				"CRITICAL: degraded for %s (> stale limit %s) without a node token — last-good keeps serving; operator action needed",
+				d, p.cfg.StaleLimit)
+		}
+	}
+}
+
 func (p *Poller) log(kind, format string, args ...any) {
 	p.cfg.Log(kind, format, args...)
 }
@@ -707,6 +828,16 @@ func (p *Poller) log(kind, format string, args ...any) {
 // Recovery messages ("applied snapshot …") are never throttled.
 func (p *Poller) logThrottled(kind, brand, format string, args ...any) {
 	if !p.throttle.allow(brand, p.cfg.ErrorLogGap, p.cfg.Now()) {
+		return
+	}
+	p.log(kind, format, args...)
+}
+
+// logThrottledGap is logThrottled with an explicit gap. The "no node token"
+// and CRITICAL-staleness lines use a longer throttle than the API-failure
+// brand, so they neither flood the 30s line nor collapse into it.
+func (p *Poller) logThrottledGap(kind, brand string, gap time.Duration, format string, args ...any) {
+	if !p.throttle.allow(brand, gap, p.cfg.Now()) {
 		return
 	}
 	p.log(kind, format, args...)

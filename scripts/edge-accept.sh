@@ -214,6 +214,10 @@ dc down >/dev/null 2>&1
 # network removal — give it a beat so the route check below doesn't race.
 sleep 1
 for v in caddy_data caddy_config poller_state; do sudo docker volume rm "gatepost-edge-dev_$v" >/dev/null 2>&1; done
+# Remove any stale node token from a previous (possibly aborted) run: the poller
+# reads GP_EDGE_TOKEN_FILE on boot, and an empty/leftover file is the exact shape
+# a crashed-soak crash-looped on (item 2c degrade — a clean slate is cleaner).
+rm -f "$SECRETS/token"
 
 # Kill any leftover process on the API port (port 8090, not 8080 — docker's
 # NAT for the host-publish 8080 would intercept 172.17.0.1:8080).
