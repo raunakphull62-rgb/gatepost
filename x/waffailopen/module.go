@@ -41,11 +41,6 @@ func init() {
 	caddy.RegisterModule(StatsAPI{})
 }
 
-// errWAFOpaque is a generic error returned to the client on a WAF failure.
-// It deliberately carries no request-derived text: a blocking host that
-// hits the 503 path must never echo the attacker's payload back.
-var errWAFOpaque = fmt.Errorf("WAF evaluation unavailable")
-
 // FailOpenHandler wraps the Coraza WAF handler with recover, a per-request
 // time budget and bounded concurrency. On failure it either returns 503
 // (blocking hosts) or falls through to the next handler (detection/off
@@ -110,10 +105,17 @@ func (h *FailOpenHandler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("waffailopen: embedded handler %T does not implement MiddlewareHandler", wafIface)
 	}
 	h.WAF = mh
+	return h.parseConfig()
+}
 
+// parseConfig validates and parses the timeout/concurrency fields into
+// internal types. It does NOT touch WAFRaw — callers may inject h.WAF
+// directly for testing.
+func (h *FailOpenHandler) parseConfig() error {
 	// Parse timeout (default 250ms).
 	h.timeout = 250 * time.Millisecond
 	if h.Timeout != "" {
+		var err error
 		h.timeout, err = time.ParseDuration(h.Timeout)
 		if err != nil {
 			return fmt.Errorf("waffailopen: invalid timeout %q: %w", h.Timeout, err)
@@ -126,6 +128,7 @@ func (h *FailOpenHandler) Provision(ctx caddy.Context) error {
 	// Parse concurrency wait (default 50ms).
 	h.wait = 50 * time.Millisecond
 	if h.ConcurrencyWait != "" {
+		var err error
 		h.wait, err = time.ParseDuration(h.ConcurrencyWait)
 		if err != nil {
 			return fmt.Errorf("waffailopen: invalid concurrency_wait %q: %w", h.ConcurrencyWait, err)
@@ -194,7 +197,7 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 	// next (i.e. the request passed the WAF), and restores the original
 	// context + response writer so reverse_proxy is unaffected by the
 	// WAF timeout budget.
-	pt := &passThrough{next: onceNext, origW: w, origCtx: r.Context()}
+	pt := &passThrough{next: onceNext, origW: w, origCtx: r.Context(), passed: make(chan struct{})}
 
 	// Run the WAF handler in a goroutine with recover.
 	type wafResult struct{ err error }
@@ -257,9 +260,11 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 func (h *FailOpenHandler) failOpen(w http.ResponseWriter, r *http.Request, host, mode string, hdl caddyhttp.Handler) error {
 	if mode == "blocking" {
 		w.Header().Set("Retry-After", "1")
-		return caddyhttp.Error(http.StatusServiceUnavailable, errWAFOpaque)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(http.StatusText(http.StatusServiceUnavailable)))
+		return nil
 	}
-	// detection/off: pass through, skip WAF
 	return hdl.ServeHTTP(w, r)
 }
 

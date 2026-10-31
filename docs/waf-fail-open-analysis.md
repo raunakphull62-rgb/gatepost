@@ -16,12 +16,16 @@ only if the process survives the call.
 
 ### 2. Panic in the WAF handler
 A nil deref, an out-of-range index, or a bad rule definition panics inside
-`eval`/`InspectRequestBody`. Without a recover, the panic propagates through
-Caddy's HTTP handler and kills the **whole edge process** (not just the one
-request) — every served host drops, TLS handshakes stall, and the node
-reboots into a cold-start window every time the rule fires. That is a
-stability bug, not just a WAF bug: a single rule in a single tenant's
-policy could take down the edge for everyone.
+`eval`/`InspectRequestBody`. Caddy's HTTP server recovers the panic at the
+handler boundary (returning 500 to the client), so the **process survives**
+— the baseline test `TestWAFOpaquePanicBaseline` confirms a second request
+to a different host succeeds immediately after the panic. However, the
+panicking request itself fails with a 500 (not a 403), the panic is not
+counted, is not surfaced in /health, and a blocking host's rule that panics
+silently downgrades to 500 rather than the expected 403 — an
+observability and correctness gap, not a crash. The waffailopen wrapper
+adds application-level recovery: the panic becomes a counted 503 (blocking)
+or a pass-through (detection), and the counters appear in /health.
 
 ### 3. Slow evaluation (head-of-line blocking)
 A pathological request (nested encodings, huge body, a rule with a hot
