@@ -434,3 +434,62 @@ Deterministic forwarder ports were considered and rejected: they only
 remove the ~0.3s post-boot apply gap, not the downtime, which the
 supervisor bounds either way.
 
+## 2026-10-31 — A missing node token degrades to last-good serving, not a fatal boot (B3c item 2c)
+
+**Rule.** A missing/empty/unreadable node token is a POLLING-credential failure,
+not a trust-anchor failure: the poller boots, loads and verifies its saved
+snapshot, and serves last-good instead of exiting. It does not poll (no 401
+flood), does not climb the backoff streak (a missing token is not a connection
+failure), and re-reads the token file on every cycle so a refilled secret
+restores polling with **no restart**. `/health` returns **200** with the
+degraded reason in the body — a 503 would just restart the loop into the same
+empty-token state (the exact crash/loop the `.supervise-off` trap exists to
+avoid during tests). After `GP_EDGE_STALE_LIMIT` (default **24h**) the poller
+logs a **CRITICAL** line every hour until recovery; the node is never
+auto-taken down.
+
+**Mechanics.** `bootToken` (main.go) resolves the token with DISTINCT reasons
+for missing / empty / unreadable so a deploy typo is diagnosable.
+`bootStateDir` / `stateDirProbe` classify the state dir: writable → normal; a
+read-only mount that still holds a saved snapshot → degrade (load read-only,
+never write back, persist gated on `!ReadOnlyFS`); missing dir AND no snapshot
+→ fatal. The signing key, API base, issuer, WAF mode, features, and admin
+address stay fatal via `envOrFile` — they are trust anchors, not polling
+credentials, and a node that can't correctly verify/identify cannot correctly
+serve.
+
+**Boot conditions — fatal vs. degrade.** The poller splits its boot inputs by
+trust role, not by "all secrets":
+
+| Input | Role | Boot |
+|---|---|---|
+| node token | poll credential (ephemeral) | **degrade** — serve last-good, no poll |
+| snapshot signing key | verification (trust anchor) | fatal |
+| API base | control-plane identity | fatal |
+| issuer | cert issuance identity | fatal |
+| WAF mode | policy posture | fatal |
+| features | capability gate (B3c item 2b) | fatal — unknown features rejected at boot |
+| admin address | ask endpoint | fatal |
+| state dir (writable / creatable) | writeback location | normal |
+| state dir (read-only, with snapshot) | same | **degrade** (read-only) |
+| state dir (missing, no snapshot) | nothing to serve | fatal |
+
+**Why.** Serving last-good is strictly safer than 502-for-everyone, and a
+missing token keeps the node SERVING while a missing trust anchor means it
+cannot CORRECTLY serve (failed verification, wrong plane, wrong policy). The
+downside is a stale config, bounded by the `GP_EDGE_STALE_LIMIT` CRITICAL log:
+an operator is paged before staleness becomes unbounded, and the node keeps
+answering from a known-good artifact. Determined by the schema-gate work
+(B3c item 2b) which established that the poller owns the egress forwarders in
+the edge's shared network namespace, so a boot-fatal poller takes down served
+hosts even with a good snapshot on disk.
+
+**Evidence.** `TestTokenFileEmptyThenRestoredDegradesServesLastGood` boots a
+real poller with an empty token file: the ask endpoint stays 200 from boot
+(last-good applies at boot, 0 non-200 during the blip), 0 poll requests and 0
+backoff-streak lines while degraded, then a refilled token resumes polling
+within one poll cycle with no restart. `TestDegradedStalenessLogsCritical`
+confirms the CRITICAL staleness line fires past `StaleLimit` while `/health`
+stays 200. Production-pace acceptance (170 passed / 0 failed) and the 5-min
+soak (zero non-200) pass against the item-2c binary.
+
