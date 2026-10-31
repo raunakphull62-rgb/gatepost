@@ -91,6 +91,11 @@ type Config struct {
 	// next poll rebuilds, GP_SNAPSHOT_TTL. Writes invalidate it regardless.
 	// Zero falls back to 30.
 	SnapshotTTLSeconds int
+	// Node staleness (B3c item 2c Q7a): GP_NODE_STALE_MINUTES — an ACTIVE node
+	// whose last_seen is older than this opens one node_stale alert (deduped
+	// in the DB per 008), auto-resolved by its next heartbeat. Zero falls back
+	// to 10. Nodes that never connected (last_seen IS NULL) are never alerted.
+	NodeStaleMinutes int
 }
 
 type Principal struct {
@@ -154,6 +159,9 @@ func New(cfg Config, pool *pgxpool.Pool, mail mailer.Sender) *Server {
 	}
 	if s.cfg.SnapshotTTLSeconds <= 0 {
 		s.cfg.SnapshotTTLSeconds = 30 // B3a default: rebuild a stale artifact at most twice a minute
+	}
+	if s.cfg.NodeStaleMinutes <= 0 {
+		s.cfg.NodeStaleMinutes = 10 // B3c default: alert after 10 min of node silence
 	}
 	s.serviceHostnames = map[string]struct{}{}
 	for _, h := range cfg.ServiceHostnames {

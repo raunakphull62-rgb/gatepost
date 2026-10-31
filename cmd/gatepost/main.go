@@ -112,6 +112,7 @@ func main() {
 		SnapshotKey:             os.Getenv("GP_SNAPSHOT_KEY"),
 		OriginUnresolvedMinutes: atoiEnv("GP_ORIGIN_UNRESOLVED_MINUTES"),
 		NodePollCap:             atoiEnv("GP_NODE_RATE_CAP"),
+		NodeStaleMinutes:        atoiEnv("GP_NODE_STALE_MINUTES"),
 		SnapshotTTLSeconds:      atoiEnv("GP_SNAPSHOT_TTL"),
 	}
 	// the boot gate runs on the fully parsed config: a message and exit
@@ -132,6 +133,28 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-time.After(time.Hour):
+			}
+		}
+	}()
+
+	// Stale-node sweep (B3c item 2c Q7a): an active node that stops heartbeating
+	// opens a node_stale alert; its next heartbeat resolves it. Runs on its own
+	// cadence so staleness is caught even when no snapshot builds — a silent
+	// node with no config churn still pages. Sweep interval is fixed (2 min);
+	// the staleness threshold is GP_NODE_STALE_MINUTES (default 10). The count
+	// is silent nodes FOUND this pass (DB dedup keeps one open alert per node).
+	go func() {
+		const sweepInterval = 2 * time.Minute
+		for {
+			if n, err := srv.SweepStaleNodes(context.Background()); err != nil {
+				log.Printf("stale-node sweep: %v", err)
+			} else if n > 0 {
+				log.Printf("stale-node sweep: %d silent active node(s) (open alerts deduped in-DB)", n)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(sweepInterval):
 			}
 		}
 	}()

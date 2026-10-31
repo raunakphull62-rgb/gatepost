@@ -5,7 +5,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -219,7 +221,50 @@ func (s *Server) nodeHeartbeat(w http.ResponseWriter, r *http.Request, n nodeRow
 		fail(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// A successful heartbeat is the "heard from" signal: clear any open
+	// node_stale alert for this node (Q7a auto-resolve). A refused heartbeat
+	// (bad/unknown generation above) stamps nothing and resolves nothing.
+	s.resolveAlert(r.Context(), "node_stale", n.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"applied_generation": body.Generation})
+}
+
+// sweepStaleNodes scans for ACTIVE nodes that have checked in (last_seen IS
+// NOT NULL) but have not heartbeated within NodeStaleMinutes and opens a
+// node_stale alert for each. recordAlert dedupes by (kind, subject), so a
+// silent node already carrying an OPEN alert is left alone — the DB's unique
+// index is the dedup gate, exactly like origin_unsafe. A node that never
+// connected (last_seen IS NULL) is never alerted: "never seen" is not "gone
+// silent", so a freshly minted-but-not-yet-booted node does not page. Returns
+// the count of silent nodes found this pass (some may raise no new alert if
+// one is already open).
+func (s *Server) SweepStaleNodes(ctx context.Context) (int, error) {
+	mins := s.cfg.NodeStaleMinutes
+	if mins <= 0 {
+		mins = 10
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, name, role, last_seen FROM nodes
+		WHERE status = 'active' AND last_seen IS NOT NULL
+		  AND last_seen < now() - $1::interval
+		ORDER BY last_seen`,
+		fmt.Sprintf("%d minutes", mins))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var silent int
+	for rows.Next() {
+		var id, name, role string
+		var lastSeen time.Time
+		if err := rows.Scan(&id, &name, &role, &lastSeen); err != nil {
+			return silent, err
+		}
+		silent++
+		s.recordAlert(ctx, "node_stale", id, fmt.Sprintf(
+			"node %s (%s) not heard from in %s; last seen %s (stale limit %dm)",
+			name, role, time.Since(lastSeen).Truncate(time.Second),
+			lastSeen.Format(time.RFC3339), mins))
+	}
+	return silent, rows.Err()
 }
 
 // etagMatches — If-None-Match may list candidates or "*" (any); quotes and
