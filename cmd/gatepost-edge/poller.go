@@ -597,12 +597,15 @@ func (p *Poller) serveHealth(w http.ResponseWriter, _ *http.Request) {
 		if r := p.degradeReason(); r != "" {
 			body = "ok (degraded: " + r + "; serving last-good, not polling)"
 		}
+		// The waf_config_failed note must show even when the stats endpoint is
+		// gone: WAF-off fallback has no waffailopen handler to provision, so
+		// fetchWAFStats returns nil exactly when the note matters most.
 		if stats := p.fetchWAFStats(); stats != nil {
 			body += fmt.Sprintf("; waf: panics=%d timeouts=%d saturated=%d",
 				stats.Panics, stats.Timeouts, stats.Saturated)
-			if p.wafFallback.Load() {
-				body += " (waf_config_failed: serving WAF-off)"
-			}
+		}
+		if p.wafFallback.Load() {
+			body += " (waf_config_failed: serving WAF-off)"
 		}
 		fmt.Fprint(w, body)
 	}

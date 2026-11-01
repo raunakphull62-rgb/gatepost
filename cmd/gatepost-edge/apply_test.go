@@ -792,6 +792,31 @@ func TestServeHealthReportsStalls(t *testing.T) {
 	}
 }
 
+// The waf_config_failed note must appear in /health even when the waffailopen
+// stats endpoint is unreachable: during WAF-off fallback there is NO handler
+// provisioned, so stats are nil exactly when the note matters most.
+func TestHealthWAFConfigFailedNoteSurvivesNilStats(t *testing.T) {
+	cfg := newTestCfg(t, &logHook{}, t.TempDir(), "", "", nil)
+	cfg.CaddyAdmin = "" // fetchWAFStats returns nil immediately
+	p := NewPoller(cfg)
+
+	r := httptest.NewRecorder()
+	p.serveHealth(r, nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("/health = %d, want 200", r.Code)
+	}
+	if body := r.Body.String(); strings.Contains(body, "waf_config_failed") {
+		t.Fatalf("clean node reports waf_config_failed: %q", body)
+	}
+
+	p.wafFallback.Store(true)
+	r = httptest.NewRecorder()
+	p.serveHealth(r, nil)
+	if body := r.Body.String(); !strings.Contains(body, "waf_config_failed") {
+		t.Fatalf("fallback node /health body missing waf_config_failed: %q", body)
+	}
+}
+
 // Soak test for issue B: with the API unreachable and caddy rejecting configs,
 // the apply loop stays inside a cooldown wait or a retry wait that EXCEEDS
 // applyStallLimit (30s in production, 200ms here). Before the fix, those waits

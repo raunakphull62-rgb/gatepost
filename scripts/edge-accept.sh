@@ -45,6 +45,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 COMPOSE=deploy/dev/compose.yaml
+FAULT_ARGS=()   # section q only: -f deploy/dev/compose.poller-fault.yaml
 SECRETS=deploy/dev/secrets
 API=http://172.17.0.1:8090
 EDGE_HTTP=http://127.0.0.1:8081
@@ -140,7 +141,9 @@ dc() {
   if [ "${1:-}" = "exec" ]; then
     cmd_args=("exec" "-T" "${@:2}")
   fi
-  sudo env "${env_args[@]}" docker compose -f "$COMPOSE" --profile poller "${cmd_args[@]}"
+  # FAULT_ARGS (section q only): -f deploy/dev/compose.poller-fault.yaml to
+  # swap in the fault poller image; empty everywhere else.
+  sudo env "${env_args[@]}" docker compose -f "$COMPOSE" ${FAULT_ARGS[@]+"${FAULT_ARGS[@]}"} --profile poller "${cmd_args[@]}"
 }
 
 # until_ok <timeout-s> <what> <shell-condition>: evaluated in THIS shell
@@ -1128,6 +1131,93 @@ check "p) resumed polling logged once (transition, not flood)" \
   "$(dc logs --since "$P_START" poller 2>/dev/null | grep -c 'resumed polling: node token restored')" "1"
 # Edge still serves 200 — the resume path has no blip of its own.
 check "p) edge still serves 200 after token restore (no restart)" \
+  "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+
+# --- q) invalid WAF config rejected → WAF-off fallback keeps the edge serving ---
+# B3c item 4's last live proof: when Caddy REJECTS the generated WAF config
+# (400 — bad SecAction, undefined rule, module mismatch), the poller retries
+# WITHOUT the Coraza handler so the edge keeps serving every host, the
+# heartbeat reports waf_fallback (the API opens a waf_config_failed alert),
+# and the next valid snapshot re-applies the WAF and auto-resolves the alert.
+# The rejection is driven by a FAULT-ONLY knob: the gatepost_edge_fault
+# poller image replaces the generated WAF directives with the contents of
+# $GP_EDGE_FAULT_WAF_FILE. Deleting the file makes the next snapshot valid
+# again — no restart anywhere. The production image has no such hook.
+section "q) WAF config rejected by Caddy → WAF-off fallback, then auto-resolve"
+FAULT_COMPOSE=deploy/dev/compose.poller-fault.yaml
+if sudo docker build -q -f deploy/dev/Dockerfile.poller.fault -t gatepost-poller-fault:dev . >/dev/null 2>&1; then
+  pass "q) fault poller image built (gatepost_edge_fault tag, fault hook in)"
+else
+  fail "q) fault poller image build failed"
+fi
+FAULT_ARGS=(-f "$FAULT_COMPOSE")
+Q_START=$(date +%s)
+dc up -d --force-recreate poller >/dev/null 2>&1 \
+  && pass "q) fault poller up (GP_EDGE_FAULT_WAF_FILE=/state/waf-fault.txt)" \
+  || { fail "q) fault poller did not start"; }
+until_ok 30 "q) fault poller applied the snapshot (WAF still live)" \
+  'dc logs --since "$Q_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
+# The invalid directive: an unknown action makes coraza's parser fail at
+# provision time, so Caddy answers /load with 400 and keeps the last-good
+# config running.
+dc exec poller sh -c 'printf "SecAction \"phase:1,not_a_real_action:1,id:999999\"\n" > /state/waf-fault.txt'
+check_ne "q) fault file written into the poller state volume" \
+  "$(dc exec poller cat /state/waf-fault.txt 2>/dev/null | grep -c not_a_real_action)" "0"
+# Trigger a new generation: flip the domain's WAF mode (detection → blocking).
+# The poller generates WAF directives, the fault hook swaps in the invalid
+# SecAction, Caddy rejects, the fallback applies the WAF-off config.
+T0=$SECONDS
+QLOG=$(date +%s)
+OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"blocking"}')
+check "q) set $HOST blocking (new generation to carry the poisoned WAF config)" "$(codeof "$OUT")" "200"
+until_ok 90 "q) poller logged the rejection and applied the WAF-off fallback" \
+  'dc logs --since "$QLOG" poller 2>/dev/null | grep -q "serving WAF-off config"'
+echo "     q) rejection → fallback took $((SECONDS - T0))s ($PACE_LABEL)"
+# THE fail-open property: the edge never stopped serving through the whole
+# rejection — same host, same origin, 200 from origin-test.
+check "q) edge still serves $HOST during WAF-off fallback" \
+  "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+# /health: still 200, and the body names the fallback (the waffailopen stats
+# endpoint is gone with the handler, so the note must survive stats == nil).
+check "q) /health is 200 during fallback" \
+  "$(dc exec poller wget -S -O /dev/null 'http://127.0.0.1:8099/health' 2>&1 | grep -c 'HTTP/1.1 200')" "1"
+HEALTH_BODY=$(dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/null || true)
+check "q) /health body reports waf_config_failed (WAF-off)" \
+  "$(printf '%s' "$HEALTH_BODY" | grep -c 'waf_config_failed')" "1"
+# The heartbeat carried waf_fallback=true → the API opened the operator alert.
+if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+  until_ok 30 "q) waf_config_failed alert OPEN for the node" \
+    "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 1"
+else
+  fail "q) psql not available — cannot verify the operator alert"
+fi
+# Recovery: delete the fault file, flip the mode again (blocking → detection);
+# the next snapshot's WAF config is valid, Caddy accepts it, the WAF is live
+# and the alert auto-resolves. No restart anywhere.
+dc exec poller rm -f /state/waf-fault.txt
+T0=$SECONDS
+QLOG=$(date +%s)
+OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}')
+check "q) set $HOST detection again (recovery generation)" "$(codeof "$OUT")" "200"
+until_ok 90 "q) WAF live again: stats endpoint answers after auto-resolve" \
+  'dc exec edge wget -qO- http://127.0.0.1:2019/waffailopen/stats 2>/dev/null | grep -q "\"mode\":\"detection\""'
+echo "     q) auto-resolve took $((SECONDS - T0))s ($PACE_LABEL)"
+check "q) edge serves $HOST with the WAF back (detection passes SQLi)" \
+  "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok?id=%27%20OR%20%271%27%3D%271" | grep -c 'port 9001')" "1"
+if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
+  until_ok 30 "q) waf_config_failed alert auto-RESOLVED" \
+    "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 0"
+fi
+# No new fallback line after the fault file was removed: the recovery was a
+# clean apply, not another rejection cycle.
+check "q) no re-rejection after the fault file was removed" \
+  "$(dc logs --since "$QLOG" poller 2>/dev/null | grep -c 'WAF config rejected')" "0"
+# Restore the DEFAULT poller: no override, no fault hook, fresh binary.
+FAULT_ARGS=()
+dc up -d --build --force-recreate poller >/dev/null 2>&1
+until_ok 30 "q) default poller restored (no fault image, no fault env)" \
+  'dc logs --since "$Q_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
+check "q) edge still serves after the default poller came back" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
 section "verdict"

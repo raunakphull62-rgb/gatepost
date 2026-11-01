@@ -1,0 +1,9 @@
+# FAULT-ONLY override for the config-rejection fallback test (section q of
+# scripts/edge-accept.sh): swaps in the gatepost_edge_fault poller image and
+# points the fault hook at a file in the poller_state volume. NEVER used in
+# production — the default poller image contains no fault hook at all.
+services:
+  poller:
+    image: gatepost-poller-fault:dev
+    environment:
+      GP_EDGE_FAULT_WAF_FILE: /state/waf-fault.txt
