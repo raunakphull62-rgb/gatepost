@@ -405,6 +405,10 @@ until_ok 30 "the no-snapshot edge takes the deny-all posture" \
 check "b) known host over http = 421" "$(code_of -H "Host: $HOST" "$EDGE_HTTP/ok")" "421"
 check "b) denied host over http = 421" "$(code_of -H "Host: $DENIED" "$EDGE_HTTP/ok")" "421"
 check "b) unknown host over http = 421" "$(code_of -H "Host: $STRANGER" "$EDGE_HTTP/ok")" "421"
+# Deterministic: wait for the HTTPS listener to accept connections before
+# probing it (caddy's TLS listener can lag the HTTP listener on cold start).
+until_ok 30 "b) HTTPS listener accepts connections" \
+  'code_of -sk --resolve "$HOST:8445:127.0.0.1" "$EDGE_HTTPS/ok" >/dev/null 2>&1'
 C=$(code_of -sk --resolve "$HOST:8445:127.0.0.1" "$EDGE_HTTPS/ok")
 check "b) known host over https = 421 (fallback cert, no ask answer)" "$C" "421"
 C=$(code_of -sk --resolve "$DENIED:8445:127.0.0.1" "$EDGE_HTTPS/ok")
@@ -1186,17 +1190,18 @@ check "q) /health is 200 during fallback" \
 HEALTH_BODY=$(dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/null || true)
 check "q) /health body reports waf_config_failed (WAF-off)" \
   "$(printf '%s' "$HEALTH_BODY" | grep -c 'waf_config_failed')" "1"
-# The heartbeat carried waf_fallback=true → the API opened the operator alert.
-# Wait a moment for the next heartbeat (poll interval ~1s in fast mode).
-sleep 3
+# DETERMINISTIC: check the alert is OPEN while the fault is STILL ACTIVE.
+# The heartbeat with waf_fallback=true was sent when fallback was applied;
+# wait for it to be persisted (API is synchronous after heartbeat returns 200).
+# In fast mode the poll cycle is 1s; the heartbeat fires on the NEXT tick,
+# so the alert can take a few cycles to appear. Bounded retry up to 30s.
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
-  # Debug: show alert count before the wait
-  until_ok 15 "q) waf_config_failed alert OPEN for the node" \
+  until_ok 30 "q) waf_config_failed alert OPEN (fault still active)" \
     "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 1"
 else
   fail "q) psql not available — cannot verify the operator alert"
 fi
-# Recovery: delete the fault file, flip the mode again (blocking → detection);
+# RECOVERY: delete the fault file, flip the mode again (blocking → detection);
 # the next snapshot's WAF config is valid, Caddy accepts it, the WAF is live
 # and the alert auto-resolves. No restart anywhere.
 dc exec poller rm -f /state/waf-fault.txt
