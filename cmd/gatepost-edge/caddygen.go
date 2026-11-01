@@ -717,6 +717,7 @@ func wafHandler(w WAFConfig, doms []snapshot.Domain) (*corazaWAF, error) {
 	if err != nil {
 		return nil, err
 	}
+	d = faultWAFDirectives(d) // fault-only knob: no-op without the build tag
 	return &corazaWAF{
 		Handler:      "waf", // short name; Caddy resolves to http.handlers.waf
 		LoadOWASPCRS: true,
