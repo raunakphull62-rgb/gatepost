@@ -493,3 +493,26 @@ confirms the CRITICAL staleness line fires past `StaleLimit` while `/health`
 stays 200. Production-pace acceptance (170 passed / 0 failed) and the 5-min
 soak (zero non-200) pass against the item-2c binary.
 
+## 2026-11-01 — Applied migrations are never edited; fixes go in a new migration (migration drift)
+
+**Rule.** Once a migration file has been applied to any database (dev, test,
+or production) and recorded in `schema_migrations`, its content is immutable.
+If the SQL needs to change, a NEW migration file is added (014, 015, …) that
+drops and recreates whatever the earlier migration did. Editing an applied
+migration silently diverges already-applied databases from fresh ones — the
+same file hash means different schema states depending on when it was applied.
+
+**Mechanics.** `db.Migrate` (internal/db/db.go) applies migrations from
+`gatepost/migrations/` in lexicographic order, recording each in
+`schema_migrations`. A test (`TestMigrationChecksumsStable`) pins the SHA-256
+of every migration file and fails if any previously-applied file changes.
+Migration drift found on this repo: `013_node_stale_alert.sql` was edited
+after its first application (commit 33f84b6 added `waf_config_failed` to the
+CHECK constraint that 964e2f58 had originally applied without it). Fixed by
+restoring 013 to its originally-applied content and adding
+`014_waf_config_failed_alert.sql` to widen the CHECK constraint.
+
+**Why.** A migration that changes meaning after application breaks the
+"apply to empty DB == apply to dev DB" invariant that tests and acceptance
+runs depend on.
+

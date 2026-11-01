@@ -8,4 +8,4 @@
 -- must not page.
 ALTER TABLE operator_alerts DROP CONSTRAINT operator_alerts_kind_check;
 ALTER TABLE operator_alerts ADD CONSTRAINT operator_alerts_kind_check
-  CHECK (kind IN ('origin_unsafe','origin_unresolved','snapshot_build_failed','node_stale','waf_config_failed'));
+  CHECK (kind IN ('origin_unsafe','origin_unresolved','snapshot_build_failed','node_stale'));
