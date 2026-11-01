@@ -94,8 +94,7 @@ func (FailOpenHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.waffailopen",
 		New: func() caddy.Module { return new(FailOpenHandler) },
-	}
-}
+	}}
 
 // Provision sets up the handler.
 func (h *FailOpenHandler) Provision(ctx caddy.Context) error {
@@ -192,22 +191,18 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 			return true
 		}))
 
-	// onceHandler ensures next is only invoked once, preventing double
-	// reverse_proxy calls when both the WAF goroutine and the timeout
-	// handler race to call next.
+	// onceHandler ensures next is only invoked once AND provides a
+	// "committed" flag so the fail-open path can prevent the late WAF
+	// goroutine from writing to the response writer after the main
+	// goroutine has already committed a 503 response.
 	onceNext := &onceHandler{next: next}
 
 	// passThrough signals the main goroutine when the WAF handler calls
 	// next (i.e. the request passed the WAF), and restores the original
 	// context + response writer so reverse_proxy is unaffected by the
-	// WAF timeout budget.
-	// failW wraps the original ResponseWriter so that when the timeout/
-	// panic/saturation path writes a 503, any late write from the still-
-	// running WAF goroutine (via passThrough → onceNext → next) is
-	// swallowed — preventing the data race and double-response.
-	fw := &failSafeWriter{ResponseWriter: w}
-
-	pt := &passThrough{next: onceNext, origW: fw, origCtx: r.Context(), passed: make(chan struct{})}
+	// WAF timeout budget. It also checks onceNext.committed to swallow
+	// late writes after the fail-open path has taken the response.
+	pt := &passThrough{next: onceNext, origW: w, origCtx: r.Context(), passed: make(chan struct{})}
 
 	// Run the WAF handler in a goroutine with recover.
 	type wafResult struct{ err error }
@@ -248,9 +243,8 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 		return nil
 
 	case res := <-resultCh:
-		// WAF handler returned (error or nil) without calling next.
 		if res.err == errPanic {
-			return h.failOpen(fw, r, host, mode, next)
+			return h.failOpen(w, r, host, mode, onceNext)
 		}
 		// WAF-generated response (e.g. 403) is in the recorder.
 		if rec.Buffered() {
@@ -261,10 +255,9 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 		return res.err
 
 	case <-timer.C:
-		// Timeout: the WAF handler is still in rule evaluation.
 		h.stats.timeouts.Add(1)
 		log.Printf("waffailopen: TIMEOUT for host %s (budget %s exceeded)", host, h.timeout)
-		return h.failOpen(fw, r, host, mode, onceNext)
+		return h.failOpen(w, r, host, mode, onceNext)
 	}
 }
 
@@ -273,6 +266,11 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 // payload); detection hosts fall through to next.
 func (h *FailOpenHandler) failOpen(w http.ResponseWriter, r *http.Request, host, mode string, hdl caddyhttp.Handler) error {
 	if mode == "blocking" {
+		// Mark committed so the late WAF goroutine's passThrough swallows
+		// its write — preventing a data race on the ResponseWriter.
+		if oh, ok := hdl.(*onceHandler); ok {
+			oh.committed.Store(true)
+		}
 		w.Header().Set("Retry-After", "1")
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -309,8 +307,9 @@ var errPanic = fmt.Errorf("waf panic recovered")
 // reverse_proxy calls when the WAF goroutine and the timeout/fallback
 // path both try to invoke next.
 type onceHandler struct {
-	next   caddyhttp.Handler
-	called atomic.Bool
+	next      caddyhttp.Handler
+	called    atomic.Bool
+	committed atomic.Bool
 }
 
 func (o *onceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
@@ -334,37 +333,14 @@ type passThrough struct {
 
 func (p *passThrough) ServeHTTP(_ http.ResponseWriter, r *http.Request) error {
 	p.once.Do(func() { close(p.passed) })
-	// Restore original context so reverse_proxy is not subject to the
-	// WAF evaluation timeout.
+	// If the fail-open path already committed a 503 response, swallow
+	// this late pass-through — the WAF goroutine is still running but
+	// the response has been taken by the fail-open path.
+	if oh, ok := p.next.(*onceHandler); ok && oh.committed.Load() {
+		return nil
+	}
 	r = r.WithContext(p.origCtx)
-	// origW is wrapped by failSafeWriter; the underlying writer is shared
-	// with the fail-open 503 path. failSafeWriter ensures only one side
-	// writes (the first to call WriteHeader wins).
 	return p.next.ServeHTTP(p.origW, r)
-}
-
-// failSafeWriter wraps the original ResponseWriter so that the fail-open 503
-// path (from the timeout/panic/saturation case in the main goroutine) and
-// any late write from the still-running WAF goroutine (via passThrough →
-// next) do not race on the same http.ResponseWriter. The first WriteHeader
-// call wins; subsequent calls are swallowed.
-type failSafeWriter struct {
-	http.ResponseWriter
-	failed atomic.Bool
-}
-
-func (f *failSafeWriter) WriteHeader(statusCode int) {
-	if !f.failed.CompareAndSwap(false, true) {
-		return // another path already committed the response
-	}
-	f.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (f *failSafeWriter) Write(b []byte) (int, error) {
-	if !f.failed.Load() {
-		return f.ResponseWriter.Write(b)
-	}
-	return len(b), nil // swallow: response already committed elsewhere
 }
 
 // Interface guards

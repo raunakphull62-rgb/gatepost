@@ -186,9 +186,13 @@ func withAdmin(t *testing.T, cfg Config, admin *httptest.Server) Config {
 func startPollerRaw(t *testing.T, cfg Config) *Poller {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done // wait for the goroutine: it reads package-level test knobs
+	})
 	p := NewPoller(cfg)
-	go func() { _ = p.Run(ctx) }()
+	go func() { defer close(done); _ = p.Run(ctx) }()
 	return p
 }
 

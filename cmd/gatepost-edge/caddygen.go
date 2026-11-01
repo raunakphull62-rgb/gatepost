@@ -399,7 +399,7 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 			// saturation the wrapper fails closed (503) for blocking hosts
 			// and fails open (pass through) for detection hosts.
 			handle = append(handle, wafFailOpenHandler{
-				Handler:         "gatepost/waffailopen",
+				Handler:         "waffailopen",
 				WAF:             waf,
 				Timeout:         p.WAF.Timeout,
 				Concurrency:     p.WAF.Concurrency,

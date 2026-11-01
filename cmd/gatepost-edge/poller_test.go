@@ -240,8 +240,12 @@ func newTestCfg(t *testing.T, hook *logHook, stateDir, baseURL, token string, ke
 func startPoller(t *testing.T, cfg Config) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = NewPoller(cfg).Run(ctx) }()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done // wait for the goroutine: it reads package-level test knobs
+	})
+	go func() { defer close(done); _ = NewPoller(cfg).Run(ctx) }()
 	return "http://" + cfg.AskLn.Addr().String()
 }
 

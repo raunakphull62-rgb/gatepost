@@ -140,7 +140,7 @@ func TestGenerateEmitsCorazaHandler(t *testing.T) {
 	var foundCoraza bool
 	for _, rt := range cfg.Apps.HTTP.Servers["edge"].Routes {
 		for _, h := range rt.Handle {
-			if m, ok := h.(map[string]any); ok && m["handler"] == "gatepost/waffailopen" {
+			if m, ok := h.(map[string]any); ok && m["handler"] == "waffailopen" {
 				foundCoraza = true
 				wafCfg, ok := m["waf"].(map[string]any)
 				if !ok {
@@ -172,7 +172,7 @@ func TestGenerateEmitsCorazaHandler(t *testing.T) {
 		}
 	}
 	if !foundCoraza {
-		t.Fatal("expected a gatepost/waffailopen handler in the generated routes")
+		t.Fatal("expected a waffailopen handler in the generated routes")
 	}
 }
 

@@ -74,7 +74,8 @@ func (p *Poller) startApply(ctx context.Context) {
 		return
 	}
 	p.fwd = newForwarder(p.cfg)
-	go p.applyLoop(ctx)
+	p.applyWG.Add(1)
+	go func() { defer p.applyWG.Done(); p.applyLoop(ctx) }()
 }
 
 // enqueueApply is accept's hook into the apply loop: content-equal to what

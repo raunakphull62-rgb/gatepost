@@ -122,6 +122,7 @@ type Poller struct {
 	lastLoad       time.Time          // last /load attempt (success or failure)
 	adminFirstFail time.Time          // start of the current admin-unreachable window
 	adminFail      chan error         // the apply loop's one fatal outcome (errAdminGone)
+	applyWG        sync.WaitGroup     // joins applyLoop before Run returns (tests restore package knobs in cleanup)
 
 	applyTick atomic.Int64 // last applyLoop wake (liveness: see serveHealth)
 	pollTick  atomic.Int64 // last poll-loop wake
@@ -231,6 +232,7 @@ func NewPoller(cfg Config) *Poller {
 // retrying on the ladder, a corrupt file is "no snapshot", nothing panics
 // out of a tick.
 func (p *Poller) Run(ctx context.Context) error {
+	defer p.applyWG.Wait() // first defer = last out: applyLoop is out before Run returns
 	p.startApply(ctx)
 	p.loadSavedSnapshot(ctx)
 

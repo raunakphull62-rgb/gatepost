@@ -117,7 +117,7 @@ func TestPanicFailOpenInDetectionMode(t *testing.T) {
 }
 
 func TestTimeoutFailClosedInBlockingMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: 500 * time.Millisecond})
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: "500ms"})
 	req := httptest.NewRequest("GET", "http://block.example.test/foo", nil)
 	rec := httptest.NewRecorder()
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +137,7 @@ func TestTimeoutFailClosedInBlockingMode(t *testing.T) {
 }
 
 func TestTimeoutFailOpenInDetectionMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "detection", &FaultConfig{Sleep: 500 * time.Millisecond})
+	h, rfp := newTestHandler(t, "detection", &FaultConfig{Sleep: "500ms"})
 	req := httptest.NewRequest("GET", "http://det.example.test/foo", nil)
 	rec := httptest.NewRecorder()
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +156,7 @@ func TestTimeoutFailOpenInDetectionMode(t *testing.T) {
 }
 
 func TestSaturationFailClosedInBlockingMode(t *testing.T) {
-	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: 200 * time.Millisecond})
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: "200ms"})
 	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rfp.ServeHTTP(w, r)
 	})}
@@ -231,6 +231,45 @@ func TestFailOpenNoPayloadEcho(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestLateCompletionResponseWrittenOnce: the WAF evaluation completes AFTER
+// the time budget and tries to write its own response. The fail-open 503 is
+// committed by the main goroutine; the late pass-through must be swallowed so
+// the response is written exactly once.
+func TestLateCompletionResponseWrittenOnce(t *testing.T) {
+	h, rfp := newTestHandler(t, "blocking", &FaultConfig{Sleep: "500ms"})
+	req := httptest.NewRequest("GET", "http://block.example.test/foo", nil)
+	rec := httptest.NewRecorder()
+	cw := &countWriter{inner: rec}
+	next := &handlerAdapter{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rfp.ServeHTTP(w, r)
+	})}
+	if err := h.ServeHTTP(cw, req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	// Let the late WAF goroutine finish and try its write.
+	time.Sleep(600 * time.Millisecond)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if n := cw.headers.Load(); n != 1 {
+		t.Errorf("WriteHeader called %d times, want exactly 1", n)
+	}
+	if rfp.called.Load() {
+		t.Error("origin reached after the 503 was committed")
+	}
+}
+
+type countWriter struct {
+	inner   http.ResponseWriter
+	headers atomic.Int32
+}
+
+func (c *countWriter) Header() http.Header { return c.inner.Header() }
+func (c *countWriter) WriteHeader(s int)   { c.headers.Add(1); c.inner.WriteHeader(s) }
+func (c *countWriter) Write(b []byte) (int, error) {
+	return c.inner.Write(b)
 }
 
 var _ caddyhttp.MiddlewareHandler = (*fakeWAFHandler)(nil)
