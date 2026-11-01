@@ -772,15 +772,19 @@ func TestEdgeAccessLogs(t *testing.T) {
 		ec.fail(fmt.Sprintf("unknown host = %d, want 421", code))
 	}
 
-	b, err := os.ReadFile(cfg.CaddyAccessLog)
-	if err != nil {
-		ec.fail("read access log: " + err.Error())
-	}
-	raw := string(b)
+	// Wait for the log writer to flush exactly 3 lines (3 requests = 3 lines).
+	// Caddy's access log is async; polling avoids the flaky immediate read.
+	var raw string
+	until(t, 10*time.Second, "access log has exactly 3 lines", func() bool {
+		b, err := os.ReadFile(cfg.CaddyAccessLog)
+		if err != nil {
+			return false
+		}
+		raw = string(b)
+		rows := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+		return len(rows) == 3
+	})
 	rows := strings.Split(strings.TrimRight(raw, "\n"), "\n")
-	if len(rows) != 3 {
-		ec.fail(fmt.Sprintf("access log has %d lines, want exactly 3 (a forged line would add to this):\n%s", len(rows), raw))
-	}
 	// The secrets are gone — values AND header names, the correction's two
 	// query values, the injected payload's level too ("info" is the only
 	// level these requests produce).

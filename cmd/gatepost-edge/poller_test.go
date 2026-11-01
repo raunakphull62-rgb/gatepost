@@ -871,7 +871,13 @@ func TestColdStartNoSnapshotServes421(t *testing.T) {
 	hook := &logHook{}
 	ask := startPoller(t, newTestCfg(t, hook, t.TempDir(), "http://"+addr, token, key))
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for the ask endpoint to be ready (poller started, apply loop ran).
+	// The ask listener starts immediately in startApply, so this confirms
+	// the poller is up without relying on a fixed sleep.
+	until(t, 5*time.Second, "ask endpoint ready", func() bool {
+		_, err := http.Get(ask + "/check?domain=test.example.com")
+		return err == nil // 421 is still a valid response; connection success = ready
+	})
 	for _, q := range []string{"?domain=nothing.example.com", "?domain=", "?_", ""} {
 		if code := askGet(t, ask, "/check"+q); code != http.StatusMisdirectedRequest {
 			t.Fatalf("no-snapshot ask %q = %d, want 421", q, code)

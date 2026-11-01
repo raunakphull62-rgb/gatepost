@@ -15,6 +15,8 @@ import (
 
 func newTestHandler(t *testing.T, mode string, fault *FaultConfig) (*FailOpenHandler, *fakeReverseProxy) {
 	t.Helper()
+	// Enable fault injection for tests (normally controlled by GP_EDGE_FAULT_WAF_ENABLED env var).
+	t.Setenv("GP_EDGE_FAULT_WAF_ENABLED", "true")
 	rfp := &fakeReverseProxy{}
 	h := &FailOpenHandler{
 		Timeout:               "250ms",
