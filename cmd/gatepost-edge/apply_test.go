@@ -928,3 +928,46 @@ func TestHealthSoakCooldownWindow(t *testing.T) {
 	// After cooldown, the second /load lands.
 	until(t, 3*time.Second, "post-cooldown /load", func() bool { return al.count() == 2 })
 }
+
+// TestHeartbeatBoundedTimeoutWhenAPIDown: the heartbeat uses a bounded
+// context so a down or slow API cannot stall the apply loop beyond a few
+// seconds (the liveness limit is 30s). The fake API accepts the TCP
+// connection but never answers the heartbeat POST — without the bounded
+// context this would block for the full 10s client timeout.
+func TestHeartbeatBoundedTimeoutWhenAPIDown(t *testing.T) {
+	key := makeKey(t)
+	token := "node-token-hb-down"
+
+	// Slow API: accepts connections, never responds to heartbeat POST.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/node/v1/heartbeat" && r.Method == http.MethodPost {
+			// Never write a response — block until the client times out.
+			select {}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cfg := newTestCfg(t, &logHook{}, t.TempDir(), slow.URL, token, key)
+	cfg.WAF.Mode = "detection"
+
+	p := NewPoller(cfg)
+	// Simulate an applied generation with WAF fallback active so heartbeat
+	// actually attempts to send (gen > 0, gen != acked, waf changed).
+	p.mu.Lock()
+	p.generation = 1
+	p.acked = 0
+	p.wafFallback.Store(true)
+	p.mu.Unlock()
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.heartbeat(ctx)
+	elapsed := time.Since(start)
+
+	// Must return within ~2s (the bounded heartbeat context), not 10s.
+	if elapsed > 5*time.Second {
+		t.Fatalf("heartbeat blocked for %v when API is slow — bounded timeout not working", elapsed)
+	}
+	t.Logf("heartbeat returned in %v with slow API", elapsed)
+}

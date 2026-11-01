@@ -324,6 +324,11 @@ func (p *Poller) applyConfigWithFallback(ctx context.Context, d *snapshot.Docume
 	err := p.applyCaddy(ctx, d, p.cfg.WAF)
 	if err == nil {
 		p.wafFallback.Store(false)
+		// Bounded context: a down/slow API must not stall the apply loop
+		// (liveness limit is 30s; heartbeat cap is 2s).
+		hbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		p.heartbeat(hbCtx)
 		return nil
 	}
 
@@ -346,6 +351,9 @@ func (p *Poller) applyConfigWithFallback(ctx context.Context, d *snapshot.Docume
 	}
 	p.wafFallback.Store(true)
 	p.log("warn", "WAF disabled — serving WAF-off config; waf_config_failed alert raised")
+	hbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	p.heartbeat(hbCtx) // report the fallback immediately so the alert is recorded without waiting for the next poll tick
 	return nil
 }
 
