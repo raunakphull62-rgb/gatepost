@@ -1,0 +1,2023 @@
+openapi: 3.1.0
+info:
+  title: Gatepost API
+  version: v1
+  license:
+    name: Proprietary
+  description: |
+    Gatepost customer, operator and edge-node API contract. Built from the
+    code in cmd/gatepost and internal/server. All bodies and responses are
+    application/json. Timestamps are RFC3339 UTC.
+servers:
+  - url: http://localhost:8080
+    description: local dev (GP_PUBLIC_BASE_URL)
+
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+paths:
+  # ---------- auth ----------
+  /auth/signup:
+    post:
+      tags: [auth]
+      summary: Create an account (uniform response, no email enumeration)
+      operationId: signup
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/signupRequest'
+      responses:
+        '200':
+          description: check your inbox (same body whether new or existing email)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/okMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/verify:
+    post:
+      tags: [auth]
+      summary: Verify email with a one-time token; starts a session
+      operationId: verify
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/verifyRequest'
+      responses:
+        '200':
+          description: verified and session cookie set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ok'
+        '400':
+          description: invalid or expired token (verify tokens live 24 h)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Log in; creates a fresh session cookie
+      operationId: login
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/loginRequest'
+      responses:
+        '200':
+          description: logged in, session cookie set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ok'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Delete the session and clear the cookie
+      operationId: logout
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/password-reset-request:
+    post:
+      tags: [auth]
+      summary: Request a password reset (always 202, uniform)
+      operationId: passwordResetRequest
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/passwordResetRequestRequest'
+      responses:
+        '202':
+          description: if the address exists, a reset token was mailed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/okMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/password-reset:
+    post:
+      tags: [auth]
+      summary: Set a new password from a one-time reset token (revokes all sessions)
+      operationId: passwordReset
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/passwordResetRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          description: invalid or expired token (reset tokens live 30 min, one-time)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/password-change:
+    post:
+      tags: [auth]
+      summary: Change password (session only); ends other sessions, rotates current token
+      operationId: passwordChange
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/passwordChangeRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/sessions:
+    get:
+      tags: [auth]
+      summary: List the caller's sessions (metadata only, no token material)
+      operationId: listSessions
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/sessionsList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/sessions/{id}/revoke:
+    post:
+      tags: [auth]
+      summary: Revoke one of the caller's sessions by opaque id
+      operationId: revokeSession
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/sessionIdPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: not found (uniform for foreign or absent id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout-everywhere:
+    post:
+      tags: [auth]
+      summary: End every session of the caller and clear the cookie
+      operationId: logoutEverywhere
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/oauth/{provider}/start:
+    get:
+      tags: [auth, oauth]
+      summary: Start Google or GitHub OAuth (302 to provider)
+      operationId: oauthStart
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: public
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/providerPath'
+      responses:
+        '200':
+          description: This endpoint issues a 302 redirect to the provider; a direct 200 is not returned in practice.
+        '302':
+          description: redirect to provider authorize URL
+        '404':
+          description: unknown provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/oauth/{provider}/callback:
+    get:
+      tags: [auth, oauth]
+      summary: OAuth callback; sets session cookie, returns 200
+      operationId: oauthCallback
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: public
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/providerPath'
+        - $ref: '#/components/parameters/oauthCodeQuery'
+        - $ref: '#/components/parameters/oauthStateQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          description: missing code or state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '403':
+          description: oauth failure (uniform, no enumeration)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '404':
+          description: unknown provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/api-keys:
+    post:
+      tags: [auth, api-keys]
+      summary: Create an API key; full key returned once
+      operationId: createAPIKey
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/apiKeyCreateRequest'
+      responses:
+        '201':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/apiKeyCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [auth, api-keys]
+      summary: List the caller's API keys (metadata only)
+      operationId: listAPIKeys
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/apiKeysList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/api-keys/{id}/revoke:
+    post:
+      tags: [auth, api-keys]
+      summary: Revoke an API key (terminal)
+      operationId: revokeAPIKey
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/apiKeyIdPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: not found (uniform for foreign keys)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ---------- customer api ----------
+  /api/me:
+    get:
+      tags: [api]
+      summary: Identity of the authenticated principal (session or API key)
+      operationId: me
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: sessionOrApiKey
+      security:
+        - sessionCookie: []
+        - bearerApiKey: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/principal'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user-data:
+    get:
+      tags: [api]
+      summary: Get the caller's JSON document ({} when none)
+      operationId: getUserData
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: sessionOrApiKey
+      security:
+        - sessionCookie: []
+        - bearerApiKey: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema: {}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      tags: [api]
+      summary: Replace the caller's JSON document (<= 32 KiB, valid JSON)
+      operationId: putUserData
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: sessionOrApiKey
+      security:
+        - sessionCookie: []
+        - bearerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {}
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          description: body exceeds 32 KiB or is not valid JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ---------- customer domains ----------
+  /v1/domains:
+    post:
+      tags: [domains]
+      summary: Claim a hostname
+      operationId: addDomain
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/domainCreateRequest'
+      responses:
+        '201':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainCreated'
+        '200':
+          description: caller already holds this claim (returned untouched or re-claimed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainExisting'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: reserved Gatepost service hostname
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '409':
+          description: hostname already verified by another user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '422':
+          description: domain cap reached or snapshot size cap
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '429':
+          description: rate limit exceeded for domains:add
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [domains]
+      summary: List the caller's claims (full list, not paginated)
+      operationId: listDomains
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainsList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}:
+    get:
+      tags: [domains]
+      summary: Get one of the caller's domains
+      operationId: getDomain
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainGet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: not found (uniform when not the caller's)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags: [domains]
+      summary: Delete one of the caller's domains (and its origin)
+      operationId: deleteDomain
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/waf:
+    put:
+      tags: [domains, waf]
+      summary: Set WAF mode and excluded rule IDs for a domain
+      operationId: putDomainWAF
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/wafRequest'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainGet'
+        '400':
+          description: invalid mode or rule id out of range (1..999999)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/verification:
+    get:
+      tags: [domains]
+      summary: DNS instructions the customer points at (TXT or nameserver pair)
+      operationId: domainVerification
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/verificationGet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/verify:
+    post:
+      tags: [domains]
+      summary: Prove ownership (TXT for cname, NS delegation for nameserver)
+      operationId: verifyDomain
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/domainVerified'
+        '400':
+          description: verification failed (TXT/NS/DNS error)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: hostname already verified by another user / race
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '410':
+          description: claim not pending or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '429':
+          description: rate limit exceeded for domains:verify
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/origin:
+    post:
+      tags: [domains, origins]
+      summary: Create the one origin for a domain
+      operationId: addOrigin
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/originCreateRequest'
+      responses:
+        '201':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/originCreated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: origin already set; use PUT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '422':
+          description: origin validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '429':
+          description: rate limit exceeded for domains:add
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [domains, origins]
+      summary: Get the stored origin for a domain
+      operationId: getOrigin
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/originGet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: not found, or no origin set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      tags: [domains, origins]
+      summary: Replace every field of the stored origin
+      operationId: putOrigin
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/originUpdateRequest'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/originGet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: not found, or no origin set (POST to create)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/origin/test:
+    post:
+      tags: [domains, origins]
+      summary: Test connection to the stored origin (reports reachable=false on refusal)
+      operationId: testOrigin
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/originTest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          description: rate limit exceeded for domains:origin-test
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/records:
+    post:
+      tags: [domains, records]
+      summary: Create a zone record (nameserver-mode domains only)
+      operationId: addRecord
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/recordCreateRequest'
+      responses:
+        '201':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/recordCreated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: no zone, or CNAME exclusivity conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '422':
+          description: validation error or zone record limit reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [domains, records]
+      summary: List zone records (full list, not paginated)
+      operationId: listRecords
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/recordsList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: records need a nameserver-mode domain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/domains/{id}/records/{rid}:
+    get:
+      tags: [domains, records]
+      summary: Get one record with its change history
+      operationId: getRecord
+      x-gatepost-tag: CUSTOMER
+      x-csrf: false
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+        - $ref: '#/components/parameters/recordIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/recordWithHistory'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ConflictNoZone'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    patch:
+      tags: [domains, records]
+      summary: Partially update one record (value/ttl/priority; name/type immutable)
+      operationId: patchRecord
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+        - $ref: '#/components/parameters/recordIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/recordPatchRequest'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/recordUpdated'
+        '400':
+          description: nothing to change
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ConflictNoZone'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags: [domains, records]
+      summary: Delete one record (history row kept)
+      operationId: deleteRecord
+      x-gatepost-tag: CUSTOMER
+      x-csrf: true
+      x-auth: session
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/domainIdPath'
+        - $ref: '#/components/parameters/recordIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/recordDeleted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ConflictNoZone'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ---------- operator nodes ----------
+  /v1/nodes:
+    post:
+      tags: [nodes, operator]
+      summary: Mint an edge/dns node (operator only); token shown once
+      operationId: createNode
+      x-gatepost-tag: OPERATOR
+      x-csrf: true
+      x-auth: operator
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/nodeCreateRequest'
+      responses:
+        '201':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/nodeCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: operator access only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '409':
+          description: node name already taken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [nodes, operator]
+      summary: List nodes (roster, no token material)
+      operationId: listNodes
+      x-gatepost-tag: OPERATOR
+      x-csrf: false
+      x-auth: operator
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/nodesList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/nodes/{id}/revoke:
+    post:
+      tags: [nodes, operator]
+      summary: Revoke a node (idempotent)
+      operationId: revokeNode
+      x-gatepost-tag: OPERATOR
+      x-csrf: true
+      x-auth: operator
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/nodeIdPath'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/nodeRevoked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ---------- edge node poll ----------
+  /node/v1/config:
+    get:
+      tags: [nodes, edge]
+      summary: Signed config snapshot envelope; generation as ETag
+      operationId: nodeConfig
+      x-gatepost-tag: EDGE-NODE
+      x-csrf: false
+      x-auth: nodeToken
+      security:
+        - bearerNodeToken: []
+      parameters:
+        - $ref: '#/components/parameters/ifNoneMatchHeader'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/snapshotEnvelope'
+          headers:
+            ETag:
+              schema:
+                type: string
+        '304':
+          description: unchanged since the generation in If-None-Match
+          headers:
+            ETag:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: rate limit exceeded for node polls
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /node/v1/heartbeat:
+    post:
+      tags: [nodes, edge]
+      summary: Report applied generation; stamps last_seen/applied_version
+      operationId: nodeHeartbeat
+      x-gatepost-tag: EDGE-NODE
+      x-csrf: true
+      x-auth: nodeToken
+      security:
+        - bearerNodeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/heartbeatRequest'
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/heartbeatResponse'
+        '400':
+          description: invalid or unknown generation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: rate limit exceeded for node polls
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+# =====================================================================
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: gp_session
+      description: |
+        HttpOnly, SameSite=Lax, Path=/, Max-Age=30d, Secure when
+        GP_PUBLIC_BASE_URL is https. Server stores only SHA-256(value).
+    bearerApiKey:
+      type: http
+      scheme: bearer
+      description: gp_pat_ + 256-bit random; used on /api/* only.
+    bearerNodeToken:
+      type: http
+      scheme: bearer
+      description: Edge/DNS node token; authenticates /node/v1/* only. Mutual 401s with user routes.
+
+  parameters:
+    providerPath:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [google, github]
+    oauthCodeQuery:
+      name: code
+      in: query
+      required: true
+      schema:
+        type: string
+    oauthStateQuery:
+      name: state
+      in: query
+      required: true
+      schema:
+        type: string
+    sessionIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: opaque session id (uuid text)
+    apiKeyIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: api key id (uuid text)
+    domainIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: domain id (uuid text)
+    nodeIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: node id (uuid text)
+    recordIdPath:
+      name: rid
+      in: path
+      required: true
+      schema:
+        type: string
+        description: record id (uuid text)
+    ifNoneMatchHeader:
+      name: If-None-Match
+      in: header
+      schema:
+        type: string
+        description: generation ETag, e.g. "3"
+
+  # ------------------------------------------------------------------
+  # responses
+  # ------------------------------------------------------------------
+  responses:
+    OK:
+      description: success
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ok'
+    NotFound:
+      description: not found (uniform, no disclosure)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    Forbidden:
+      description: operator access only
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    ConflictNoZone:
+      description: records need a nameserver-mode domain
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    Unauthorized:
+      description: authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    BadRequest:
+      description: invalid request body or field shape
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    Unprocessable:
+      description: validation error (422)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    TooManyRequests:
+      description: rate limit or lockout (429)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+    InternalServerError:
+      description: internal error (500)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/error'
+
+  # ------------------------------------------------------------------
+  # schemas
+  # ------------------------------------------------------------------
+  schemas:
+    error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: human message; the HTTP status is the only machine-readable signal
+      required: [error]
+      additionalProperties: false
+      example:
+        error: invalid credentials
+
+    ok:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+      required: [ok]
+      additionalProperties: false
+      example:
+        ok: true
+
+    okMessage:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        message:
+          type: string
+      required: [ok, message]
+      additionalProperties: false
+      example:
+        ok: true
+        message: check your inbox to verify your account
+
+    # ---- auth request/response ----
+    signupRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          description: loose shape; <= 254 octets, no whitespace, domain contains a '.'
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+      required: [email, password]
+      additionalProperties: false
+
+    verifyRequest:
+      type: object
+      properties:
+        token:
+          type: string
+      required: [token]
+      additionalProperties: false
+
+    loginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+      required: [email, password]
+      additionalProperties: false
+
+    passwordResetRequestRequest:
+      type: object
+      properties:
+        email:
+          type: string
+      required: [email]
+      additionalProperties: false
+
+    passwordResetRequest:
+      type: object
+      properties:
+        token:
+          type: string
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+      required: [token, new_password]
+      additionalProperties: false
+
+    passwordChangeRequest:
+      type: object
+      properties:
+        current_password:
+          type: string
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+      required: [current_password, new_password]
+      additionalProperties: false
+
+    sessionsList:
+      type: object
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/sessionRow'
+      required: [sessions]
+
+    sessionRow:
+      type: object
+      properties:
+        id:
+          type: string
+          description: opaque session id (uuid text)
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        current:
+          type: boolean
+      required: [id, created_at, expires_at, current]
+
+    apiKeyCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+      required: [name]
+      additionalProperties: false
+
+    apiKeyCreateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        key:
+          type: string
+          description: full key gp_pat_..., returned once, never stored
+        prefix:
+          type: string
+          description: gp_pat_ + first 8 chars
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: ["string", "null"]
+          format: date-time
+        revoked_at:
+          type: ["string", "null"]
+          format: date-time
+      required: [id, name, key, prefix, created_at]
+
+    apiKeysList:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/apiKeyRow'
+      required: [keys]
+
+    apiKeyRow:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        prefix:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: ["string", "null"]
+          format: date-time
+        revoked_at:
+          type: ["string", "null"]
+          format: date-time
+      required: [id, name, prefix, created_at]
+
+    principal:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+      required: [id, email]
+
+    # ---- domains ----
+    domainRow:
+      type: object
+      properties:
+        id:
+          type: string
+        hostname:
+          type: string
+        status:
+          type: string
+          enum: [pending, verified, rejected, expired, disabled]
+        setup_type:
+          type: string
+          enum: [cname, nameserver]
+        claimed_at:
+          type: string
+          format: date-time
+        verified_at:
+          type: ["string", "null"]
+          format: date-time
+        expires_at:
+          type: ["string", "null"]
+          format: date-time
+        ns1:
+          type: string
+        ns2:
+          type: string
+        waf_mode:
+          type: string
+          enum: [off, detection, blocking]
+        excluded_rule_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 999999
+      required: [id, hostname, status, setup_type, claimed_at, ns1, ns2, waf_mode, excluded_rule_ids]
+
+    domainCreateRequest:
+      type: object
+      properties:
+        hostname:
+          type: string
+        setup_type:
+          type: string
+          enum: [cname, nameserver]
+          default: cname
+      required: [hostname]
+      additionalProperties: false
+
+    domainCreated:
+      type: object
+      properties:
+        domain:
+          $ref: '#/components/schemas/domainRow'
+        existing:
+          type: boolean
+          const: false
+      required: [domain, existing]
+
+    domainExisting:
+      type: object
+      properties:
+        domain:
+          $ref: '#/components/schemas/domainRow'
+        existing:
+          type: boolean
+          const: true
+      required: [domain, existing]
+
+    domainGet:
+      type: object
+      properties:
+        domain:
+          $ref: '#/components/schemas/domainRow'
+      required: [domain]
+
+    domainsList:
+      type: object
+      properties:
+        domains:
+          type: array
+          items:
+            $ref: '#/components/schemas/domainRow'
+      required: [domains]
+
+    domainVerified:
+      type: object
+      properties:
+        status:
+          type: string
+          const: verified
+      required: [status]
+
+    verificationGet:
+      type: object
+      properties:
+        verification:
+          type: object
+          properties:
+            domain_id:
+              type: string
+            hostname:
+              type: string
+            setup_type:
+              type: string
+            status:
+              type: string
+            expires_at:
+              type: ["string", "null"]
+              format: date-time
+            nameservers:
+              type: array
+              items:
+                type: string
+              description: nameserver mode only
+            record_name:
+              type: string
+              description: cname mode only
+            record_value:
+              type: string
+              description: cname mode only
+          required: [domain_id, hostname, setup_type, status, expires_at]
+      required: [verification]
+
+    # ---- origins ----
+    originRow:
+      type: object
+      properties:
+        scheme:
+          type: string
+          enum: [http, https]
+        address:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        host_header:
+          type: ["string", "null"]
+        tls_verify:
+          type: boolean
+        health_path:
+          type: string
+        health_interval:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [scheme, address, port, tls_verify, health_path, health_interval, created_at, updated_at]
+
+    originCreateRequest:
+      type: object
+      properties:
+        scheme:
+          type: string
+          enum: [http, https]
+        address:
+          type: string
+        port:
+          type: integer
+        host_header:
+          type: string
+        tls_verify:
+          type: boolean
+          default: true
+        health_path:
+          type: string
+        health_interval:
+          type: integer
+      required: [scheme, address, port]
+      additionalProperties: false
+
+    originUpdateRequest:
+      type: object
+      properties:
+        scheme:
+          type: string
+          enum: [http, https]
+        address:
+          type: string
+        port:
+          type: integer
+        host_header:
+          type: string
+        tls_verify:
+          type: boolean
+        health_path:
+          type: string
+        health_interval:
+          type: integer
+      additionalProperties: false
+
+    originCreated:
+      type: object
+      properties:
+        origin:
+          $ref: '#/components/schemas/originRow'
+      required: [origin]
+
+    originGet:
+      type: object
+      properties:
+        origin:
+          $ref: '#/components/schemas/originRow'
+      required: [origin]
+
+    originTest:
+      type: object
+      properties:
+        test:
+          type: object
+          properties:
+            reachable:
+              type: boolean
+            status_code:
+              type: integer
+            tls_ok:
+              type: boolean
+            duration_ms:
+              type: integer
+            error:
+              type: string
+          required: [reachable]
+      required: [test]
+
+    # ---- records ----
+    recordRow:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [A, AAAA, CNAME, MX, TXT, NS, SRV, CAA]
+        value:
+          type: string
+        ttl:
+          type: integer
+        priority:
+          type: ["integer", "null"]
+        created_at:
+          type: string
+          format: date-time
+      required: [id, name, type, value, ttl, created_at]
+
+    recordCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        value:
+          type: string
+        ttl:
+          type: integer
+          default: 3600
+        priority:
+          type: integer
+      required: [name, type, value]
+      additionalProperties: false
+
+    recordCreated:
+      type: object
+      properties:
+        record:
+          $ref: '#/components/schemas/recordRow'
+      required: [record]
+
+    recordsList:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/recordRow'
+      required: [records]
+
+    recordWithHistory:
+      type: object
+      properties:
+        record:
+          $ref: '#/components/schemas/recordRow'
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/recordChange'
+      required: [record, history]
+
+    recordUpdated:
+      type: object
+      properties:
+        record:
+          $ref: '#/components/schemas/recordRow'
+      required: [record]
+
+    recordDeleted:
+      type: object
+      properties:
+        deleted:
+          type: boolean
+          const: true
+      required: [deleted]
+
+    recordPatchRequest:
+      type: object
+      properties:
+        value:
+          type: string
+        ttl:
+          type: integer
+        priority:
+          type: integer
+      additionalProperties: false
+
+    recordChange:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [create, update, delete]
+        old_value:
+          type: ["string", "null"]
+        new_value:
+          type: ["string", "null"]
+        changed_by:
+          type: string
+        changed_at:
+          type: string
+          format: date-time
+      required: [action, changed_by, changed_at]
+
+    # ---- waf ----
+    wafRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [off, detection, blocking]
+        excluded_rule_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 999999
+      additionalProperties: false
+
+    # ---- nodes ----
+    nodeRow:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [edge, dns]
+        status:
+          type: string
+          enum: [active, revoked]
+        last_seen:
+          type: ["string", "null"]
+          format: date-time
+        applied_version:
+          type: ["integer", "null"]
+        created_at:
+          type: string
+          format: date-time
+      required: [id, name, role, status, created_at]
+
+    nodeCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+        role:
+          type: string
+          enum: [edge, dns]
+      required: [name, role]
+      additionalProperties: false
+
+    nodeCreated:
+      type: object
+      properties:
+        node:
+          $ref: '#/components/schemas/nodeRow'
+        token:
+          type: string
+          description: 256-bit random, shown once, never stored
+      required: [node, token]
+
+    nodesList:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/nodeRow'
+      required: [nodes]
+
+    nodeRevoked:
+      type: object
+      properties:
+        node:
+          $ref: '#/components/schemas/nodeRow'
+      required: [node]
+
+    # ---- edge node ----
+    snapshotEnvelope:
+      type: object
+      properties:
+        payload:
+          type: string
+          description: canonical JSON of the snapshot document
+        signature:
+          type: string
+          description: hex HMAC-SHA256(payload)
+        key_id:
+          type: string
+          description: first 16 hex of SHA-256(signing key)
+      required: [payload, signature, key_id]
+
+    heartbeatRequest:
+      type: object
+      properties:
+        generation:
+          type: integer
+          description: must be > 0 and an existing snapshot generation
+        waf_fallback:
+          type: boolean
+          description: whether the node is serving WAF-off
+      required: [generation]
+      additionalProperties: false
+
+    heartbeatResponse:
+      type: object
+      properties:
+        applied_generation:
+          type: integer
+      required: [applied_generation]
