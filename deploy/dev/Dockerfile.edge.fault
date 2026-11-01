@@ -4,7 +4,9 @@ FROM golang:1.26-alpine AS build
 RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
 COPY x/wafredactor/*.go x/wafredactor/go.mod x/wafredactor/go.sum /tmp/wafredactor/
 COPY x/waffailopen/*.go x/waffailopen/go.mod x/waffailopen/go.sum /tmp/waffailopen/
-RUN XCADDY_GO_BUILD_FLAGS="-tags=waffailopen_fault" CGO_ENABLED=0 xcaddy build v2.11.7 \
+# GOFLAGS is passed to all go build invocations, including xcaddy's module builds
+ENV GOFLAGS="-tags=waffailopen_fault"
+RUN CGO_ENABLED=0 xcaddy build v2.11.7 \
     --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 \
     --with github.com/caddyserver/cache-handler@v0.17.0 \
     --with gatepost/x/wafredactor=/tmp/wafredactor \

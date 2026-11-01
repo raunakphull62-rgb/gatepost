@@ -132,6 +132,10 @@ type Poller struct {
 	// via the heartbeat so the waf_config_failed operator alert can be
 	// recorded / auto-resolved.
 	wafFallback atomic.Bool
+	// hbWafFallback mirrors wafFallback at the time of the last successful
+	// heartbeat. Used to force a heartbeat when the fallback state changes
+	// without a generation bump.
+	hbWafFallback bool
 
 	throttle      *logThrottle // repeated identical failure lines resolve here
 	certWindow    time.Time    // start of the current on-demand cap window
@@ -465,7 +469,8 @@ func (p *Poller) poll(ctx context.Context) (*snapshot.Envelope, pollOutcome) {
 
 // heartbeat tells the API which generation is actually applied — the one in
 // memory, not the last fetched attempt — and only when it is newer than the
-// last acknowledged. It retries on the next tick until the API answers 200.
+// last acknowledged, OR when the WAF fallback state has changed. It retries
+// on the next tick until the API answers 200.
 func (p *Poller) heartbeat(ctx context.Context) {
 	if p.token() == "" {
 		// Degraded: no token to authenticate a heartbeat — don't 401-spam.
@@ -478,12 +483,14 @@ func (p *Poller) heartbeat(ctx context.Context) {
 		// to record/resolve the waf_config_failed operator alert.
 		WAFFallback bool `json:"waf_fallback,omitempty"`
 	}
-	gen, acked := p.heartbeats()
-	if gen == 0 || gen == acked { // nothing applied, or already acknowledged
+	gen, acked, hbWaf := p.heartbeats()
+	currentWaf := p.wafFallback.Load()
+	// Send heartbeat if: new generation, OR WAF fallback state changed.
+	if gen == 0 || (gen == acked && currentWaf == hbWaf) {
 		return
 	}
 	body.Generation = gen
-	body.WAFFallback = p.wafFallback.Load()
+	body.WAFFallback = currentWaf
 	payload, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.APIBase+"/node/v1/heartbeat", strings.NewReader(string(payload)))
 	if err != nil {
@@ -504,6 +511,7 @@ func (p *Poller) heartbeat(ctx context.Context) {
 	}
 	p.mu.Lock()
 	p.acked = gen
+	p.hbWafFallback = currentWaf
 	p.mu.Unlock()
 }
 
@@ -802,10 +810,10 @@ func (p *Poller) resetStreak() {
 	p.mu.Unlock()
 }
 
-func (p *Poller) heartbeats() (gen, acked int64) {
+func (p *Poller) heartbeats() (gen, acked int64, wafFallback bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.generation, p.acked
+	return p.generation, p.acked, p.hbWafFallback
 }
 
 // token returns the node token for the current poll cycle. The boot-time

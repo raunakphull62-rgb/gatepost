@@ -800,6 +800,7 @@ echo "     l) mode change (blocking→detection) reached the edge in $((SECONDS 
 check "l) host isolation: $WAF_B still blocks while $HOST is detection" \
   "$(code_of -H "Host: $WAF_B" "$EDGE_HTTP/$SQLI_ATTACK")" "403"
 # Ordering proof: live Caddy config must place host-scoped ctl rules BEFORE CRS includes.
+# The WAF config is now nested inside the waffailopen handler's "waf" field.
 ORDERING=$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | python3 -c '
 import json, sys
 cfg = json.load(sys.stdin)
@@ -807,8 +808,9 @@ srv = cfg.get("apps",{}).get("http",{}).get("servers",{}).get("edge",{})
 if not srv: print("NO_EDGE_SERVER"); sys.exit(0)
 for rt in srv.get("routes", []):
     for h in rt.get("handle", []):
-        if isinstance(h, dict) and h.get("handler") == "waf":
-            d = h.get("directives", "")
+        if isinstance(h, dict) and h.get("handler") == "waffailopen":
+            waf = h.get("waf", {})
+            d = waf.get("directives", "")
             ctl_idx = d.find("REQUEST_HEADERS:Host")
             crs_idx = d.find("@owasp_crs")
             if ctl_idx >= 0 and (crs_idx < 0 or ctl_idx < crs_idx): print("ORDERED")
@@ -816,7 +818,7 @@ for rt in srv.get("routes", []):
             break
     else: continue
     break
-else: print("NO_WAF_HANDLER")
+else: print("NO_WAFFAILOPEN_HANDLER")
 ' 2>/dev/null)
 check "l) ordering: host-scoped ctl rules precede CRS includes" "$ORDERING" "ORDERED"
 # Reset HOST to detection (global default) for subsequent sections.
@@ -1185,8 +1187,11 @@ HEALTH_BODY=$(dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/nul
 check "q) /health body reports waf_config_failed (WAF-off)" \
   "$(printf '%s' "$HEALTH_BODY" | grep -c 'waf_config_failed')" "1"
 # The heartbeat carried waf_fallback=true → the API opened the operator alert.
+# Wait a moment for the next heartbeat (poll interval ~1s in fast mode).
+sleep 3
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
-  until_ok 30 "q) waf_config_failed alert OPEN for the node" \
+  # Debug: show alert count before the wait
+  until_ok 15 "q) waf_config_failed alert OPEN for the node" \
     "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 1"
 else
   fail "q) psql not available — cannot verify the operator alert"
@@ -1204,6 +1209,10 @@ until_ok 90 "q) WAF live again: stats endpoint answers after auto-resolve" \
 echo "     q) auto-resolve took $((SECONDS - T0))s ($PACE_LABEL)"
 check "q) edge serves $HOST with the WAF back (detection passes SQLi)" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok?id=%27%20OR%20%271%27%3D%271" | grep -c 'port 9001')" "1"
+# With the handler back, /health carries the live fail-open counters again
+# (stats AND health body show the counts — the requirement pair).
+until_ok 15 "q) /health body carries the waf counters again" \
+  'dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/null | grep -q "waf: panics="'
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
   until_ok 30 "q) waf_config_failed alert auto-RESOLVED" \
     "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 0"

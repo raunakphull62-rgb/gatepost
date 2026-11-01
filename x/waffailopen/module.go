@@ -216,9 +216,15 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 				resultCh <- wafResult{err: errPanic}
 			}
 		}()
-		// Fault injection (only active with waffailopen_fault build tag).
+		// Fault injection (enabled by GP_EDGE_FAULT_WAF_ENABLED env var).
+		// Only short-circuit if a fault is actually configured; otherwise
+		// run the WAF normally.
 		if h.injectFaults() {
-			return
+			fc := h.faultInjected()
+			if fc != nil {
+				h.injectFault(r2.Context())
+				return
+			}
 		}
 		err := h.WAF.ServeHTTP(rec, r2, pt)
 		resultCh <- wafResult{err: err}
@@ -235,23 +241,31 @@ func (h *FailOpenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 		// waiting on reverse_proxy).
 		res := <-resultCh
 		// If the WAF wrote anything to the recorder before calling next
-		// (e.g. a late 403 that races with the pass-through), commit it.
-		if rec.Buffered() {
+		// (e.g. a late 43 that races with the pass-through), commit it.
+		// rec.Status() > 0 means a response actually STARTED — Buffered()
+		// only reports the buffering decision and is true even when the
+		// handler wrote nothing.
+		if rec.Status() > 0 {
 			return rec.WriteResponse()
 		}
-		_ = res
-		return nil
+		// Errors from the pass-through chain (e.g. the origin dial being
+		// refused) must propagate: swallowing them turns a 502 into a
+		// silent empty 200.
+		return res.err
 
 	case res := <-resultCh:
 		if res.err == errPanic {
 			return h.failOpen(w, r, host, mode, onceNext)
 		}
-		// WAF-generated response (e.g. 403) is in the recorder.
-		if rec.Buffered() {
+		// WAF-generated response (e.g. a 403 the WAF wrote itself) is in
+		// the recorder — commit it. Status() > 0, not Buffered(): the
+		// recorder buffers unconditionally here, so Buffered() is true
+		// even when nothing was written.
+		if rec.Status() > 0 {
 			return rec.WriteResponse()
 		}
-		// No buffered content: return the error (0 if pass-through,
-		// HandlerError if blocked).
+		// Nothing written: return the error (nil for a clean pass-through
+		// without next, HandlerError for a block — Caddy serves 403/502).
 		return res.err
 
 	case <-timer.C:
