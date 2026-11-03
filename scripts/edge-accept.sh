@@ -949,8 +949,26 @@ print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
         'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "applied snapshot generation"'
       until_ok ${PROPAGATE_TIMEOUT} "n) old-style node REFUSED the API snapshot (required feature unknown)" \
         'sudo docker logs --since "$N_OLD" accept-old-poller 2>&1 | grep -q "does not implement"'
-      check "n) old-style edge keeps serving $HOST (last-good held)" \
-        "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
+      # Precondition: old edge must be confirmed serving the baseline host
+      # before the gate refusal is asserted as fail-closed. The poller logs
+      # "applied snapshot generation" when the doc is accepted in memory,
+      # but caddy's /load is async — wait until the edge actually serves.
+      until_ok ${PROPAGATE_TIMEOUT} "n) old edge confirmed serving baseline host" \
+        'curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -q "port 9001"'
+      # Strict assertion: after the gate refused the schema-2 snapshot, the
+      # old edge must serve the baseline host on every one of 10 consecutive
+      # probes (one per second) with no dip. Do NOT pass on "ever saw 1".
+      for _ in $(seq 1 10); do
+        N=$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')
+        if [ "$N" != "1" ]; then
+          fail "n) old edge stopped serving baseline host (probe $_ of 10)"
+          break
+        fi
+        sleep 1
+      done
+      # Precondition: caddy config must be readable before checking ruleEngine.
+      until_ok ${PROPAGATE_TIMEOUT} "n) caddy config readable after refusal" \
+        'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q .'
       check "n) old-style edge did NOT apply the refused snapshot (no ctl:ruleEngine=On)" \
         "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'ctl:ruleEngine=On')" "0"
     else
@@ -1010,19 +1028,18 @@ print(json.dumps({"payload": payload, "signature": sig, "key_id": key_id}))
     # The restarted poller reads the schema-1 snapshot at boot and applies it.
     until_ok ${PROPAGATE_TIMEOUT} "n) poller applied the schema-1 snapshot" \
       'dc logs --since "$N_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
-    sleep 3  # brief settle: the poller logs "applied" before Caddy finishes reloading the WAF directives
-    # The schema-1 snapshot is valid (same key, bumped generation) and the
-    # apply above confirms the poller accepted it. We check the edge is
-    # serving correctly below — that's the real proof of backward compat.
-    # The edge must still serve the HOST domain (WAFMode defaulted to detection).
+    # Precondition: caddy must finish loading the schema-1 snapshot before
+    # asserting serving behavior. The poller logs "applied" before Caddy
+    # finishes reloading — poll the edge until it confirms serving, with no
+    # fixed sleep.
     until_ok ${PROPAGATE_TIMEOUT} "n) edge serves $HOST from origin-test (schema-1 backward compat)" \
       'curl -s -H "Host: $HOST" $EDGE_HTTP/ok | grep -q "port 9001"'
-    check "n) edge serves $WAF_B from origin-test (schema-1 backward compat)" \
-      "$(curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -c 'port 9001')" "1"
+    until_ok ${PROPAGATE_TIMEOUT} "n) edge serves $WAF_B from origin-test (schema-1 backward compat)" \
+      'curl -s -H "Host: $WAF_B" $EDGE_HTTP/ok | grep -q "port 9001"'
     # Audit: the schema-1 snapshot's waf_mode defaulted to detection — verify
     # the generated directives use DetectionOnly as the global default.
-    check "n) directives default to DetectionOnly for schema-1 domains" \
-      "$(dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -c 'SecRuleEngine DetectionOnly')" "1"
+    until_ok ${PROPAGATE_TIMEOUT} "n) directives default to DetectionOnly for schema-1 domains" \
+      'dc exec edge wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q "SecRuleEngine DetectionOnly"'
     # Restart API for schema-2 refetch. The schema-1 snapshot has gen bumped by
     # 1, so the API's current snapshot (same content → same gen) is "behind"
     # the poller's applied gen — it would skip it ("not strictly newer"). We
@@ -1191,12 +1208,14 @@ HEALTH_BODY=$(dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/nul
 check "q) /health body reports waf_config_failed (WAF-off)" \
   "$(printf '%s' "$HEALTH_BODY" | grep -c 'waf_config_failed')" "1"
 # DETERMINISTIC: check the alert is OPEN while the fault is STILL ACTIVE.
-# The heartbeat with waf_fallback=true was sent when fallback was applied;
-# wait for it to be persisted (API is synchronous after heartbeat returns 200).
-# In fast mode the poll cycle is 1s; the heartbeat fires on the NEXT tick,
-# so the alert can take a few cycles to appear. Bounded retry up to 30s.
+# The heartbeat with waf_fallback=true was sent when fallback was applied
+# (applyConfigWithFallback calls p.heartbeat() synchronously), so the alert
+# is persisted within one poll cycle. Wait is derived from pacing:
+#   POLL_INTERVAL + 15s margin (heartbeat -> API persists alert).
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
-  until_ok 30 "q) waf_config_failed alert OPEN (fault still active)" \
+  Q_OPEN_WAIT=$((POLL_INTERVAL + 15))
+  echo "     q) alert OPEN wait: ${Q_OPEN_WAIT}s (poll ${POLL_INTERVAL}s + 15s margin, $PACE_LABEL)"
+  until_ok "$Q_OPEN_WAIT" "q) waf_config_failed alert OPEN (fault still active)" \
     "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 1"
 else
   fail "q) psql not available — cannot verify the operator alert"
@@ -1204,12 +1223,21 @@ fi
 # RECOVERY: delete the fault file, flip the mode again (blocking → detection);
 # the next snapshot's WAF config is valid, Caddy accepts it, the WAF is live
 # and the alert auto-resolves. No restart anywhere.
+# The resolution path: snapshot rebuild -> apply (gated by reload cooldown) ->
+# heartbeat with waf_fallback=false -> API resolves alert. Wait is derived
+# from pacing:
+#   POLL_COOLDOWN + 3 * POLL_INTERVAL + 30s margin.
 dc exec poller rm -f /state/waf-fault.txt
-T0=$SECONDS
+# Settle: let any in-flight poll/apply cycle drain before setting QLOG, so a
+# "WAF config rejected" already in flight when the fault file was removed
+# isn't counted as a re-rejection. Bounded: one poll cycle plus caddy reload.
+sleep 2
 QLOG=$(date +%s)
 OUT=$(cb -X PUT "$API/v1/domains/$DOM/waf" -H 'Content-Type: application/json' -d '{"mode":"detection"}')
 check "q) set $HOST detection again (recovery generation)" "$(codeof "$OUT")" "200"
-until_ok 90 "q) WAF live again: stats endpoint answers after auto-resolve" \
+Q_RESOLVE_WAIT=$((POLL_COOLDOWN + 3 * POLL_INTERVAL + 30))
+echo "     q) alert auto-resolve wait: ${Q_RESOLVE_WAIT}s (cooldown ${POLL_COOLDOWN}s + 3x poll ${POLL_INTERVAL}s + 30s margin, $PACE_LABEL)"
+until_ok "$Q_RESOLVE_WAIT" "q) WAF live again: stats endpoint answers after auto-resolve" \
   'dc exec edge wget -qO- http://127.0.0.1:2019/waffailopen/stats 2>/dev/null | grep -q "\"mode\":\"detection\""'
 echo "     q) auto-resolve took $((SECONDS - T0))s ($PACE_LABEL)"
 check "q) edge serves $HOST with the WAF back (detection passes SQLi)" \
@@ -1219,7 +1247,7 @@ check "q) edge serves $HOST with the WAF back (detection passes SQLi)" \
 until_ok 15 "q) /health body carries the waf counters again" \
   'dc exec poller wget -qO- "http://127.0.0.1:8099/health" 2>/dev/null | grep -q "waf: panics="'
 if [ -n "$DB_URL" ] && command -v psql >/dev/null 2>&1; then
-  until_ok 30 "q) waf_config_failed alert auto-RESOLVED" \
+  until_ok "$Q_RESOLVE_WAIT" "q) waf_config_failed alert auto-RESOLVED" \
     "psql '$DB_URL' -tAc \"SELECT count(*) FROM operator_alerts WHERE kind='waf_config_failed' AND subject='$NID' AND resolved_at IS NULL\" | grep -qx 0"
 fi
 # No new fallback line after the fault file was removed: the recovery was a
@@ -1231,6 +1259,11 @@ FAULT_ARGS=()
 dc up -d --build --force-recreate poller >/dev/null 2>&1
 until_ok 30 "q) default poller restored (no fault image, no fault env)" \
   'dc logs --since "$Q_START" poller 2>/dev/null | grep -q "applied snapshot generation"'
+# Precondition: the edge must be confirmed serving again after the default
+# poller reapplies the snapshot. "applied snapshot generation" is logged when
+# the doc is accepted in memory, before caddy finishes /load.
+until_ok ${PROPAGATE_TIMEOUT} "q) edge confirmed serving after default poller restore" \
+  'curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -q "port 9001"'
 check "q) edge still serves after the default poller came back" \
   "$(curl -s -H "Host: $HOST" "$EDGE_HTTP/ok" | grep -c 'port 9001')" "1"
 
