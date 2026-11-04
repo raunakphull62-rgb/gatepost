@@ -318,6 +318,43 @@ func closedPort(t *testing.T) string {
 	return addr
 }
 
+// TestVerifyRefusesBadHostHeader: the snapshot verify step mirrors the API
+// side host_header rule. A verified envelope whose origin host_header is not
+// hostname or hostname:port is refused and never applied.
+func TestVerifyRefusesBadHostHeader(t *testing.T) {
+	key := makeKey(t)
+	p := NewPoller(Config{Key: key})
+
+	badDoc := snapshot.Document{
+		SchemaVersion: snapshot.SchemaVersion,
+		Generation:    1,
+		Domains: []snapshot.Domain{{
+			Hostname: "shop.example.test",
+			Origin: snapshot.Origin{
+				Scheme:      "http",
+				Address:     "93.184.216.34",
+				Port:        80,
+				HostHeader:  hostHeader("{env.PATH}"),
+			},
+		}},
+	}
+	env, err := snapshot.Sign(key, badDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.verify(env, 0); err == nil {
+		t.Fatal("snapshot with bad host_header verified — must be refused")
+	}
+
+	// a well-formed host_header verifies
+	goodDoc := badDoc
+	goodDoc.Domains[0].Origin.HostHeader = hostHeader("backend.example.com")
+	genv, _ := snapshot.Sign(key, goodDoc)
+	if _, err := p.verify(genv, 0); err != nil {
+		t.Fatalf("good snapshot failed verify: %v", err)
+	}
+}
+
 // ---- tests -------------------------------------------------------------
 
 // The production defaults are exactly the spec: 5s cadence, 60s cap.

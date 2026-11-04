@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -157,6 +158,55 @@ func TestValidateOriginNumericForms(t *testing.T) {
 		}
 		if !errors.Is(err, ErrForbiddenOrigin) && !errors.Is(err, ErrInvalidOrigin) {
 			t.Errorf("ValidateOrigin(%q): wrong error class: %v", c.in, err)
+		}
+	}
+}
+
+// TestValidateHostHeader — host_header may only be hostname or hostname:port
+// (LDH labels, ≤253 octets, optional :port 1..65535). { } / @ ? # and
+// anything else is refused: the value is emitted verbatim as the upstream
+// Host header, so it must carry no structure.
+func TestValidateHostHeader(t *testing.T) {
+	valid := []string{
+		"internal.example.com",
+		"shop.example.com:443",
+		"a-b.c.d:8080",
+		"example.com:65535",
+		"example.com:1",
+	}
+	for _, h := range valid {
+		if err := ValidateHostHeader(h); err != nil {
+			t.Errorf("ValidateHostHeader(%q) = %v, want accepted", h, err)
+		}
+	}
+	invalid := []string{
+		"",
+		"   ",
+		"{env.PATH}",
+		"bad}host",
+		"host/x",
+		"h@h",
+		"h?x",
+		"h#x",
+		"h x",
+		"h\tx",
+		"h_ost.example.com",
+		"-bad.example.com",
+		"example-.com",
+		"ex..ample.com",
+		"example.com:0",
+		"example.com:99999",
+		"example.com:abc",
+		":80",
+		"host:",
+		"example..com",
+		"[::1]:80",
+		"UPPER.example.com",
+		strings.Repeat("a", 254) + ".com",
+	}
+	for _, h := range invalid {
+		if err := ValidateHostHeader(h); err == nil {
+			t.Errorf("ValidateHostHeader(%q) accepted, want refused", h)
 		}
 	}
 }

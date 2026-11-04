@@ -114,13 +114,26 @@ func TestOriginValidationRules(t *testing.T) {
 		// field rules
 		{"bad scheme", map[string]any{"address": "ok.example.com", "scheme": "ftp"}, http.StatusUnprocessableEntity},
 		{"empty host header", map[string]any{"address": "ok.example.com", "host_header": "  "}, http.StatusUnprocessableEntity},
+		{"host header hostname", map[string]any{"address": "ok.example.com", "host_header": "internal.example.com"}, http.StatusCreated},
+		{"host header hostname port", map[string]any{"address": "ok.example.com", "host_header": "internal.example.com:8443"}, http.StatusCreated},
+		{"host header env path", map[string]any{"address": "ok.example.com", "host_header": "{env.PATH}"}, http.StatusUnprocessableEntity},
+		{"host header brace close", map[string]any{"address": "ok.example.com", "host_header": "bad}host"}, http.StatusUnprocessableEntity},
+		{"host header slash", map[string]any{"address": "ok.example.com", "host_header": "host/x"}, http.StatusUnprocessableEntity},
+		{"host header at sign", map[string]any{"address": "ok.example.com", "host_header": "h@h"}, http.StatusUnprocessableEntity},
+		{"host header question", map[string]any{"address": "ok.example.com", "host_header": "h?x"}, http.StatusUnprocessableEntity},
+		{"host header hash", map[string]any{"address": "ok.example.com", "host_header": "h#x"}, http.StatusUnprocessableEntity},
+		{"host header space", map[string]any{"address": "ok.example.com", "host_header": "h x"}, http.StatusUnprocessableEntity},
+		{"host header underscore", map[string]any{"address": "ok.example.com", "host_header": "h_ost.example.com"}, http.StatusUnprocessableEntity},
 		{"bad health path", map[string]any{"address": "ok.example.com", "health_path": "../etc"}, http.StatusUnprocessableEntity},
 		{"bad interval", map[string]any{"address": "ok.example.com", "health_interval": 3}, http.StatusUnprocessableEntity},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			// host_header cases all reach origin validation (the address
+			// resolves), so they each need a fresh domain; the other
+			// refusals fail at the address check and can share ref.
 			domID := ref
-			if c.want == http.StatusCreated {
+			if c.want == http.StatusCreated || strings.HasPrefix(c.name, "host header") {
 				slug := strings.NewReplacer(" ", "-", "_", "-", "/", "-").Replace(c.name)
 				domID = claimRow(t, a, slug+"-rule.example.com").ID
 			}
@@ -128,8 +141,10 @@ func TestOriginValidationRules(t *testing.T) {
 			if code != c.want {
 				t.Fatalf("want %d, got %d: %s", c.want, code, body)
 			}
-			if c.want == http.StatusCreated {
-				// free the claim (cascade drops the origin) so caps stay clear
+			if c.want == http.StatusCreated || strings.HasPrefix(c.name, "host header") {
+				// free the claim: valid cases drop the origin via cascade,
+				// invalid cases (refused at host_header) still leave a
+				// pending claim that would otherwise hit the claim cap.
 				a.must("DELETE", "/v1/domains/"+domID, "", http.StatusOK)
 			}
 		})

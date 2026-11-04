@@ -437,6 +437,9 @@ func Generate(d *snapshot.Document, p CaddyParams) ([]byte, error) {
 		}
 		switch {
 		case dm.Origin.HostHeader != nil && *dm.Origin.HostHeader != "":
+			if err := domains.ValidateHostHeader(*dm.Origin.HostHeader); err != nil {
+				return nil, fmt.Errorf("caddygen: host_header %q of %s: %v", *dm.Origin.HostHeader, dm.Hostname, err)
+			}
 			rp.Headers = &caddyRPHeaders{}
 			rp.Headers.Request.Set = map[string][]string{"Host": {*dm.Origin.HostHeader}}
 		case dm.Origin.Scheme == "https":

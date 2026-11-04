@@ -78,6 +78,57 @@ func CheckPort(p int) error {
 	return nil
 }
 
+// ValidateHostHeader accepts "hostname" or "hostname:port" — LDH labels,
+// each ≤63 octets, the whole host ≤253 octets, plus an optional :port
+// (1..65535). Anything else ({ } / @ ? #, spaces, underscores, upper case,
+// …) is refused: the value is emitted verbatim as the upstream Host header,
+// so it must carry no structure.
+func ValidateHostHeader(h string) error {
+	reject := func(format string, args ...any) error {
+		return fmt.Errorf("%w: "+format, append([]any{ErrInvalidOrigin}, args...)...)
+	}
+	if h == "" {
+		return reject("empty host_header")
+	}
+	host := h
+	var portStr string
+	hasPort := false
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		host = h[:i]
+		portStr = h[i+1:]
+		hasPort = true
+	}
+	if host == "" {
+		return reject("host_header %q is missing the hostname", h)
+	}
+	if len(host) > 253 {
+		return reject("host_header %q is longer than 253 octets", h)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 {
+			return reject("host_header %q has a bad label", h)
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return reject("host_header %q is not LDH", h)
+			}
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return reject("host_header %q has a bad label", h)
+		}
+	}
+	if hasPort {
+		if portStr == "" {
+			return reject("host_header %q has an empty port", h)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return reject("host_header %q has a bad port", h)
+		}
+	}
+	return nil
+}
+
 // OwnedAddresses is our own infrastructure, parsed once at boot from the env
 // list: IP literals to refuse exactly, and hostnames normalised for
 // case/trailing-dot comparisons.

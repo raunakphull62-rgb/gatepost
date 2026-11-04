@@ -335,6 +335,10 @@ func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, e
 	d, err := snapshot.VerifyWith(p.cfg.Key, env, prev, p.cfg.Features)
 	switch {
 	case err == nil:
+		if verr := validateSnapshotHostHeaders(d); verr != nil {
+			p.logThrottled("error", "refused", "snapshot refused: %v", verr)
+			return snapshot.Document{}, verr
+		}
 		return d, nil
 	case errors.Is(err, snapshot.ErrUnknownKey):
 		// Refusals REROLL every interval (the ladder resets on a sane reply),
@@ -361,6 +365,21 @@ func (p *Poller) verify(env snapshot.Envelope, prev int64) (snapshot.Document, e
 		p.logThrottled("error", "refused", "snapshot refused: %v", err)
 		return snapshot.Document{}, err
 	}
+}
+
+// validateSnapshotHostHeaders mirrors the API-side host_header rule
+// (internal/server/origins.go): a verified snapshot whose any origin's
+// host_header is not hostname or hostname:port is refused here, so a hostile
+// or malformed value never becomes the upstream Host header.
+func validateSnapshotHostHeaders(d snapshot.Document) error {
+	for _, dom := range d.Domains {
+		if hh := dom.Origin.HostHeader; hh != nil && *hh != "" {
+			if err := domains.ValidateHostHeader(*hh); err != nil {
+				return fmt.Errorf("host_header %q of %s: %w", *hh, dom.Hostname, err)
+			}
+		}
+	}
+	return nil
 }
 
 // accept promotes a VERIFIED artifact to the current state: persists first

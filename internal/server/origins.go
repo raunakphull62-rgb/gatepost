@@ -119,12 +119,11 @@ func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (s
 	}
 	hostHeader = ""
 	if b.HostHeader != nil {
-		hh := strings.TrimSpace(*b.HostHeader)
-		if hh == "" || len(hh) > 255 || strings.ContainsAny(hh, " \t\r\n\x00") {
-			fail(w, http.StatusUnprocessableEntity, "host_header empty, too long, or contains spaces")
+		if err := domains.ValidateHostHeader(*b.HostHeader); err != nil {
+			fail(w, http.StatusUnprocessableEntity, "host_header: "+err.Error())
 			return
 		}
-		hostHeader = hh
+		hostHeader = *b.HostHeader
 	}
 	healthPath = "/"
 	if b.HealthPath != nil {

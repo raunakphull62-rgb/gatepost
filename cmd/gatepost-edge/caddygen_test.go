@@ -190,6 +190,28 @@ func TestGenerateHostileIsOneHostString(t *testing.T) {
 	}
 }
 
+// TestGenerateRejectsBadHostHeader: host_header must be hostname or
+// hostname:port (LDH). A hostile or malformed value ({env.PATH}, braces,
+// slashes, ...) makes Generate refuse — the edge never forwards it as the
+// upstream Host header. Valid hostnames still generate.
+func TestGenerateRejectsBadHostHeader(t *testing.T) {
+	bad := []string{"{env.PATH}", "bad}host", "host/x", "h@h", "h?x", "h#x", "h x", "h\tx", "h_ost.example.com"}
+	for _, hh := range bad {
+		d := fixtureDoc("single")
+		d.Domains[0].Origin.HostHeader = hostHeader(hh)
+		if _, err := Generate(d, fixtureParams()); err == nil {
+			t.Fatalf("host_header %q accepted", hh)
+		}
+	}
+	for _, hh := range []string{"backend.example.com", "backend.example.com:8443"} {
+		d := fixtureDoc("single")
+		d.Domains[0].Origin.HostHeader = hostHeader(hh)
+		if _, err := Generate(d, fixtureParams()); err != nil {
+			t.Fatalf("host_header %q rejected: %v", hh, err)
+		}
+	}
+}
+
 // TestGenerateDetectsBrokenInput: generator refuses to emit a config whose
 // origins it cannot tunnel (fail loud, keep last-good) — unknown scheme, or
 // a port missing from the forwarder's allocations.
