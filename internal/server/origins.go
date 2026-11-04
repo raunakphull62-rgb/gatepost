@@ -119,11 +119,12 @@ func (b *originBody) check(w http.ResponseWriter, s *Server, r *http.Request) (s
 	}
 	hostHeader = ""
 	if b.HostHeader != nil {
-		if err := domains.ValidateHostHeader(*b.HostHeader); err != nil {
+		hh := strings.ToLower(*b.HostHeader)
+		if err := domains.ValidateHostHeader(hh); err != nil {
 			fail(w, http.StatusUnprocessableEntity, "host_header: "+err.Error())
 			return
 		}
-		hostHeader = *b.HostHeader
+		hostHeader = hh
 	}
 	healthPath = "/"
 	if b.HealthPath != nil {

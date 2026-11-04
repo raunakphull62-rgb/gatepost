@@ -160,6 +160,38 @@ func TestOriginValidationRules(t *testing.T) {
 	_ = pool
 }
 
+// TestOriginHostHeaderLowercased — host_header is lowercased before storing,
+// so SHOP.example.com and SHOP.Example.COM:8443 are stored normalized.
+func TestOriginHostHeaderLowercased(t *testing.T) {
+	_, a, _ := originSetup(t)
+	cases := []struct {
+		in, want string
+	}{
+		{"SHOP.example.com", "shop.example.com"},
+		{"SHOP.Example.COM:8443", "shop.example.com:8443"},
+		{"shop.example.com:443", "shop.example.com:443"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			slug := strings.NewReplacer(".", "-", ":", "-", "/", "-").Replace(c.in + "-" + c.want)
+			d := claimRow(t, a, "lower-"+slug+".example.com")
+			code, body := originCall(t, a, d.ID, map[string]any{"address": "ok.example.com", "host_header": c.in})
+			if code != http.StatusCreated {
+				t.Fatalf("create: %d %s", code, body)
+			}
+			o := originJSON(t, body)
+			got := "<nil>"
+			if o.HostHeader != nil {
+				got = *o.HostHeader
+			}
+			if got != c.want {
+				t.Fatalf("host_header stored %q, want %q", got, c.want)
+			}
+			a.must("DELETE", "/v1/domains/"+d.ID, "", http.StatusOK)
+		})
+	}
+}
+
 // TestOriginSettingsFlow — create/get/update with ownership 404s, field
 // defaults, and the stored shape.
 func TestOriginSettingsFlow(t *testing.T) {
