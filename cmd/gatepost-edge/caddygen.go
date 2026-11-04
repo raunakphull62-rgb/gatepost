@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -774,6 +775,17 @@ func wafHandler(w WAFConfig, doms []snapshot.Domain) (*corazaWAF, error) {
 // Audit file mode: 0644 (coraza default). No shared volume, no 0666 — the
 // poller no longer touches the audit file; the on-disk format is already
 // secret-free at format time.
+
+// hostMatchPattern builds the coraza match for one host: the Host header is
+// lowercased (t:lowercase) before matching, so "SHOP.example.com" and
+// "shop.example.com" receive the same ctl as the exact host; an optional
+// :port is accepted, so "shop.example.com:443" matches too. The hostname is
+// regex-escaped and anchored — validateHostForWAF already guarantees LDH
+// labels, so dots are the only metacharacters in practice.
+func hostMatchPattern(host string) string {
+	return "^" + regexp.QuoteMeta(strings.ToLower(host)) + "(?::\\d+)?$"
+}
+
 func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string, error) {
 	if w.AuditLogPath == "" {
 		return "", fmt.Errorf("caddygen: WAF mode %q enabled but AuditLogPath empty — the audit log path must be explicit", mode)
@@ -833,8 +845,8 @@ func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string,
 		}
 		hostMode := snapshotDomainWAF(dom)
 		if hostMode != mode {
-			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@streq %s" "id:%d,phase:1,pass,t:none,nolog,ctl:ruleEngine=%s"`,
-				dom.Hostname, ruleID, hostModeToCtl(hostMode)))
+			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@rx %s" "id:%d,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=%s"`,
+				hostMatchPattern(dom.Hostname), ruleID, hostModeToCtl(hostMode)))
 			b.WriteString("\n")
 			ruleID++
 		}
@@ -842,8 +854,8 @@ func corazaDirectives(mode string, w WAFConfig, doms []snapshot.Domain) (string,
 			if rid < 1 || rid > 999999 {
 				return "", fmt.Errorf("caddygen: excluded rule ID %d out of range (1..999999) for host %s", rid, dom.Hostname)
 			}
-			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@streq %s" "id:%d,phase:1,pass,t:none,nolog,ctl:ruleRemoveById=%d"`,
-				dom.Hostname, ruleID, rid))
+			b.WriteString(fmt.Sprintf(`SecRule REQUEST_HEADERS:Host "@rx %s" "id:%d,phase:1,pass,t:lowercase,nolog,ctl:ruleRemoveById=%d"`,
+				hostMatchPattern(dom.Hostname), ruleID, rid))
 			b.WriteString("\n")
 			ruleID++
 		}

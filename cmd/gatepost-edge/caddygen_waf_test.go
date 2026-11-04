@@ -10,6 +10,7 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -216,12 +217,12 @@ func TestCorazaDirectivesHostScoped(t *testing.T) {
 	}
 
 	// Detection host: a ctl:ruleEngine=DetectionOnly override.
-	if !strings.Contains(d, `"id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=DetectionOnly"`) {
+	if !strings.Contains(d, `"id:190000,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=DetectionOnly"`) {
 		t.Error("missing ctl:ruleEngine=DetectionOnly for detection host")
 	}
 
 	// Off host: a ctl:ruleEngine=Off override.
-	if !strings.Contains(d, `"id:190001,phase:1,pass,t:none,nolog,ctl:ruleEngine=Off"`) {
+	if !strings.Contains(d, `"id:190001,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=Off"`) {
 		t.Error("missing ctl:ruleEngine=Off for off host")
 	}
 
@@ -238,9 +239,54 @@ func TestCorazaDirectivesHostScoped(t *testing.T) {
 		t.Error("missing ctl:ruleRemoveById=941100")
 	}
 
-	// Host-scoped rules must match on the Host header.
-	if !strings.Contains(d, `REQUEST_HEADERS:Host "@streq excluded.example.test"`) {
-		t.Error("missing Host-scoped match for excluded host")
+	// Host-scoped rules must match on the Host header, case-insensitively
+	// and with an optional port.
+	if !strings.Contains(d, `REQUEST_HEADERS:Host "@rx ^excluded\.example\.test(?::\d+)?$"`) {
+		t.Error("missing case-insensitive Host-scoped match for excluded host")
+	}
+}
+
+// TestWAFHostMatchCaseInsensitiveAndOptionalPort: the per-host SecRule must
+// match the Host header case-insensitively (t:lowercase) and accept an
+// optional :port, so "SHOP.example.com" and "shop.example.com:443" receive
+// the same ctl as the exact host "shop.example.com".
+func TestWAFHostMatchCaseInsensitiveAndOptionalPort(t *testing.T) {
+	pat := hostMatchPattern("shop.example.com")
+	re := regexp.MustCompile(pat)
+	for _, want := range []string{
+		"shop.example.com", "SHOP.example.com", "shop.example.com:443",
+		"SHOP.Example.Com:8443",
+	} {
+		if !re.MatchString(strings.ToLower(want)) { // coraza lowercases via t:lowercase
+			t.Errorf("pattern %q did not match %q", pat, want)
+		}
+	}
+	for _, not := range []string{
+		"evil.example.com", "shop.example.com.evil.com", "shop.example.com:abc",
+		"notshop.example.com",
+	} {
+		if re.MatchString(not) {
+			t.Errorf("pattern %q should not match %q", pat, not)
+		}
+	}
+
+	// corazaDirectives emits that pattern with t:lowercase, ahead of CRS
+	doms := []snapshot.Domain{{Hostname: "shop.example.com", WAFMode: "off"}}
+	d, err := corazaDirectives("blocking", WAFConfig{
+		Mode:         "blocking",
+		AuditLogPath: "/tmp/waf.log",
+	}, doms)
+	if err != nil {
+		t.Fatalf("corazaDirectives: %v", err)
+	}
+	wantLine := `SecRule REQUEST_HEADERS:Host "@rx ` + pat + `" "id:190000,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=Off"`
+	if !strings.Contains(d, wantLine) {
+		t.Fatalf("missing case-insensitive host rule:\n%s", d)
+	}
+	crsIdx := strings.Index(d, "Include @owasp_crs/*.conf")
+	ruleIdx := strings.Index(d, `REQUEST_HEADERS:Host "@rx `+pat+`"`)
+	if crsIdx < 0 || ruleIdx < 0 || ruleIdx >= crsIdx {
+		t.Fatalf("host-scoped rule must precede Include @owasp_crs: rule=%d crs=%d", ruleIdx, crsIdx)
 	}
 }
 
@@ -301,7 +347,7 @@ func TestCorazaDirectivesOrderingProof(t *testing.T) {
 	}
 	// Every host-scoped SecRule must be before the CRS include.
 	for _, host := range []string{"off.example.test", "blocked.example.test"} {
-		idx := strings.Index(d, `REQUEST_HEADERS:Host "@streq `+host+`"`)
+		idx := strings.Index(d, `REQUEST_HEADERS:Host "@rx ^`+regexp.QuoteMeta(host)+`(?::\d+)?$"`)
 		if idx < 0 {
 			t.Fatalf("missing host-scoped rule for %s", host)
 		}
@@ -317,9 +363,9 @@ func TestCorazaDirectivesOrderingProof(t *testing.T) {
 	// blocked.example.test gets ctl:ruleEngine=On (id 190001), then its
 	// exclusion 942100 gets ctl:ruleRemoveById (id 190002) — both before CRS.
 	for _, needle := range []string{
-		`id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=Off`,
-		`id:190001,phase:1,pass,t:none,nolog,ctl:ruleEngine=On`,
-		`id:190002,phase:1,pass,t:none,nolog,ctl:ruleRemoveById=942100`,
+		`id:190000,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=Off`,
+		`id:190001,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=On`,
+		`id:190002,phase:1,pass,t:lowercase,nolog,ctl:ruleRemoveById=942100`,
 	} {
 		idx := strings.Index(d, needle)
 		if idx < 0 {
@@ -356,10 +402,10 @@ func TestCorazaDirectivesSchema1BackwardCompat(t *testing.T) {
 	}
 	// But the schema-1 host (empty WAFMode) must get a DetectionOnly override —
 	// it never opted into blocking.
-	if !strings.Contains(d, `id:190000,phase:1,pass,t:none,nolog,ctl:ruleEngine=DetectionOnly`) {
+	if !strings.Contains(d, `id:190000,phase:1,pass,t:lowercase,nolog,ctl:ruleEngine=DetectionOnly`) {
 		t.Fatal("schema-1 host (empty WAFMode) must get a ctl:ruleEngine=DetectionOnly override when global mode is blocking")
 	}
-	if !strings.Contains(d, `REQUEST_HEADERS:Host "@streq schema1.example.test"`) {
+	if !strings.Contains(d, `REQUEST_HEADERS:Host "@rx ^schema1\.example\.test(?::\d+)?$"`) {
 		t.Fatal("missing host-scoped rule for schema-1 host")
 	}
 }
