@@ -91,6 +91,21 @@ func (s *Server) buildSnapshot(ctx context.Context) (snapshot.Document, snapshot
 			&wafMode, &excludedRuleIDs); err != nil {
 			return snapshot.Document{}, snapshot.Envelope{}, err
 		}
+		// config validation: an origin that can never be served is dropped
+		// from the snapshot with an operator alert; the build continues for
+		// every other domain.
+		if hh != nil && *hh != "" {
+			if err := domains.ValidateHostHeader(*hh); err != nil {
+				log.Printf("snapshot build: dropped %s (origin %s): invalid host_header: %v", hostname, address, err)
+				s.recordAlert(ctx, "origin_unsafe", hostname, "invalid host_header: "+err.Error())
+				continue
+			}
+		}
+		if scheme == "https" && !tlsVerify {
+			log.Printf("snapshot build: dropped %s (origin %s): https origin with tls_verify=false", hostname, address)
+			s.recordAlert(ctx, "origin_unsafe", hostname, "https origin with tls_verify=false")
+			continue
+		}
 		verdict := s.originVerdict(ctx, address)
 		s.noteVerdict(ctx, id, hostname, verdict)
 		switch {

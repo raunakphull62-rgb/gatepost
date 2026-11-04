@@ -144,6 +144,60 @@ func TestBuildSnapshotRecheckDrops(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshotSkipsInvalidOrigins — an origin whose host_header fails
+// validation, or an https origin with tls_verify=false (which caddygen
+// refuses), is dropped from the snapshot with an operator alert; the build
+// continues and serves every other domain. One bad domain must not block
+// the others.
+func TestBuildSnapshotSkipsInvalidOrigins(t *testing.T) {
+	pool, a, f, s := snapshotSetup(t)
+	f.ips["ok.example.com"] = []net.IP{net.ParseIP("93.184.216.34")}
+	ctx := context.Background()
+
+	// good domain: served.
+	good := verifiedClaim(t, pool, a, f, "good.example.com")
+	if code, _ := originCall(t, a, good.ID, map[string]any{"address": "ok.example.com"}); code != http.StatusCreated {
+		t.Fatalf("good origin: %d", code)
+	}
+
+	// bad-tls: https origin with tls_verify=false — caddygen refuses these,
+	// so the builder must drop the domain and keep serving the rest.
+	badTLS := verifiedClaim(t, pool, a, f, "bad-tls.example.com")
+	if code, _ := originCall(t, a, badTLS.ID, map[string]any{"scheme": "https", "address": "ok.example.com", "tls_verify": false}); code != http.StatusCreated {
+		t.Fatalf("bad-tls origin: %d", code)
+	}
+
+	// bad-hh: pre-existing malformed host_header (direct SQL, bypassing the
+	// API's validation). The builder must drop it too.
+	badHH := verifiedClaim(t, pool, a, f, "bad-hh.example.com")
+	if _, err := pool.Exec(ctx, `INSERT INTO origins(domain_id, scheme, address, port, host_header, tls_verify) VALUES($1,'https','ok.example.com',443,$2,true)`,
+		badHH.ID, "{env.PATH}"); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	doc, _, err := s.buildSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range doc.Domains {
+		got[d.Hostname] = true
+	}
+	if len(got) != 1 || !got["good.example.com"] {
+		t.Fatalf("snapshot domains = %v, want only good.example.com (bad origins dropped, not blocking)", doc.Domains)
+	}
+	if got["bad-tls.example.com"] || got["bad-hh.example.com"] {
+		t.Fatalf("invalid-origin domains must not be in the snapshot: %v", doc.Domains)
+	}
+	if out := buf.String(); !strings.Contains(out, "dropped") {
+		t.Fatalf("drops must be logged: %q", out)
+	}
+}
+
 // TestBuildSnapshotVersionBumps — a changed origin moves the generation; an
 // untouched rebuild keeps it (the 304 path of item 4 rests on this).
 func TestBuildSnapshotVersionBumps(t *testing.T) {
